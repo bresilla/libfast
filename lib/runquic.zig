@@ -1,8 +1,23 @@
-pub const packet = @import("packet.zig");
-pub const frame = @import("frame.zig");
-pub const stream = @import("stream.zig");
-pub const connection = @import("connection.zig");
-pub const crypto = @import("crypto.zig");
-pub const transport = @import("transport.zig");
+/// RunQUIC - QUIC transport library
+/// Supports both TLS and SSH key exchange modes
 
-pub const QuicTransport = transport.QuicTransport;
+const std = @import("std");
+
+// Core QUIC protocol
+pub const types = @import("core/types.zig");
+pub const varint = @import("utils/varint.zig");
+
+// Re-export commonly used types
+pub const QuicMode = types.QuicMode;
+pub const ConnectionId = types.ConnectionId;
+pub const StreamId = types.StreamId;
+pub const PacketNumber = types.PacketNumber;
+pub const ErrorCode = types.ErrorCode;
+
+// Version information
+pub const version = "0.1.0";
+pub const QUIC_VERSION_1 = types.QUIC_VERSION_1;
+
+test {
+    std.testing.refAllDecls(@This());
+}
