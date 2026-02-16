@@ -1,0 +1,15 @@
+.{
+    .name = .syslink,
+    .version = "0.0.1",
+    .dependencies = .{
+        // zquic removed - building custom minimal QUIC for SSH/QUIC
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "bin",
+        "examples",
+        "lib",
+    },
+    .fingerprint = 0xc55b9533dacbf6c7,
+}
