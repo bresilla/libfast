@@ -1,8 +1,8 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 123
-- **Unit Tests**: 115
+- **Total Tests**: 143
+- **Unit Tests**: 135
 - **Integration Tests**: 8
 - **Status**: ✅ All passing
 
@@ -155,6 +155,36 @@
 - **udp.zig** (2 tests)
   - Socket bind and close
   - Send and receive
+
+### Public API (20 tests)
+
+- **config.zig** (8 tests)
+  - SSH client config
+  - SSH server config
+  - TLS client config
+  - TLS server config
+  - Config validation - SSH client valid
+  - Config validation - TLS server requires credentials
+  - Role helper methods
+
+- **types.zig** (5 tests)
+  - ConnectionState methods
+  - StreamState methods
+  - ConnectionStats initialization
+  - StreamInfo creation
+  - ConnectionEvent variants
+
+- **connection.zig** (5 tests)
+  - Create SSH client connection
+  - Create TLS client connection
+  - Connection state transitions
+  - Get connection stats
+  - Event queue
+
+- **stream.zig** (2 tests)
+  - Stream builder
+  - Stream ID and type
+  - Unidirectional stream
 
 ### Integration Tests (8 tests)
 - Packet with frames (encoding/decoding)
