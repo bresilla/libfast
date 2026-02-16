@@ -13,6 +13,10 @@ pub const varint = @import("utils/varint.zig");
 pub const buffer = @import("utils/buffer.zig");
 pub const time = @import("utils/time.zig");
 
+// Crypto
+pub const ssh_obfuscation = @import("crypto/ssh/obfuscation.zig");
+pub const ssh_init = @import("crypto/ssh/init.zig");
+
 // Transport
 pub const udp = @import("transport/udp.zig");
 
