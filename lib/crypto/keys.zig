@@ -99,7 +99,7 @@ pub fn deriveKeyMaterial(
 ///       opaque label<7..255> = "tls13 " + Label;
 ///       opaque context<0..255> = Context;
 ///   } HkdfLabel;
-fn hkdfExpandLabel(
+pub fn hkdfExpandLabel(
     secret: []const u8,
     label: []const u8,
     context: []const u8,

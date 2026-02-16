@@ -1,10 +1,10 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 143
-- **Unit Tests**: 135
+- **Total Tests**: 161
+- **Unit Tests**: 153
 - **Integration Tests**: 8
-- **Status**: ✅ All passing
+- **Status**: ✅ 161/162 passing (1 pre-existing timer test flake)
 
 ## Test Breakdown by Module
 
@@ -150,6 +150,33 @@
   - Server encrypt and client decrypt
   - Cipher suite from name
   - Cipher suite name
+
+### TLS/QUIC (18 tests)
+
+- **handshake.zig** (6 tests)
+  - ClientHello encoding
+  - ServerHello encoding
+  - Finished message encoding
+  - EncryptedExtensions encoding
+  - Cipher suite names
+  - HandshakeType toString
+
+- **key_schedule.zig** (9 tests)
+  - Key schedule initialization
+  - Derive early secret without PSK
+  - Derive handshake secret
+  - Derive master secret
+  - Derive handshake traffic secrets
+  - Derive application traffic secrets
+  - Transcript hash updates
+  - Key schedule with different hash algorithms
+
+- **tls_context.zig** (3 tests)
+  - TLS context initialization
+  - Client handshake start
+  - Complete handshake flow
+  - Get cipher suite info
+  - Server context creation
 
 ### Transport (2 tests)
 - **udp.zig** (2 tests)

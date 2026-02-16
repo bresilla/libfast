@@ -54,6 +54,11 @@ pub const aead = @import("crypto/aead.zig");
 pub const keys = @import("crypto/keys.zig");
 pub const header_protection = @import("crypto/header_protection.zig");
 
+// Crypto - TLS
+pub const tls_handshake = @import("crypto/tls/handshake.zig");
+pub const tls_key_schedule = @import("crypto/tls/key_schedule.zig");
+pub const tls_context = @import("crypto/tls/tls_context.zig");
+
 // Transport
 pub const udp = @import("transport/udp.zig");
 
