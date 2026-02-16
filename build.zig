@@ -36,4 +36,78 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
+
+    // Examples
+
+    // SSH echo server
+    const ssh_server_module = b.createModule(.{
+        .root_source_file = b.path("examples/ssh_echo_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ssh_server_module.addImport("runquic", runquic_module);
+
+    const ssh_server = b.addExecutable(.{
+        .name = "ssh_echo_server",
+        .root_module = ssh_server_module,
+    });
+    b.installArtifact(ssh_server);
+
+    const run_ssh_server = b.addRunArtifact(ssh_server);
+    const ssh_server_step = b.step("run-ssh-server", "Run SSH/QUIC echo server example");
+    ssh_server_step.dependOn(&run_ssh_server.step);
+
+    // SSH echo client
+    const ssh_client_module = b.createModule(.{
+        .root_source_file = b.path("examples/ssh_echo_client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ssh_client_module.addImport("runquic", runquic_module);
+
+    const ssh_client = b.addExecutable(.{
+        .name = "ssh_echo_client",
+        .root_module = ssh_client_module,
+    });
+    b.installArtifact(ssh_client);
+
+    const run_ssh_client = b.addRunArtifact(ssh_client);
+    const ssh_client_step = b.step("run-ssh-client", "Run SSH/QUIC echo client example");
+    ssh_client_step.dependOn(&run_ssh_client.step);
+
+    // TLS echo server
+    const tls_server_module = b.createModule(.{
+        .root_source_file = b.path("examples/tls_echo_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tls_server_module.addImport("runquic", runquic_module);
+
+    const tls_server = b.addExecutable(.{
+        .name = "tls_echo_server",
+        .root_module = tls_server_module,
+    });
+    b.installArtifact(tls_server);
+
+    const run_tls_server = b.addRunArtifact(tls_server);
+    const tls_server_step = b.step("run-tls-server", "Run TLS/QUIC echo server example");
+    tls_server_step.dependOn(&run_tls_server.step);
+
+    // TLS echo client
+    const tls_client_module = b.createModule(.{
+        .root_source_file = b.path("examples/tls_echo_client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tls_client_module.addImport("runquic", runquic_module);
+
+    const tls_client = b.addExecutable(.{
+        .name = "tls_echo_client",
+        .root_module = tls_client_module,
+    });
+    b.installArtifact(tls_client);
+
+    const run_tls_client = b.addRunArtifact(tls_client);
+    const tls_client_step = b.step("run-tls-client", "Run TLS/QUIC echo client example");
+    tls_client_step.dependOn(&run_tls_client.step);
 }
