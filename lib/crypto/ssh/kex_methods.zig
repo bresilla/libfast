@@ -388,7 +388,8 @@ test "Exchange hash computation" {
     );
     defer state.deinit();
 
-    _ = try state.generateKeyPair();
+    const public_key = try state.generateKeyPair();
+    defer allocator.free(public_key);
 
     const host_key = "server-host-key-data";
     const hash = try state.computeExchangeHash(host_key);

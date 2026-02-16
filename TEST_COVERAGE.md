@@ -1,14 +1,14 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 161
-- **Unit Tests**: 153
+- **Total Tests**: 170
+- **Unit Tests**: 162
 - **Integration Tests**: 8
-- **Status**: ✅ 161/162 passing (1 pre-existing timer test flake)
+- **Status**: ✅ 170/170 passing
 
 ## Test Breakdown by Module
 
-### Core Protocol (25 tests)
+### Core Protocol (35 tests)
 - **types.zig** (7 tests)
   - ConnectionId creation, equality, empty
   - StreamType properties and identification
@@ -38,6 +38,17 @@
   - Connection manager
   - Packet number sequencing
   - Connection flow control
+
+- **flow_control.zig** (10 tests)
+  - Flow controller initialization
+  - Receive data with flow control violations
+  - Send data with blocking
+  - MAX_DATA update when window consumed
+  - Send MAX update from peer
+  - Connection flow control
+  - Stream flow control with offsets
+  - Out-of-order receive handling
+  - Flow control blocking and unblocking
 
 ### Utilities (19 tests)
 - **varint.zig** (13 tests)
