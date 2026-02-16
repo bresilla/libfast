@@ -11,24 +11,24 @@ RunQUIC provides a complete QUIC transport implementation (RFC 9000, 9002) with 
 
 ## Features
 
-✅ **Core QUIC Protocol**
+**Core QUIC Protocol**
 - Connection management
 - Stream multiplexing (bidirectional and unidirectional)
 - Packet encoding/decoding
 - Frame handling
 
-✅ **SSH/QUIC Crypto Mode**
+**SSH/QUIC Crypto Mode**
 - Obfuscated envelope (AEAD-AES-256-GCM)
 - SSH key exchange (curve25519-sha256)
 - Secret derivation (SSH K,H → QUIC secrets)
 - No TLS overhead for SSH applications
 
-✅ **Standard TLS/QUIC**
+**Standard TLS/QUIC**
 - TLS 1.3 handshake
 - Cipher suites (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305)
 - Compatible with HTTP/3 applications
 
-✅ **Reliability & Performance**
+**Reliability & Performance**
 - Flow control (stream and connection level)
 - Loss detection (RFC 9002)
 - RTT estimation
@@ -167,7 +167,7 @@ zig build test --summary all
 
 ## Implementation Status
 
-### ✅ Completed (Phase 1-6)
+### Completed (Phase 1-6)
 - Core QUIC types and constants
 - Packet encoding/decoding
 - Frame handling
@@ -184,14 +184,14 @@ zig build test --summary all
 - Congestion control (NewReno)
 - Public API design
 
-### 🚧 In Progress (Phase 7-8)
+### In Progress (Phase 7-8)
 - Example applications
 - Documentation
 - Connection establishment implementation
 - Stream I/O implementation
 - Path validation and migration
 
-### 📋 Planned (Phase 9)
+### Planned (Phase 9)
 - Full integration testing
 - Performance optimization
 - Interoperability testing
@@ -209,9 +209,9 @@ No external dependencies required!
 ## Design Philosophy
 
 1. **Library-First Approach** - RunQUIC is a transport library, not a full protocol implementation
-   - ✅ QUIC transport and crypto
-   - ❌ SSH protocol (implemented by applications like syslink)
-   - ❌ HTTP/3 semantics (implemented by HTTP/3 applications)
+   - QUIC transport and crypto
+   - SSH protocol (implemented by applications like syslink)
+   - HTTP/3 semantics (implemented by HTTP/3 applications)
 
 2. **Dual Crypto Modes** - Support both SSH and TLS without code duplication
    - Unified connection/stream API
