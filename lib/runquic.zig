@@ -33,4 +33,5 @@ pub const QUIC_VERSION_1 = types.QUIC_VERSION_1;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("integration_test.zig");
 }
