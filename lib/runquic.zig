@@ -5,6 +5,7 @@ const std = @import("std");
 
 // Core QUIC protocol
 pub const types = @import("core/types.zig");
+pub const packet = @import("core/packet.zig");
 pub const varint = @import("utils/varint.zig");
 
 // Re-export commonly used types
