@@ -1,14 +1,14 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 180
-- **Unit Tests**: 172
+- **Total Tests**: 191
+- **Unit Tests**: 183
 - **Integration Tests**: 8
-- **Status**: ✅ 180/180 passing
+- **Status**: ✅ 191/191 passing
 
 ## Test Breakdown by Module
 
-### Core Protocol (45 tests)
+### Core Protocol (56 tests)
 - **types.zig** (7 tests)
   - ConnectionId creation, equality, empty
   - StreamType properties and identification
@@ -61,6 +61,19 @@
   - Loss detection by packet threshold
   - Loss detection by time threshold
   - Packet number space isolation
+
+- **congestion.zig** (11 tests)
+  - Congestion controller initialization
+  - Packet sent updates bytes in flight
+  - Available window calculation
+  - Slow start window growth
+  - Transition to congestion avoidance
+  - Congestion avoidance window growth
+  - Packet loss triggers recovery
+  - Recovery prevents window growth
+  - Exit from recovery
+  - Persistent congestion reset
+  - Minimum ssthresh enforcement
 
 ### Utilities (19 tests)
 - **varint.zig** (13 tests)
