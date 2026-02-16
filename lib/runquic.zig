@@ -8,6 +8,7 @@ pub const types = @import("core/types.zig");
 pub const packet = @import("core/packet.zig");
 pub const frame = @import("core/frame.zig");
 pub const stream = @import("core/stream.zig");
+pub const connection = @import("core/connection.zig");
 pub const varint = @import("utils/varint.zig");
 
 // Transport
