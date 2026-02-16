@@ -206,3 +206,111 @@ test "integration: time-based operations" {
 
     try std.testing.expect(elapsed < runquic.time.Duration.SECOND);
 }
+
+test "integration: SSH key exchange packet flow" {
+    const allocator = std.testing.allocator;
+
+    // Shared obfuscation key
+    const key = runquic.ssh_obfuscation.ObfuscationKey.fromKeyword("shared-secret");
+
+    // Step 1: Client sends SSH_QUIC_INIT
+    const versions = [_]u32{runquic.QUIC_VERSION_1};
+    const kex_algs = [_]runquic.ssh_init.KexAlgorithm{
+        .{ .name = "curve25519-sha256", .data = "" },
+    };
+    const cipher_suites = [_][]const u8{"TLS_AES_256_GCM_SHA384"};
+
+    const init = runquic.ssh_init.SshQuicInit{
+        .client_connection_id = &[_]u8{ 1, 2, 3, 4 },
+        .server_name_indication = "example.com",
+        .quic_versions = &versions,
+        .transport_params = &[_]u8{},
+        .signature_algorithms = "ssh-ed25519,ssh-rsa",
+        .trusted_fingerprints = &[_][]const u8{},
+        .kex_algorithms = &kex_algs,
+        .cipher_suites = &cipher_suites,
+        .extensions = &[_]runquic.ssh_init.ExtensionPair{},
+    };
+
+    var init_encrypted: [4096]u8 = undefined;
+    const init_len = try init.encodeEncrypted(allocator, key, &init_encrypted);
+    try std.testing.expect(init_len >= runquic.ssh_init.MIN_PAYLOAD_SIZE);
+
+    // Step 2: Server responds with SSH_QUIC_REPLY
+    const server_sig_algs = [_][]const u8{"ssh-ed25519"};
+    const server_kex_algs = [_]runquic.ssh_reply.ServerKexAlgorithm{
+        .{ .name = "curve25519-sha256", .data = "server-ephemeral-key" },
+    };
+
+    const reply = runquic.ssh_reply.SshQuicReply{
+        .server_connection_id = &[_]u8{ 5, 6, 7, 8 },
+        .server_quic_version = runquic.QUIC_VERSION_1,
+        .transport_params = &[_]u8{},
+        .signature_algorithms = &server_sig_algs,
+        .kex_algorithms = &server_kex_algs,
+        .cipher_suite = "TLS_AES_256_GCM_SHA384",
+        .extensions = &[_]runquic.ssh_reply.ExtensionPair{},
+    };
+
+    var reply_encrypted: [8192]u8 = undefined;
+    const reply_len = try reply.encodeEncrypted(
+        allocator,
+        key,
+        init_len,
+        &reply_encrypted,
+    );
+
+    // Verify amplification limit (server reply ≤ 3x client init)
+    try std.testing.expect(reply_len <= init_len * runquic.ssh_reply.AMPLIFICATION_FACTOR + 100);
+
+    // Step 3: Either party can send SSH_QUIC_CANCEL on error
+    const cancel = runquic.ssh_cancel.SshQuicCancel.unsupportedKex();
+
+    var cancel_encrypted: [2048]u8 = undefined;
+    const cancel_len = try cancel.encodeEncrypted(allocator, key, &cancel_encrypted);
+    try std.testing.expect(cancel_len > 0);
+
+    // Verify all packets are properly obfuscated (high bit set)
+    try std.testing.expect((init_encrypted[0] & 0x80) != 0);
+    try std.testing.expect((reply_encrypted[0] & 0x80) != 0);
+    try std.testing.expect((cancel_encrypted[0] & 0x80) != 0);
+
+    // Step 4: Decrypt and verify INIT packet
+    var init_decrypted: [4096]u8 = undefined;
+    const init_dec_len = try runquic.ssh_obfuscation.ObfuscatedEnvelope.decrypt(
+        init_encrypted[0..init_len],
+        key,
+        &init_decrypted,
+    );
+    try std.testing.expect(init_dec_len >= runquic.ssh_init.MIN_PAYLOAD_SIZE);
+    try std.testing.expectEqual(runquic.ssh_init.SSH_QUIC_INIT, init_decrypted[0]);
+
+    // Step 5: Decrypt and verify REPLY packet
+    var reply_decrypted: [8192]u8 = undefined;
+    const reply_dec_len = try runquic.ssh_obfuscation.ObfuscatedEnvelope.decrypt(
+        reply_encrypted[0..reply_len],
+        key,
+        &reply_decrypted,
+    );
+    try std.testing.expect(reply_dec_len > 0);
+    try std.testing.expectEqual(runquic.ssh_reply.SSH_QUIC_REPLY, reply_decrypted[0]);
+
+    // Step 6: Decrypt and verify CANCEL packet
+    var cancel_decrypted: [2048]u8 = undefined;
+    const cancel_dec_len = try runquic.ssh_obfuscation.ObfuscatedEnvelope.decrypt(
+        cancel_encrypted[0..cancel_len],
+        key,
+        &cancel_decrypted,
+    );
+    try std.testing.expect(cancel_dec_len > 0);
+    try std.testing.expectEqual(runquic.ssh_cancel.SSH_QUIC_CANCEL, cancel_decrypted[0]);
+
+    // Verify we can decode the cancel packet
+    var decoded_cancel = try runquic.ssh_cancel.SshQuicCancel.decode(
+        allocator,
+        cancel_decrypted[0..cancel_dec_len],
+    );
+    defer decoded_cancel.deinit(allocator);
+
+    try std.testing.expect(decoded_cancel.reason_phrase.len > 0);
+}

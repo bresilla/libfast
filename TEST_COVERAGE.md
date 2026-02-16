@@ -1,9 +1,9 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 79
+- **Total Tests**: 80
 - **Unit Tests**: 72
-- **Integration Tests**: 7
+- **Integration Tests**: 8
 - **Status**: ✅ All passing
 
 ## Test Breakdown by Module
@@ -97,7 +97,7 @@
   - Socket bind and close
   - Send and receive
 
-### Integration Tests (7 tests)
+### Integration Tests (8 tests)
 - Packet with frames (encoding/decoding)
 - Connection with streams
 - SSH obfuscated envelope with INIT packet
@@ -105,6 +105,7 @@
 - UDP socket with ring buffers
 - Connection ID hashing and lookup
 - Time-based operations
+- SSH key exchange packet flow (INIT/REPLY/CANCEL)
 
 ## Coverage Analysis
 
