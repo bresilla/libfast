@@ -1,14 +1,14 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 170
-- **Unit Tests**: 162
+- **Total Tests**: 180
+- **Unit Tests**: 172
 - **Integration Tests**: 8
-- **Status**: ✅ 170/170 passing
+- **Status**: ✅ 180/180 passing
 
 ## Test Breakdown by Module
 
-### Core Protocol (35 tests)
+### Core Protocol (45 tests)
 - **types.zig** (7 tests)
   - ConnectionId creation, equality, empty
   - StreamType properties and identification
@@ -49,6 +49,18 @@
   - Stream flow control with offsets
   - Out-of-order receive handling
   - Flow control blocking and unblocking
+
+- **loss_detection.zig** (10 tests)
+  - Loss detection initialization
+  - RTT stats initialization
+  - RTT stats first sample
+  - RTT stats multiple samples
+  - RTT stats PTO calculation
+  - Sent packet tracking
+  - ACK processing
+  - Loss detection by packet threshold
+  - Loss detection by time threshold
+  - Packet number space isolation
 
 ### Utilities (19 tests)
 - **varint.zig** (13 tests)
