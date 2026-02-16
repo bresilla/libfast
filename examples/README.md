@@ -58,14 +58,18 @@ zig build run-tls-client
 
 ## Implementation Status
 
-**Note:** These examples demonstrate the intended API structure. Full connection handling is still in development. The examples currently show:
+**Note:** These examples demonstrate the intended API structure. Full connection handling is still in development.
 
-- ✅ Configuration API (SSH and TLS modes)
-- ✅ Connection initialization
-- ✅ Intended event loop structure
-- 🚧 Connection establishment (TODO)
-- 🚧 Stream operations (TODO)
-- 🚧 Data transmission (TODO)
+**Implemented:**
+- Configuration API (SSH and TLS modes)
+- Connection initialization
+- Event queue and types
+
+**Not Yet Implemented (TODO):**
+- Connection establishment (connect/accept methods are stubs)
+- Stream operations (openStream is stub)
+- Data transmission (streamWrite/streamRead are stubs)
+- Event polling (poll method is stub)
 
 ## API Usage Patterns
 
