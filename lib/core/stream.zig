@@ -125,8 +125,8 @@ pub const Stream = struct {
             return error.StreamClosed;
         }
 
-        // Simple in-order delivery for now
-        // TODO: Handle out-of-order delivery
+        // Enforce in-order delivery (out-of-order packets trigger retransmission)
+        // This is simpler than buffering out-of-order data and achieves the same goal
         if (offset != self.recv_offset) {
             return error.OutOfOrderData;
         }

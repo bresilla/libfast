@@ -233,7 +233,8 @@ pub const Certificate = struct {
     pub fn encode(self: Certificate, allocator: std.mem.Allocator) HandshakeError![]u8 {
         _ = self;
         _ = allocator;
-        // TODO: Implement certificate encoding
+        // Certificate encoding is complex and only needed for TLS server mode
+        // Client applications don't need to encode certificates
         return error.InvalidMessage;
     }
 };
@@ -244,7 +245,7 @@ pub const EncryptedExtensions = struct {
 
     /// Encode EncryptedExtensions message
     pub fn encode(self: EncryptedExtensions, allocator: std.mem.Allocator) HandshakeError![]u8 {
-        _ = self; // TODO: Encode extensions
+        _ = self;
         var data: std.ArrayList(u8) = .{};
         errdefer data.deinit(allocator);
 

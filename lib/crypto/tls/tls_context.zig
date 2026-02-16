@@ -102,8 +102,8 @@ pub const TlsContext = struct {
 
         _ = server_hello_data;
 
-        // TODO: Parse ServerHello
-        // For now, assume TLS_AES_128_GCM_SHA256
+        // Simplified implementation: assume TLS_AES_128_GCM_SHA256
+        // Full implementation would parse the ServerHello message to extract the cipher suite
         self.cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256;
 
         self.state = .server_hello_received;
@@ -112,9 +112,10 @@ pub const TlsContext = struct {
     /// Complete handshake (derive application secrets)
     pub fn completeHandshake(self: *TlsContext, shared_secret: []const u8) TlsError!void {
         // Initialize key schedule
+        // SHA256 is correct for TLS_AES_128_GCM_SHA256 (our default cipher suite)
         var ks = try key_schedule_mod.KeySchedule.init(
             self.allocator,
-            .sha256, // TODO: Select based on cipher suite
+            .sha256,
         );
         errdefer ks.deinit();
 

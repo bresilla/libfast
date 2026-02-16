@@ -50,8 +50,8 @@ pub const QuicStream = struct {
         allocator: std.mem.Allocator,
         max_size: usize,
     ) types_mod.QuicError![]u8 {
-        var data = std.ArrayList(u8).init(allocator);
-        errdefer data.deinit();
+        var data: std.ArrayList(u8) = .{};
+        errdefer data.deinit(allocator);
 
         var buffer: [4096]u8 = undefined;
         while (data.items.len < max_size) {
@@ -62,7 +62,7 @@ pub const QuicStream = struct {
             try data.appendSlice(allocator, buffer[0..n]);
         }
 
-        return data.toOwnedSlice();
+        return data.toOwnedSlice(allocator);
     }
 
     /// Write string (convenience)

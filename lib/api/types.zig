@@ -80,11 +80,14 @@ pub const QuicError = error{
     StreamClosed,
     StreamLimitReached,
     FlowControlError,
+    StreamError,
 
     // Transport errors
     NetworkError,
     InvalidPacket,
     ProtocolViolation,
+    InvalidAddress,
+    SocketError,
 
     // Crypto errors
     CryptoError,

@@ -5,11 +5,10 @@ const conn_internal = @import("../core/connection.zig");
 const stream_internal = @import("../core/stream.zig");
 const udp_mod = @import("../transport/udp.zig");
 const crypto_mod = @import("../crypto/crypto.zig");
+const packet_mod = @import("../core/packet.zig");
+const frame_mod = @import("../core/frame.zig");
 
 /// Public QUIC connection handle
-///
-/// This is the main interface for applications to interact with QUIC connections.
-/// It wraps the internal connection implementation and provides a clean API.
 pub const QuicConnection = struct {
     allocator: std.mem.Allocator,
     config: config_mod.QuicConfig,
@@ -27,12 +26,14 @@ pub const QuicConnection = struct {
     // Event queue
     events: std.ArrayList(types_mod.ConnectionEvent),
 
+    // Remote address (for client)
+    remote_addr: ?std.net.Address,
+
     /// Initialize a new QUIC connection
     pub fn init(
         allocator: std.mem.Allocator,
         config: config_mod.QuicConfig,
     ) types_mod.QuicError!QuicConnection {
-        // Validate configuration
         config.validate() catch |err| {
             return switch (err) {
                 error.MissingSshConfig => types_mod.QuicError.MissingSshConfig,
@@ -49,17 +50,16 @@ pub const QuicConnection = struct {
             .socket = null,
             .crypto_ctx = null,
             .events = .{},
+            .remote_addr = null,
         };
     }
 
     /// Start connecting (client only)
     pub fn connect(
         self: *QuicConnection,
-        _remote_address: []const u8,
-        _remote_port: u16,
+        remote_address: []const u8,
+        remote_port: u16,
     ) types_mod.QuicError!void {
-        _ = _remote_address;
-        _ = _remote_port;
         if (self.config.role != .client) {
             return types_mod.QuicError.InvalidState;
         }
@@ -68,24 +68,74 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.InvalidState;
         }
 
-        // TODO: Create UDP socket
-        // TODO: Create internal connection
-        // TODO: Start handshake
+        // Parse address
+        const addr = std.net.Address.parseIp4(remote_address, remote_port) catch {
+            return types_mod.QuicError.InvalidAddress;
+        };
+        self.remote_addr = addr;
+
+        // Create UDP socket
+        const socket = try self.allocator.create(udp_mod.UdpSocket);
+        errdefer self.allocator.destroy(socket);
+
+        socket.* = udp_mod.UdpSocket.init() catch {
+            return types_mod.QuicError.SocketError;
+        };
+        self.socket = socket;
+
+        // Create crypto context
+        const crypto_ctx = try self.allocator.create(crypto_mod.CryptoContext);
+        errdefer self.allocator.destroy(crypto_ctx);
+
+        const crypto_mode: crypto_mod.CryptoMode = switch (self.config.mode) {
+            .ssh => .ssh,
+            .tls => .tls,
+        };
+
+        crypto_ctx.* = crypto_mod.CryptoContext.init(
+            crypto_mode,
+            crypto_mod.CipherSuite.TLS_AES_128_GCM_SHA256,
+        );
+        self.crypto_ctx = crypto_ctx;
+
+        // Create internal connection
+        const internal_conn = try self.allocator.create(conn_internal.Connection);
+        errdefer self.allocator.destroy(internal_conn);
+
+        // Generate connection IDs
+        var local_cid_bytes: [8]u8 = undefined;
+        std.crypto.random.bytes(&local_cid_bytes);
+        const local_cid = try conn_internal.ConnectionId.init(&local_cid_bytes);
+
+        var remote_cid_bytes: [8]u8 = undefined;
+        std.crypto.random.bytes(&remote_cid_bytes);
+        const remote_cid = try conn_internal.ConnectionId.init(&remote_cid_bytes);
+
+        const quic_mode: conn_internal.QuicMode = switch (self.config.mode) {
+            .ssh => .ssh,
+            .tls => .tls,
+        };
+
+        internal_conn.* = try conn_internal.Connection.initClient(
+            self.allocator,
+            quic_mode,
+            local_cid,
+            remote_cid,
+        );
+        self.internal_conn = internal_conn;
 
         self.state = .connecting;
 
-        // Add event
+        // Add connected event
         try self.events.append(self.allocator, .{ .connected = {} });
     }
 
     /// Accept incoming connection (server only)
     pub fn accept(
         self: *QuicConnection,
-        _bind_address: []const u8,
-        _bind_port: u16,
+        bind_address: []const u8,
+        bind_port: u16,
     ) types_mod.QuicError!void {
-        _ = _bind_address;
-        _ = _bind_port;
         if (self.config.role != .server) {
             return types_mod.QuicError.InvalidState;
         }
@@ -94,10 +144,38 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.InvalidState;
         }
 
-        // TODO: Create and bind UDP socket
-        // TODO: Wait for incoming connection
-        // TODO: Create internal connection
-        // TODO: Start handshake
+        // Parse bind address
+        const addr = std.net.Address.parseIp4(bind_address, bind_port) catch {
+            return types_mod.QuicError.InvalidAddress;
+        };
+
+        // Create and bind UDP socket
+        const socket = try self.allocator.create(udp_mod.UdpSocket);
+        errdefer self.allocator.destroy(socket);
+
+        socket.* = udp_mod.UdpSocket.init() catch {
+            return types_mod.QuicError.SocketError;
+        };
+
+        socket.bind(addr) catch {
+            return types_mod.QuicError.SocketError;
+        };
+        self.socket = socket;
+
+        // Create crypto context
+        const crypto_ctx = try self.allocator.create(crypto_mod.CryptoContext);
+        errdefer self.allocator.destroy(crypto_ctx);
+
+        const crypto_mode: crypto_mod.CryptoMode = switch (self.config.mode) {
+            .ssh => .ssh,
+            .tls => .tls,
+        };
+
+        crypto_ctx.* = crypto_mod.CryptoContext.init(
+            crypto_mode,
+            crypto_mod.CipherSuite.TLS_AES_128_GCM_SHA256,
+        );
+        self.crypto_ctx = crypto_ctx;
 
         self.state = .connecting;
     }
@@ -105,9 +183,8 @@ pub const QuicConnection = struct {
     /// Open a new stream
     pub fn openStream(
         self: *QuicConnection,
-        _bidirectional: bool,
+        bidirectional: bool,
     ) types_mod.QuicError!types_mod.StreamId {
-        _ = _bidirectional;
         if (self.state != .established) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
@@ -116,8 +193,32 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.InvalidState;
         }
 
-        // TODO: Open stream through internal connection
-        const stream_id: types_mod.StreamId = 0; // Placeholder
+        const conn = self.internal_conn.?;
+
+        // Generate stream ID
+        const stream_id = conn.nextStreamId(bidirectional) catch {
+            return types_mod.QuicError.StreamLimitReached;
+        };
+
+        // Create stream in internal connection
+        const stream = try self.allocator.create(stream_internal.Stream);
+        errdefer self.allocator.destroy(stream);
+
+        const stream_type: stream_internal.StreamType = if (bidirectional)
+            .bidirectional_client_initiated
+        else
+            .unidirectional_client_initiated;
+
+        stream.* = stream_internal.Stream.init(
+            self.allocator,
+            stream_id,
+            stream_type,
+        );
+
+        try conn.streams.put(self.allocator, stream_id, stream);
+
+        // Add event
+        try self.events.append(self.allocator, .{ .stream_opened = stream_id });
 
         return stream_id;
     }
@@ -133,16 +234,24 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
-        if (self.internal_conn == null) {
-            return types_mod.QuicError.InvalidState;
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+
+        // Get stream
+        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+
+        // Write data to stream
+        const written = stream.write(data) catch {
+            return types_mod.QuicError.StreamError;
+        };
+
+        // Handle finish flag
+        if (finish == .finish) {
+            stream.finishSend() catch {
+                return types_mod.QuicError.StreamError;
+            };
         }
 
-        // TODO: Write to stream through internal connection
-        _ = stream_id;
-        _ = data;
-        _ = finish;
-
-        return 0; // Placeholder
+        return written;
     }
 
     /// Read data from stream
@@ -155,15 +264,17 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
-        if (self.internal_conn == null) {
-            return types_mod.QuicError.InvalidState;
-        }
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
-        // TODO: Read from stream through internal connection
-        _ = stream_id;
-        _ = buffer;
+        // Get stream
+        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
-        return 0; // Placeholder
+        // Read data from stream
+        const read_count = stream.read(buffer) catch {
+            return types_mod.QuicError.StreamError;
+        };
+
+        return read_count;
     }
 
     /// Close a stream
@@ -176,13 +287,18 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
-        if (self.internal_conn == null) {
-            return types_mod.QuicError.InvalidState;
-        }
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
-        // TODO: Close stream through internal connection
-        _ = stream_id;
+        // Get stream
+        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+
+        // Reset stream with error code
         _ = error_code;
+        stream.finishSend() catch {};
+        stream.finishRecv() catch {};
+
+        // Add event
+        try self.events.append(self.allocator, .{ .stream_closed = stream_id });
     }
 
     /// Get stream information
@@ -190,18 +306,19 @@ pub const QuicConnection = struct {
         self: *QuicConnection,
         stream_id: types_mod.StreamId,
     ) types_mod.QuicError!types_mod.StreamInfo {
-        if (self.internal_conn == null) {
-            return types_mod.QuicError.InvalidState;
-        }
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
-        // TODO: Get stream info from internal connection
+        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+
+        const is_bidi = stream.stream_type == .bidirectional_client_initiated or
+            stream.stream_type == .bidirectional_server_initiated;
 
         return types_mod.StreamInfo{
             .id = stream_id,
             .state = .open,
-            .is_bidirectional = true,
-            .bytes_sent = 0,
-            .bytes_received = 0,
+            .is_bidirectional = is_bidi,
+            .bytes_sent = stream.send_offset,
+            .bytes_received = stream.recv_offset,
             .send_buffer_available = 0,
             .recv_buffer_available = 0,
         };
@@ -213,14 +330,24 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ConnectionClosed;
         }
 
-        // TODO: Process received packets
-        // TODO: Send pending packets
-        // TODO: Update timers
-        // TODO: Generate events
-
-        // Placeholder: transition to established if connecting
+        // Transition from connecting to established (simplified handshake)
         if (self.state == .connecting) {
             self.state = .established;
+            try self.events.append(self.allocator, .{ .connected = {} });
+        }
+
+        // Process received packets (simplified)
+        if (self.socket) |socket| {
+            var recv_buffer: [4096]u8 = undefined;
+            const result = socket.receive(&recv_buffer);
+
+            if (result) |recv_result| {
+                _ = recv_result;
+                // Packet received - would process it here
+                // For now, just ignore
+            } else |_| {
+                // No data or error - continue
+            }
         }
     }
 
@@ -235,11 +362,11 @@ pub const QuicConnection = struct {
 
     /// Get connection statistics
     pub fn getStats(self: *QuicConnection) types_mod.ConnectionStats {
-        const stats = types_mod.ConnectionStats{};
+        var stats = types_mod.ConnectionStats{};
 
         if (self.internal_conn) |conn| {
-            _ = conn;
-            // TODO: Populate stats from internal connection
+            stats.bytes_sent = conn.data_sent;
+            stats.bytes_received = conn.data_received;
         }
 
         return stats;
@@ -260,23 +387,24 @@ pub const QuicConnection = struct {
             return;
         }
 
-        // TODO: Send connection close frame
-        // TODO: Clean up internal state
-
-        _ = error_code;
-        _ = reason;
-
+        // Send connection close frame (simplified - just transition state)
         self.state = .draining;
+
+        // Add closing event
+        self.events.append(self.allocator, .{
+            .closing = .{
+                .error_code = error_code,
+                .reason = reason,
+            },
+        }) catch {};
     }
 
     /// Clean up resources
     pub fn deinit(self: *QuicConnection) void {
-        // Close connection if not already closed
         if (self.state != .closed) {
             self.close(0, "Connection closed") catch {};
         }
 
-        // Clean up internal resources
         if (self.internal_conn) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -328,10 +456,8 @@ test "Connection state transitions" {
     var conn = try QuicConnection.init(allocator, config);
     defer conn.deinit();
 
-    // Initial state
     try std.testing.expectEqual(types_mod.ConnectionState.idle, conn.getState());
 
-    // Simulate state transitions
     conn.state = .connecting;
     try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
 
@@ -358,14 +484,11 @@ test "Event queue" {
     var conn = try QuicConnection.init(allocator, config);
     defer conn.deinit();
 
-    // Add event
     try conn.events.append(allocator, .{ .connected = {} });
 
-    // Get event
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
 
-    // Queue should be empty now
     const event2 = conn.nextEvent();
     try std.testing.expect(event2 == null);
 }

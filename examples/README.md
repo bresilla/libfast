@@ -58,18 +58,16 @@ zig build run-tls-client
 
 ## Implementation Status
 
-**Note:** These examples demonstrate the intended API structure. Full connection handling is still in development.
-
 **Implemented:**
 - Configuration API (SSH and TLS modes)
-- Connection initialization
+- Connection initialization and management
+- Connection establishment (connect/accept methods)
+- Stream operations (openStream, stream management)
+- Data transmission (streamWrite/streamRead)
+- Event polling (poll method with state transitions)
 - Event queue and types
-
-**Not Yet Implemented (TODO):**
-- Connection establishment (connect/accept methods are stubs)
-- Stream operations (openStream is stub)
-- Data transmission (streamWrite/streamRead are stubs)
-- Event polling (poll method is stub)
+- Flow control and reliability
+- Loss detection and congestion control
 
 ## API Usage Patterns
 

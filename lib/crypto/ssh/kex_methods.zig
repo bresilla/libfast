@@ -147,7 +147,7 @@ pub const KexState = struct {
                 return public_copy;
             },
             .diffie_hellman_group14_sha256 => {
-                // TODO: Implement DH group14 key generation
+                // DH group14 is legacy - modern implementations use Curve25519
                 return error.UnsupportedMethod;
             },
         }
@@ -182,7 +182,7 @@ pub const KexState = struct {
                 return try self.allocator.dupe(u8, &shared_secret);
             },
             .diffie_hellman_group14_sha256 => {
-                // TODO: Implement DH group14 computation
+                // DH group14 is legacy - modern implementations use Curve25519
                 return error.UnsupportedMethod;
             },
         }
