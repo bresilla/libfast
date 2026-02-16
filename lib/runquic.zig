@@ -36,6 +36,7 @@ pub const packet = @import("core/packet.zig");
 pub const frame = @import("core/frame.zig");
 pub const stream = @import("core/stream.zig");
 pub const connection = @import("core/connection.zig");
+pub const transport_params = @import("core/transport_params.zig");
 pub const flow_control = @import("core/flow_control.zig");
 pub const loss_detection = @import("core/loss_detection.zig");
 pub const congestion = @import("core/congestion.zig");

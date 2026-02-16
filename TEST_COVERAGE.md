@@ -1,14 +1,14 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 191
-- **Unit Tests**: 183
+- **Total Tests**: 200
+- **Unit Tests**: 192
 - **Integration Tests**: 8
-- **Status**: ✅ 191/191 passing
+- **Status**: ✅ 200/200 passing
 
 ## Test Breakdown by Module
 
-### Core Protocol (56 tests)
+### Core Protocol (65 tests)
 - **types.zig** (7 tests)
   - ConnectionId creation, equality, empty
   - StreamType properties and identification
@@ -38,6 +38,16 @@
   - Connection manager
   - Packet number sequencing
   - Connection flow control
+
+- **transport_params.zig** (9 tests)
+  - Transport params initialization
+  - Default client and server params
+  - Encode and decode round trip
+  - Disable migration flag
+  - Empty decode handling
+  - Unknown parameter ignored per RFC
+  - Multiple parameters encoding
+  - Parameter validation
 
 - **flow_control.zig** (10 tests)
   - Flow controller initialization
