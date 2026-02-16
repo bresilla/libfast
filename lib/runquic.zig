@@ -18,6 +18,8 @@ pub const ssh_obfuscation = @import("crypto/ssh/obfuscation.zig");
 pub const ssh_init = @import("crypto/ssh/init.zig");
 pub const ssh_reply = @import("crypto/ssh/reply.zig");
 pub const ssh_cancel = @import("crypto/ssh/cancel.zig");
+pub const ssh_kex = @import("crypto/ssh/kex_methods.zig");
+pub const ssh_secrets = @import("crypto/ssh/secret_derivation.zig");
 
 // Transport
 pub const udp = @import("transport/udp.zig");

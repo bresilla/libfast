@@ -1,8 +1,8 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 80
-- **Unit Tests**: 72
+- **Total Tests**: 92
+- **Unit Tests**: 84
 - **Integration Tests**: 8
 - **Status**: ✅ All passing
 
@@ -62,7 +62,7 @@
   - Timer reset
   - Duration constants
 
-### Crypto (SSH/QUIC) (21 tests)
+### Crypto (SSH/QUIC) (33 tests)
 - **obfuscation.zig** (6 tests)
   - Key derivation from keyword
   - Empty key
@@ -91,6 +91,22 @@
   - SSH_QUIC_CANCEL encode and encrypt
   - SSH_QUIC_CANCEL encode and decode
   - SSH_QUIC_CANCEL empty extensions
+
+- **kex_methods.zig** (6 tests)
+  - KexMethod from name
+  - KexMethod name and hash algorithm
+  - Curve25519 key pair generation
+  - Curve25519 shared secret computation
+  - Exchange hash computation
+  - Complete key exchange
+
+- **secret_derivation.zig** (6 tests)
+  - Derive QUIC secrets from SSH key exchange
+  - Derive QUIC secrets with different hash algorithms
+  - Secret derivation is deterministic
+  - Expand label for additional key material
+  - Expand label with different labels produces different keys
+  - Secrets can be zeroized
 
 ### Transport (2 tests)
 - **udp.zig** (2 tests)
