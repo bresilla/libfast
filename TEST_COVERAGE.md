@@ -1,8 +1,8 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 67
-- **Unit Tests**: 60
+- **Total Tests**: 79
+- **Unit Tests**: 72
 - **Integration Tests**: 7
 - **Status**: ✅ All passing
 
@@ -62,7 +62,7 @@
   - Timer reset
   - Duration constants
 
-### Crypto (SSH/QUIC) (9 tests)
+### Crypto (SSH/QUIC) (21 tests)
 - **obfuscation.zig** (6 tests)
   - Key derivation from keyword
   - Empty key
@@ -75,6 +75,22 @@
   - SSH_QUIC_INIT encode basic
   - SSH_QUIC_INIT encode and encrypt
   - Minimum padding (1200 bytes)
+
+- **reply.zig** (5 tests)
+  - SSH_QUIC_REPLY encode basic
+  - SSH_QUIC_REPLY encode and encrypt
+  - SSH_QUIC_REPLY amplification limit
+  - SSH_QUIC_ERROR_REPLY encode
+  - SSH_QUIC_ERROR_REPLY encode and encrypt
+
+- **cancel.zig** (7 tests)
+  - SSH_QUIC_CANCEL encode basic
+  - SSH_QUIC_CANCEL predefined reasons
+  - SSH_QUIC_CANCEL with extensions
+  - SSH_QUIC_CANCEL with padding
+  - SSH_QUIC_CANCEL encode and encrypt
+  - SSH_QUIC_CANCEL encode and decode
+  - SSH_QUIC_CANCEL empty extensions
 
 ### Transport (2 tests)
 - **udp.zig** (2 tests)

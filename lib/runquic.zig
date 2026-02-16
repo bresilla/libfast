@@ -16,6 +16,8 @@ pub const time = @import("utils/time.zig");
 // Crypto
 pub const ssh_obfuscation = @import("crypto/ssh/obfuscation.zig");
 pub const ssh_init = @import("crypto/ssh/init.zig");
+pub const ssh_reply = @import("crypto/ssh/reply.zig");
+pub const ssh_cancel = @import("crypto/ssh/cancel.zig");
 
 // Transport
 pub const udp = @import("transport/udp.zig");
