@@ -252,7 +252,7 @@ No external dependencies required!
 
 ## Version
 
-Current version: **0.3.0**
+Current version: **0.0.1**
 
 - Core QUIC protocol implemented and tested
 - SSH and TLS crypto modes functional

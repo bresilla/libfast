@@ -1,5 +1,5 @@
 .{
-    .name = .syslink,
+    .name = .runquic,
     .version = "0.0.1",
     .dependencies = .{
         // zquic removed - building custom minimal QUIC for SSH/QUIC
@@ -11,5 +11,5 @@
         "examples",
         "lib",
     },
-    .fingerprint = 0xc55b9533dacbf6c7,
+    .fingerprint = 0x7a4bc66c1fa0e3a2,
 }
