@@ -10,6 +10,8 @@ pub const frame = @import("core/frame.zig");
 pub const stream = @import("core/stream.zig");
 pub const connection = @import("core/connection.zig");
 pub const varint = @import("utils/varint.zig");
+pub const buffer = @import("utils/buffer.zig");
+pub const time = @import("utils/time.zig");
 
 // Transport
 pub const udp = @import("transport/udp.zig");
