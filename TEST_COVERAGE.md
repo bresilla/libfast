@@ -1,8 +1,8 @@
 # Test Coverage Summary
 
 ## Overview
-- **Total Tests**: 92
-- **Unit Tests**: 84
+- **Total Tests**: 123
+- **Unit Tests**: 115
 - **Integration Tests**: 8
 - **Status**: ✅ All passing
 
@@ -62,7 +62,9 @@
   - Timer reset
   - Duration constants
 
-### Crypto (SSH/QUIC) (33 tests)
+### Crypto (64 tests)
+
+#### SSH/QUIC Specific (33 tests)
 - **obfuscation.zig** (6 tests)
   - Key derivation from keyword
   - Empty key
@@ -107,6 +109,47 @@
   - Expand label for additional key material
   - Expand label with different labels produces different keys
   - Secrets can be zeroized
+
+#### Common Crypto Layer (31 tests)
+
+- **aead.zig** (7 tests)
+  - AES-128-GCM encrypt and decrypt
+  - AES-256-GCM encrypt and decrypt
+  - ChaCha20-Poly1305 encrypt and decrypt
+  - Authentication failure with wrong key
+  - Authentication failure with wrong associated data
+  - Invalid key length
+  - AEAD algorithm parameters
+
+- **keys.zig** (9 tests)
+  - Derive key material for AES-128-GCM
+  - Derive key material for AES-256-GCM
+  - Derive key material for ChaCha20-Poly1305
+  - Key derivation is deterministic
+  - Different secrets produce different keys
+  - Update secret for key phase
+  - Key update is deterministic
+  - HKDF-Expand with different hash algorithms
+
+- **header_protection.zig** (9 tests)
+  - AES-128-GCM header protection
+  - AES-256-GCM header protection
+  - ChaCha20-Poly1305 header protection
+  - Protect and unprotect short header
+  - Protect and unprotect long header
+  - Different samples produce different masks
+  - Same sample produces same mask
+  - Invalid key length
+  - Invalid sample length
+
+- **crypto.zig** (6 tests)
+  - Create crypto context for TLS mode
+  - Create crypto context for SSH mode
+  - Install secrets and derive keys
+  - Client encrypt and server decrypt
+  - Server encrypt and client decrypt
+  - Cipher suite from name
+  - Cipher suite name
 
 ### Transport (2 tests)
 - **udp.zig** (2 tests)

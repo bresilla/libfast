@@ -13,13 +13,19 @@ pub const varint = @import("utils/varint.zig");
 pub const buffer = @import("utils/buffer.zig");
 pub const time = @import("utils/time.zig");
 
-// Crypto
+// Crypto - SSH/QUIC
 pub const ssh_obfuscation = @import("crypto/ssh/obfuscation.zig");
 pub const ssh_init = @import("crypto/ssh/init.zig");
 pub const ssh_reply = @import("crypto/ssh/reply.zig");
 pub const ssh_cancel = @import("crypto/ssh/cancel.zig");
 pub const ssh_kex = @import("crypto/ssh/kex_methods.zig");
 pub const ssh_secrets = @import("crypto/ssh/secret_derivation.zig");
+
+// Crypto - Common
+pub const crypto = @import("crypto/crypto.zig");
+pub const aead = @import("crypto/aead.zig");
+pub const keys = @import("crypto/keys.zig");
+pub const header_protection = @import("crypto/header_protection.zig");
 
 // Transport
 pub const udp = @import("transport/udp.zig");
