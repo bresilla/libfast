@@ -43,7 +43,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 
 ## Epoch 3 - Packet, Frame, and Stream Runtime
 
-### Slice 3.1 - Packet number semantics
+### Slice 3.1 - Packet number semantics [done]
 - Implement variable packet number length encode/decode paths.
 - Integrate PN protection bits with header protection flow.
 
