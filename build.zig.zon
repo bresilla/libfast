@@ -1,5 +1,5 @@
 .{
-    .name = .runquic,
+    .name = .libfast,
     .version = "0.0.4",
     .dependencies = .{
         // zquic removed - building custom minimal QUIC for SSH/QUIC
@@ -11,5 +11,5 @@
         "examples",
         "lib",
     },
-    .fingerprint = 0x7a4bc66c1fa0e3a2,
+    .fingerprint = 0x195115882e60ff19,
 }

@@ -1,6 +1,5 @@
-/// RunQUIC - QUIC transport library
+/// libfast - QUIC transport library
 /// Supports both TLS and SSH key exchange modes
-
 const std = @import("std");
 
 // ============================================================================

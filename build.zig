@@ -4,24 +4,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create the runquic module
-    const runquic_module = b.createModule(.{
-        .root_source_file = b.path("lib/runquic.zig"),
+    // Create the libfast module
+    const libfast_module = b.createModule(.{
+        .root_source_file = b.path("lib/libfast.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // Export the module so it can be used by other projects
-    _ = b.addModule("runquic", .{
-        .root_source_file = b.path("lib/runquic.zig"),
+    _ = b.addModule("libfast", .{
+        .root_source_file = b.path("lib/libfast.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     // Build the library
     const lib = b.addLibrary(.{
-        .name = "runquic",
-        .root_module = runquic_module,
+        .name = "fast",
+        .root_module = libfast_module,
         .linkage = .static,
     });
 
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests
     const lib_unit_tests = b.addTest(.{
-        .root_module = runquic_module,
+        .root_module = libfast_module,
     });
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    ssh_server_module.addImport("runquic", runquic_module);
+    ssh_server_module.addImport("libfast", libfast_module);
 
     const ssh_server = b.addExecutable(.{
         .name = "ssh_echo_server",
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    ssh_client_module.addImport("runquic", runquic_module);
+    ssh_client_module.addImport("libfast", libfast_module);
 
     const ssh_client = b.addExecutable(.{
         .name = "ssh_echo_client",
@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tls_server_module.addImport("runquic", runquic_module);
+    tls_server_module.addImport("libfast", libfast_module);
 
     const tls_server = b.addExecutable(.{
         .name = "tls_echo_server",
@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tls_client_module.addImport("runquic", runquic_module);
+    tls_client_module.addImport("libfast", libfast_module);
 
     const tls_client = b.addExecutable(.{
         .name = "tls_echo_client",

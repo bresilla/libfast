@@ -1,10 +1,10 @@
-# RunQUIC
+# libfast
 
 A standalone Zig QUIC transport library supporting both SSH key exchange and TLS 1.3 modes.
 
 ## Overview
 
-RunQUIC provides a complete QUIC transport implementation (RFC 9000, 9002) with dual crypto modes:
+libfast provides a complete QUIC transport implementation (RFC 9000, 9002) with dual crypto modes:
 
 - **SSH Key Exchange Mode** - For SSH applications (experimental spec)
 - **TLS 1.3 Mode** - For HTTP/3 and standard QUIC applications (RFC 9001)
@@ -38,22 +38,22 @@ RunQUIC provides a complete QUIC transport implementation (RFC 9000, 9002) with 
 
 ### Installation
 
-Add RunQUIC as a dependency in your `build.zig`:
+Add libfast as a dependency in your `build.zig`:
 
 ```zig
-const runquic = b.dependency("runquic", .{
+const libfast = b.dependency("libfast", .{
     .target = target,
     .optimize = optimize,
 });
 
-exe.root_module.addImport("runquic", runquic.module("runquic"));
+exe.root_module.addImport("libfast", libfast.module("libfast"));
 ```
 
 ### Usage Example (SSH Mode)
 
 ```zig
 const std = @import("std");
-const runquic = @import("runquic");
+const libfast = @import("libfast");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -61,13 +61,13 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Configure SSH mode
-    const config = runquic.QuicConfig.sshClient(
+    const config = libfast.QuicConfig.sshClient(
         "server.example.com",
         "obfuscation-keyword"
     );
 
     // Create connection
-    var conn = try runquic.QuicConnection.init(allocator, config);
+    var conn = try libfast.QuicConnection.init(allocator, config);
     defer conn.deinit();
 
     // Connect and use streams
@@ -81,10 +81,10 @@ pub fn main() !void {
 
 ```zig
 // Configure TLS mode
-const config = runquic.QuicConfig.tlsClient("server.example.com");
+const config = libfast.QuicConfig.tlsClient("server.example.com");
 
 // Same API - just different crypto mode
-var conn = try runquic.QuicConnection.init(allocator, config);
+var conn = try libfast.QuicConnection.init(allocator, config);
 // ... rest is identical
 ```
 
@@ -92,7 +92,7 @@ var conn = try runquic.QuicConnection.init(allocator, config);
 
 ```
 lib/
-├── runquic.zig              # Main entry point, public API
+├── libfast.zig              # Main entry point, public API
 ├── core/                    # Core QUIC protocol
 │   ├── types.zig
 │   ├── connection.zig
@@ -199,7 +199,7 @@ zig build test --summary all
 
 ## Dependencies
 
-RunQUIC uses only Zig's standard library:
+libfast uses only Zig's standard library:
 - `std.crypto` - All cryptographic operations
 - `std.net` - UDP sockets
 - `std.mem` - Memory management
@@ -209,7 +209,7 @@ No external dependencies required!
 
 ## Design Philosophy
 
-1. **Library-First Approach** - RunQUIC is a transport library, not a full protocol implementation
+1. **Library-First Approach** - libfast is a transport library, not a full protocol implementation
    - QUIC transport and crypto
    - SSH protocol (implemented by applications like syslink)
    - HTTP/3 semantics (implemented by HTTP/3 applications)

@@ -1,5 +1,5 @@
 const std = @import("std");
-const runquic = @import("runquic");
+const libfast = @import("libfast");
 
 /// Minimal SSH/QUIC echo server
 ///
@@ -11,7 +11,6 @@ const runquic = @import("runquic");
 ///
 /// Usage: zig build run-ssh-server
 /// Then connect with: zig build run-ssh-client
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -20,10 +19,10 @@ pub fn main() !void {
     std.log.info("Starting SSH/QUIC echo server on 127.0.0.1:4433", .{});
 
     // Configure SSH mode with obfuscation keyword
-    const config = runquic.QuicConfig.sshServer("test-obfuscation-keyword");
+    const config = libfast.QuicConfig.sshServer("test-obfuscation-keyword");
 
     // Create connection
-    var conn = try runquic.QuicConnection.init(allocator, config);
+    var conn = try libfast.QuicConnection.init(allocator, config);
     defer conn.deinit();
 
     std.log.info("Server ready, waiting for connections...", .{});
@@ -60,7 +59,7 @@ pub fn main() !void {
     std.log.info("Server shutting down", .{});
 }
 
-fn handleStream(conn: *runquic.QuicConnection, stream_id: u64) !void {
+fn handleStream(conn: *libfast.QuicConnection, stream_id: u64) !void {
     _ = conn;
     _ = stream_id;
 
