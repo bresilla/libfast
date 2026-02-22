@@ -76,7 +76,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 
 ## Epoch 4 - Reliability and Congestion Behavior
 
-### Slice 4.1 - ACK integration
+### Slice 4.1 - ACK integration [done]
 - Feed ACK ranges into loss detection state.
 - Update in-flight accounting and RTT sampling from ACKed packets.
 
