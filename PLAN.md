@@ -88,7 +88,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Integrate NewReno cwnd updates with send pacing decisions.
 - Enforce send budget under congestion and amplification limits.
 
-### Slice 4.4 - Recovery test harness
+### Slice 4.4 - Recovery test harness [done]
 - Add scenario tests for loss, reordering, and timeouts.
 - Assert bounded recovery time and stable behavior under stress.
 
