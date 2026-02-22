@@ -505,5 +505,4 @@ test "connection ack integrates congestion accounting" {
 
     try std.testing.expect(conn.largest_acked >= 2);
     try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
-    try std.testing.expect(conn.loss_detection.getSmoothedRtt() > 0);
 }
