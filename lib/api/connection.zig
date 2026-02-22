@@ -7,6 +7,7 @@ const udp_mod = @import("../transport/udp.zig");
 const crypto_mod = @import("../crypto/crypto.zig");
 const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
+const core_types = @import("../core/types.zig");
 
 /// Public QUIC connection handle
 pub const QuicConnection = struct {
@@ -69,7 +70,7 @@ pub const QuicConnection = struct {
         }
 
         // Parse address
-        const addr = std.net.Address.parseIp4(remote_address, remote_port) catch {
+        const addr = std.net.Address.parseIp(remote_address, remote_port) catch {
             return types_mod.QuicError.InvalidAddress;
         };
         self.remote_addr = addr;
@@ -78,7 +79,7 @@ pub const QuicConnection = struct {
         const socket = try self.allocator.create(udp_mod.UdpSocket);
         errdefer self.allocator.destroy(socket);
 
-        socket.* = udp_mod.UdpSocket.init() catch {
+        socket.* = udp_mod.UdpSocket.bindAny(self.allocator, 0) catch {
             return types_mod.QuicError.SocketError;
         };
         self.socket = socket;
@@ -93,6 +94,7 @@ pub const QuicConnection = struct {
         };
 
         crypto_ctx.* = crypto_mod.CryptoContext.init(
+            self.allocator,
             crypto_mode,
             crypto_mod.CipherSuite.TLS_AES_128_GCM_SHA256,
         );
@@ -105,13 +107,17 @@ pub const QuicConnection = struct {
         // Generate connection IDs
         var local_cid_bytes: [8]u8 = undefined;
         std.crypto.random.bytes(&local_cid_bytes);
-        const local_cid = try conn_internal.ConnectionId.init(&local_cid_bytes);
+        const local_cid = core_types.ConnectionId.init(&local_cid_bytes) catch {
+            return types_mod.QuicError.InvalidConfig;
+        };
 
         var remote_cid_bytes: [8]u8 = undefined;
         std.crypto.random.bytes(&remote_cid_bytes);
-        const remote_cid = try conn_internal.ConnectionId.init(&remote_cid_bytes);
+        const remote_cid = core_types.ConnectionId.init(&remote_cid_bytes) catch {
+            return types_mod.QuicError.InvalidConfig;
+        };
 
-        const quic_mode: conn_internal.QuicMode = switch (self.config.mode) {
+        const quic_mode: core_types.QuicMode = switch (self.config.mode) {
             .ssh => .ssh,
             .tls => .tls,
         };
@@ -125,9 +131,6 @@ pub const QuicConnection = struct {
         self.internal_conn = internal_conn;
 
         self.state = .connecting;
-
-        // Add connected event
-        try self.events.append(self.allocator, .{ .connected = {} });
     }
 
     /// Accept incoming connection (server only)
@@ -145,7 +148,7 @@ pub const QuicConnection = struct {
         }
 
         // Parse bind address
-        const addr = std.net.Address.parseIp4(bind_address, bind_port) catch {
+        const addr = std.net.Address.parseIp(bind_address, bind_port) catch {
             return types_mod.QuicError.InvalidAddress;
         };
 
@@ -153,11 +156,7 @@ pub const QuicConnection = struct {
         const socket = try self.allocator.create(udp_mod.UdpSocket);
         errdefer self.allocator.destroy(socket);
 
-        socket.* = udp_mod.UdpSocket.init() catch {
-            return types_mod.QuicError.SocketError;
-        };
-
-        socket.bind(addr) catch {
+        socket.* = udp_mod.UdpSocket.bind(self.allocator, addr) catch {
             return types_mod.QuicError.SocketError;
         };
         self.socket = socket;
@@ -172,6 +171,7 @@ pub const QuicConnection = struct {
         };
 
         crypto_ctx.* = crypto_mod.CryptoContext.init(
+            self.allocator,
             crypto_mode,
             crypto_mod.CipherSuite.TLS_AES_128_GCM_SHA256,
         );
@@ -195,27 +195,9 @@ pub const QuicConnection = struct {
 
         const conn = self.internal_conn.?;
 
-        // Generate stream ID
-        const stream_id = conn.nextStreamId(bidirectional) catch {
+        const stream_id = conn.openStream(bidirectional) catch {
             return types_mod.QuicError.StreamLimitReached;
         };
-
-        // Create stream in internal connection
-        const stream = try self.allocator.create(stream_internal.Stream);
-        errdefer self.allocator.destroy(stream);
-
-        const stream_type: stream_internal.StreamType = if (bidirectional)
-            .bidirectional_client_initiated
-        else
-            .unidirectional_client_initiated;
-
-        stream.* = stream_internal.Stream.init(
-            self.allocator,
-            stream_id,
-            stream_type,
-        );
-
-        try conn.streams.put(self.allocator, stream_id, stream);
 
         // Add event
         try self.events.append(self.allocator, .{ .stream_opened = stream_id });
@@ -237,7 +219,7 @@ pub const QuicConnection = struct {
         const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
         // Get stream
-        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+        const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
         // Write data to stream
         const written = stream.write(data) catch {
@@ -267,7 +249,7 @@ pub const QuicConnection = struct {
         const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
         // Get stream
-        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+        const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
         // Read data from stream
         const read_count = stream.read(buffer) catch {
@@ -290,15 +272,13 @@ pub const QuicConnection = struct {
         const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
         // Get stream
-        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+        const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
         // Reset stream with error code
-        _ = error_code;
-        stream.finishSend() catch {};
-        stream.finishRecv() catch {};
+        stream.reset(error_code);
 
         // Add event
-        try self.events.append(self.allocator, .{ .stream_closed = stream_id });
+        try self.events.append(self.allocator, .{ .stream_closed = .{ .id = stream_id, .error_code = error_code } });
     }
 
     /// Get stream information
@@ -308,14 +288,20 @@ pub const QuicConnection = struct {
     ) types_mod.QuicError!types_mod.StreamInfo {
         const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
 
-        const stream = conn.streams.get(stream_id) orelse return types_mod.QuicError.StreamNotFound;
+        const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
-        const is_bidi = stream.stream_type == .bidirectional_client_initiated or
-            stream.stream_type == .bidirectional_server_initiated;
+        const is_bidi = stream.isBidirectional();
+
+        const state: types_mod.StreamState = if (stream.isClosed())
+            .closed
+        else if (stream.send_state == .ready or stream.send_state == .send)
+            .open
+        else
+            .send_closed;
 
         return types_mod.StreamInfo{
             .id = stream_id,
-            .state = .open,
+            .state = state,
             .is_bidirectional = is_bidi,
             .bytes_sent = stream.send_offset,
             .bytes_received = stream.recv_offset,
@@ -339,14 +325,17 @@ pub const QuicConnection = struct {
         // Process received packets (simplified)
         if (self.socket) |socket| {
             var recv_buffer: [4096]u8 = undefined;
-            const result = socket.receive(&recv_buffer);
+            _ = socket.recvFrom(&recv_buffer) catch |err| {
+                if (err == error.WouldBlock) {
+                    return;
+                }
+                return types_mod.QuicError.NetworkError;
+            };
 
-            if (result) |recv_result| {
-                _ = recv_result;
-                // Packet received - would process it here
-                // For now, just ignore
-            } else |_| {
-                // No data or error - continue
+            // Packet received - packet decode and frame processing are implemented
+            // in subsequent production-readiness slices.
+            if (self.internal_conn) |conn| {
+                conn.updateDataReceived(1);
             }
         }
     }
@@ -491,4 +480,49 @@ test "Event queue" {
 
     const event2 = conn.nextEvent();
     try std.testing.expect(event2 == null);
+}
+
+test "connect emits connected event on poll" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    try std.testing.expect(conn.nextEvent() == null);
+
+    try conn.poll();
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .connected);
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "closeStream emits structured stream_closed event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    const stream_id = try conn.openStream(true);
+    _ = conn.nextEvent(); // drain stream_opened
+
+    try conn.closeStream(stream_id, 42);
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_closed);
+    try std.testing.expectEqual(stream_id, event.?.stream_closed.id);
+    try std.testing.expectEqual(@as(?u64, 42), event.?.stream_closed.error_code);
 }
