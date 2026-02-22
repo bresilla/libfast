@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.5] - 2026-02-22
+
+### <!-- 0 -->⛰️  Features
+
+- Rename project to libfast
+
 ## [0.0.4] - 2026-02-16
 
 ### <!-- 0 -->⛰️  Features
