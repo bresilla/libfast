@@ -38,6 +38,9 @@ pub const TlsContext = struct {
     /// Key schedule
     key_schedule: ?*key_schedule_mod.KeySchedule = null,
 
+    /// Handshake transcript bytes
+    transcript: std.ArrayList(u8),
+
     /// Handshake secrets
     handshake_client_secret: ?[]u8 = null,
     handshake_server_secret: ?[]u8 = null,
@@ -52,6 +55,7 @@ pub const TlsContext = struct {
             .allocator = allocator,
             .is_client = is_client,
             .state = .idle,
+            .transcript = .{},
         };
     }
 
@@ -85,6 +89,9 @@ pub const TlsContext = struct {
 
         const encoded = try client_hello.encode(self.allocator);
 
+        self.transcript.clearRetainingCapacity();
+        try self.transcript.appendSlice(self.allocator, encoded);
+
         self.state = .client_hello_sent;
 
         return encoded;
@@ -114,6 +121,8 @@ pub const TlsContext = struct {
             else => return error.UnsupportedCipherSuite,
         }
 
+        try self.transcript.appendSlice(self.allocator, server_hello_data);
+
         self.state = .server_hello_received;
     }
 
@@ -135,9 +144,8 @@ pub const TlsContext = struct {
         const handshake_secret = try ks.deriveHandshakeSecret(early_secret, shared_secret);
         defer self.allocator.free(handshake_secret);
 
-        // Update transcript (simplified)
-        ks.updateTranscript("ClientHello");
-        ks.updateTranscript("ServerHello");
+        // Use real handshake transcript bytes (ClientHello + ServerHello)
+        ks.updateTranscript(self.transcript.items);
 
         // Derive handshake traffic secrets
         const hs_secrets = try ks.deriveHandshakeTrafficSecrets(handshake_secret);
@@ -145,9 +153,6 @@ pub const TlsContext = struct {
         // Derive master secret
         const master_secret = try ks.deriveMasterSecret(handshake_secret);
         defer self.allocator.free(master_secret);
-
-        // Update transcript
-        ks.updateTranscript("Finished");
 
         // Derive application traffic secrets
         const app_secrets = try ks.deriveApplicationTrafficSecrets(master_secret);
@@ -203,6 +208,8 @@ pub const TlsContext = struct {
             ks.deinit();
             self.allocator.destroy(ks);
         }
+
+        self.transcript.deinit(self.allocator);
     }
 };
 
@@ -258,6 +265,7 @@ test "Complete handshake flow" {
     try std.testing.expect(ctx.state.isComplete());
     try std.testing.expect(ctx.handshake_client_secret != null);
     try std.testing.expect(ctx.application_client_secret != null);
+    try std.testing.expect(ctx.transcript.items.len > 0);
 }
 
 test "Process ServerHello rejects unsupported cipher suite" {
