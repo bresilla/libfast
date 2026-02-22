@@ -55,7 +55,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Wire STREAM/RESET/STOP handling into stream manager state.
 - Emit `stream_readable` and `stream_closed` events from real traffic.
 
-### Slice 3.4 - Connection close semantics
+### Slice 3.4 - Connection close semantics [done]
 - Encode/decode close frames and transition draining/closed correctly.
 - Preserve peer error code and reason through public events.
 
