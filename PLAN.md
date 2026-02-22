@@ -94,7 +94,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 
 ## Epoch 5 - Security Hardening and Operational Readiness
 
-### Slice 5.1 - Secret lifecycle hardening
+### Slice 5.1 - Secret lifecycle hardening [done]
 - Remove page allocator usage in secret derivation paths.
 - Zeroize transient sensitive buffers consistently.
 
