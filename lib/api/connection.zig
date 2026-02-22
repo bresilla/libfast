@@ -280,9 +280,7 @@ pub const QuicConnection = struct {
 
         // Handle finish flag
         if (finish == .finish) {
-            stream.finishSend() catch {
-                return types_mod.QuicError.StreamError;
-            };
+            stream.finish();
         }
 
         return written;
@@ -326,11 +324,14 @@ pub const QuicConnection = struct {
         // Get stream
         const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
-        // Reset stream with error code
-        stream.reset(error_code);
+        _ = error_code;
 
-        // Add event
-        try self.events.append(self.allocator, .{ .stream_closed = .{ .id = stream_id, .error_code = error_code } });
+        // Graceful close: send FIN (half-close), keep receive side open.
+        stream.finish();
+
+        if (stream.isClosed()) {
+            try self.events.append(self.allocator, .{ .stream_closed = .{ .id = stream_id, .error_code = null } });
+        }
     }
 
     /// Get stream information
@@ -344,12 +345,23 @@ pub const QuicConnection = struct {
 
         const is_bidi = stream.isBidirectional();
 
-        const state: types_mod.StreamState = if (stream.isClosed())
+        const send_closed = switch (stream.send_state) {
+            .data_sent, .reset_sent, .reset_recvd => true,
+            else => false,
+        };
+        const recv_closed = switch (stream.recv_state) {
+            .data_read, .reset_read => true,
+            else => false,
+        };
+
+        const state: types_mod.StreamState = if (send_closed and recv_closed)
             .closed
-        else if (stream.send_state == .ready or stream.send_state == .send)
-            .open
+        else if (send_closed)
+            .send_closed
+        else if (recv_closed)
+            .recv_closed
         else
-            .send_closed;
+            .open;
 
         return types_mod.StreamInfo{
             .id = stream_id,
@@ -567,7 +579,7 @@ test "connect emits connected event on poll" {
     try std.testing.expect(conn.nextEvent() == null);
 }
 
-test "closeStream emits structured stream_closed event" {
+test "closeStream is FIN-based half close" {
     const allocator = std.testing.allocator;
 
     const config = config_mod.QuicConfig.sshClient("example.com", "secret");
@@ -587,11 +599,32 @@ test "closeStream emits structured stream_closed event" {
     _ = conn.nextEvent(); // drain stream_opened
 
     try conn.closeStream(stream_id, 42);
-    const event = conn.nextEvent();
-    try std.testing.expect(event != null);
-    try std.testing.expect(event.? == .stream_closed);
-    try std.testing.expectEqual(stream_id, event.?.stream_closed.id);
-    try std.testing.expectEqual(@as(?u64, 42), event.?.stream_closed.error_code);
+
+    // FIN-based close should not emit stream_closed immediately (half-close)
+    try std.testing.expect(conn.nextEvent() == null);
+
+    const info_after_close = try conn.getStreamInfo(stream_id);
+    try std.testing.expectEqual(types_mod.StreamState.send_closed, info_after_close.state);
+
+    // Local write after FIN should fail
+    try std.testing.expectError(
+        types_mod.QuicError.StreamError,
+        conn.streamWrite(stream_id, "after-fin", .no_finish),
+    );
+
+    // Peer can still send while our send side is closed
+    const stream = conn.internal_conn.?.getStream(stream_id).?;
+    try stream.appendRecvData("peer-data", 0, false);
+
+    var read_buf: [64]u8 = undefined;
+    const read_len = try conn.streamRead(stream_id, &read_buf);
+    try std.testing.expectEqual(@as(usize, 9), read_len);
+    try std.testing.expectEqualStrings("peer-data", read_buf[0..read_len]);
+
+    // Peer FIN => EOF visible to application
+    try stream.appendRecvData(&[_]u8{}, stream.recv_offset, true);
+    const eof_len = try conn.streamRead(stream_id, &read_buf);
+    try std.testing.expectEqual(@as(usize, 0), eof_len);
 }
 
 test "poll parses received long-header packet and updates visibility stats" {
