@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.0.6] - 2026-02-22
+
+### <!-- 0 -->⛰️  Features
+
+- Handle challenge-response validation and amplification gates
+- Enforce send budget from cwnd and amplification
+- Schedule retransmissions and PTO probes
+- Wire ack handling into loss and congestion state
+- Finalize draining-to-closed transition semantics
+- Route stream reset and stop frames into state
+- Decode and route control frames in poll loop
+- Enforce bidirectional stream policy and channel IDs
+- Make closeStream send FIN with half-close behavior
+- Encode and decode variable-length packet numbers
+- Add peer certificate and hostname verification hooks
+- Enforce tls peer verification policy invariants
+- Verify Finished data during handshake completion
+- Track real handshake transcript bytes
+- Parse ServerHello and validate cipher suite
+- Parse inbound packet headers in poll loop
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Align connection lifecycle with transport and event types
+
+### <!-- 2 -->🚜 Refactor
+
+- Remove page allocator usage in secret derivation
+
+### <!-- 3 -->📚 Documentation
+
+- Mark release and compliance slice done
+- Mark fuzz and negative testing slice done
+- Mark path validation slice done
+- Mark secret lifecycle hardening slice done
+- Mark recovery harness slice done
+- Mark congestion wiring slice done
+- Mark retransmission scheduler slice done
+- Mark ack integration slice done
+- Mark connection close semantics slice done
+- Mark stream receive send slice done
+- Mark frame decode coverage slice done
+- Mark ssh cleanup compatibility slice done
+- Mark ssh bidi stream policy slice done
+- Mark fin close semantics slice done
+- Mark packet number slice done
+- Mark handshake vector slice done
+- Mark certificate validation slice done
+- Mark certificate validation slice in progress
+- Mark transcript and finished slice done
+- Mark transcript slice in progress
+- Mark tls serverhello slice done
+- Mark epoch 1 slices as done
+- Define production-readiness epochs and slices
+
+### <!-- 6 -->🧪 Testing
+
+- Add malformed decode corpus and fuzz smoke tests
+- Relax reordering retransmit bound for stability
+- Add loss reordering and timeout stress scenarios
+- Stabilize ack congestion integration assertion
+- Validate ssh transport cleanup flow control behavior
+- Add deterministic handshake vector and state machine guards
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Remove completed roadmap file
+- Add ci gates license and security policy
+
 ## [0.0.5] - 2026-02-22
 
 ### <!-- 0 -->⛰️  Features
