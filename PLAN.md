@@ -33,7 +33,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Build transcript from real handshake bytes.
 - Verify Finished MAC before marking handshake complete.
 
-### Slice 2.3 - Certificate path validation [in progress]
+### Slice 2.3 - Certificate path validation [done]
 - Validate certificate chain and hostname for client mode.
 - Add config options for trust anchors and verification policy.
 
