@@ -180,7 +180,7 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 if (self.internal_conn) |conn| {
-                    conn.processAck(decoded.frame.largest_acked);
+                    conn.processAckDetailed(decoded.frame.largest_acked, decoded.frame.ack_delay);
                 }
             },
             0x1c, 0x1d => {
@@ -403,6 +403,9 @@ pub const QuicConnection = struct {
         const written = stream.write(data) catch {
             return types_mod.QuicError.StreamError;
         };
+
+        conn.updateDataSent(written);
+        conn.trackPacketSent(written, true);
 
         // Handle finish flag
         if (finish == .finish) {

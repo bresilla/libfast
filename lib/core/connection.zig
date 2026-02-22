@@ -2,6 +2,9 @@ const std = @import("std");
 const types = @import("types.zig");
 const stream = @import("stream.zig");
 const packet = @import("../core/packet.zig");
+const loss_detection = @import("loss_detection.zig");
+const congestion = @import("congestion.zig");
+const time = @import("../utils/time.zig");
 
 const ConnectionId = types.ConnectionId;
 const ConnectionState = types.ConnectionState;
@@ -38,6 +41,10 @@ pub const Connection = struct {
     /// Packet number tracking
     next_packet_number: u64,
     largest_acked: u64,
+
+    /// Recovery and congestion control
+    loss_detection: loss_detection.LossDetection,
+    congestion_controller: congestion.CongestionController,
 
     /// Flow control
     max_data_local: u64,
@@ -78,6 +85,8 @@ pub const Connection = struct {
             .streams = StreamManager.init(allocator, false, params.initial_max_stream_data_bidi_local),
             .next_packet_number = 0,
             .largest_acked = 0,
+            .loss_detection = loss_detection.LossDetection.init(allocator),
+            .congestion_controller = congestion.CongestionController.init(1200),
             .max_data_local = params.initial_max_data,
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
@@ -115,6 +124,8 @@ pub const Connection = struct {
             .streams = StreamManager.init(allocator, true, params.initial_max_stream_data_bidi_local),
             .next_packet_number = 0,
             .largest_acked = 0,
+            .loss_detection = loss_detection.LossDetection.init(allocator),
+            .congestion_controller = congestion.CongestionController.init(1200),
             .max_data_local = params.initial_max_data,
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
@@ -132,6 +143,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         self.streams.deinit();
+        self.loss_detection.deinit();
     }
 
     /// Open a new stream
@@ -223,8 +235,62 @@ pub const Connection = struct {
 
     /// Process received ACK
     pub fn processAck(self: *Connection, largest_acked: u64) void {
+        self.processAckDetailed(largest_acked, 0);
+    }
+
+    /// Process received ACK with delay (microseconds), update RTT and congestion state.
+    pub fn processAckDetailed(self: *Connection, largest_acked: u64, ack_delay: u64) void {
+        const now = time.Instant.now();
+
+        var ack_result = self.loss_detection.onAckReceived(
+            .application,
+            largest_acked,
+            ack_delay,
+            now,
+        ) catch {
+            if (largest_acked > self.largest_acked) {
+                self.largest_acked = largest_acked;
+            }
+            return;
+        };
+        defer ack_result.lost_packets.deinit(self.allocator);
+
+        if (ack_result.acked_packet) |acked| {
+            if (acked.in_flight) {
+                self.congestion_controller.onPacketAcked(acked.size, acked.packet_number);
+            }
+        }
+
+        if (ack_result.lost_packets.items.len > 0) {
+            var bytes_lost: u64 = 0;
+            var largest_lost: u64 = 0;
+            for (ack_result.lost_packets.items) |lost| {
+                if (lost.in_flight) {
+                    bytes_lost += lost.size;
+                }
+                if (lost.packet_number > largest_lost) {
+                    largest_lost = lost.packet_number;
+                }
+            }
+
+            if (bytes_lost > 0) {
+                self.congestion_controller.onPacketsLost(bytes_lost, largest_lost);
+            }
+        }
+
         if (largest_acked > self.largest_acked) {
             self.largest_acked = largest_acked;
+        }
+    }
+
+    /// Track a sent packet for RTT/loss/congestion accounting.
+    pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
+        const pn = self.nextPacketNumber();
+        const sent = loss_detection.SentPacket.init(pn, time.Instant.now(), packet_size, ack_eliciting);
+
+        self.loss_detection.onPacketSent(.application, sent) catch {};
+        if (sent.in_flight) {
+            self.congestion_controller.onPacketSent(packet_size);
         }
     }
 };
@@ -416,4 +482,28 @@ test "connection flow control" {
 
     // Should fail if exceeding limit
     try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(conn.max_data_remote + 1));
+}
+
+test "connection ack integrates congestion accounting" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+
+    try std.testing.expect(conn.congestion_controller.getBytesInFlight() >= 3600);
+
+    conn.processAckDetailed(2, 0);
+
+    try std.testing.expect(conn.largest_acked >= 2);
+    try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
+    try std.testing.expect(conn.loss_detection.getSmoothedRtt() > 0);
 }
