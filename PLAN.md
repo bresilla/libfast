@@ -51,7 +51,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Add decode implementations for frequently used control frames.
 - Route decoded frames into stream and connection state updates.
 
-### Slice 3.3 - Stream receive/send loop
+### Slice 3.3 - Stream receive/send loop [done]
 - Wire STREAM/RESET/STOP handling into stream manager state.
 - Emit `stream_readable` and `stream_closed` events from real traffic.
 
