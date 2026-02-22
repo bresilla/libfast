@@ -9,6 +9,8 @@ const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
 
+const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
+
 /// Public QUIC connection handle
 pub const QuicConnection = struct {
     allocator: std.mem.Allocator,
@@ -29,6 +31,10 @@ pub const QuicConnection = struct {
 
     // Remote address (for client)
     remote_addr: ?std.net.Address,
+
+    // Basic packet visibility counters
+    packets_received: u64,
+    packets_invalid: u64,
 
     /// Initialize a new QUIC connection
     pub fn init(
@@ -52,7 +58,51 @@ pub const QuicConnection = struct {
             .crypto_ctx = null,
             .events = .{},
             .remote_addr = null,
+            .packets_received = 0,
+            .packets_invalid = 0,
         };
+    }
+
+    fn shortHeaderDcidLen(self: *QuicConnection) u8 {
+        if (self.internal_conn) |conn| {
+            return conn.local_conn_id.len;
+        }
+        return DEFAULT_SHORT_HEADER_DCID_LEN;
+    }
+
+    fn decodePacketHeader(self: *QuicConnection, packet: []const u8) types_mod.QuicError!usize {
+        if (packet.len == 0) {
+            return types_mod.QuicError.InvalidPacket;
+        }
+
+        const is_long_header = (packet[0] & 0x80) != 0;
+
+        if (is_long_header) {
+            const result = packet_mod.LongHeader.decode(packet) catch {
+                return types_mod.QuicError.InvalidPacket;
+            };
+            return result.consumed;
+        }
+
+        const dcid_len = self.shortHeaderDcidLen();
+        const result = packet_mod.ShortHeader.decode(packet, dcid_len) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return result.consumed;
+    }
+
+    fn queueProtocolViolation(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        self.state = .draining;
+        try self.events.append(self.allocator, .{
+            .closing = .{
+                .error_code = 1,
+                .reason = reason,
+            },
+        });
     }
 
     /// Start connecting (client only)
@@ -322,20 +372,34 @@ pub const QuicConnection = struct {
             try self.events.append(self.allocator, .{ .connected = {} });
         }
 
-        // Process received packets (simplified)
+        // Process at most one received datagram
         if (self.socket) |socket| {
             var recv_buffer: [4096]u8 = undefined;
-            _ = socket.recvFrom(&recv_buffer) catch |err| {
+            const recv_result = socket.recvFrom(&recv_buffer) catch |err| {
                 if (err == error.WouldBlock) {
                     return;
                 }
                 return types_mod.QuicError.NetworkError;
             };
 
-            // Packet received - packet decode and frame processing are implemented
-            // in subsequent production-readiness slices.
+            const packet = recv_buffer[0..recv_result.bytes];
+            self.packets_received += 1;
+
             if (self.internal_conn) |conn| {
-                conn.updateDataReceived(1);
+                conn.updateDataReceived(packet.len);
+            }
+
+            _ = self.decodePacketHeader(packet) catch {
+                self.packets_invalid += 1;
+                try self.queueProtocolViolation("invalid packet header");
+                return;
+            };
+
+            if (packet.len > 0) {
+                const frame_result = frame_mod.StreamFrame.decode(packet) catch null;
+                if (frame_result) |decoded| {
+                    try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
+                }
             }
         }
     }
@@ -352,6 +416,7 @@ pub const QuicConnection = struct {
     /// Get connection statistics
     pub fn getStats(self: *QuicConnection) types_mod.ConnectionStats {
         var stats = types_mod.ConnectionStats{};
+        stats.packets_received = self.packets_received;
 
         if (self.internal_conn) |conn| {
             stats.bytes_sent = conn.data_sent;
@@ -525,4 +590,73 @@ test "closeStream emits structured stream_closed event" {
     try std.testing.expect(event.? == .stream_closed);
     try std.testing.expectEqual(stream_id, event.?.stream_closed.id);
     try std.testing.expectEqual(@as(?u64, 42), event.?.stream_closed.error_code);
+}
+
+test "poll parses received long-header packet and updates visibility stats" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent(); // drain connected
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 1,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // payload byte (PING frame type)
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    try conn.poll();
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, packet_len), stats.bytes_received);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll maps invalid packet header to closing event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent(); // drain connected
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    const invalid_packet = [_]u8{0x40};
+    _ = try sender.sendTo(&invalid_packet, local_addr);
+
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(@as(u64, 1), event.?.closing.error_code);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
