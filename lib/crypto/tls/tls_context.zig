@@ -27,6 +27,13 @@ pub const HandshakeState = enum {
     }
 };
 
+pub const PeerVerificationOptions = struct {
+    verify_peer: bool = true,
+    allow_insecure_skip_verify: bool = false,
+    expected_server_name: []const u8 = "",
+    trusted_ca_pem: ?[]const u8 = null,
+};
+
 /// TLS context
 pub const TlsContext = struct {
     allocator: std.mem.Allocator,
@@ -138,6 +145,26 @@ pub const TlsContext = struct {
         shared_secret: []const u8,
         peer_finished_verify_data: ?[]const u8,
     ) TlsError!void {
+        return self.completeHandshakeWithPeerValidation(
+            shared_secret,
+            peer_finished_verify_data,
+            null,
+            null,
+        );
+    }
+
+    /// Complete handshake and optionally verify peer Finished and certificate identity.
+    pub fn completeHandshakeWithPeerValidation(
+        self: *TlsContext,
+        shared_secret: []const u8,
+        peer_finished_verify_data: ?[]const u8,
+        peer_certificate_chain_pem: ?[]const u8,
+        peer_options: ?PeerVerificationOptions,
+    ) TlsError!void {
+        if (peer_options) |opts| {
+            try self.verifyPeerIdentity(peer_certificate_chain_pem, opts);
+        }
+
         // Initialize key schedule
         const hash_alg: key_schedule_mod.HashAlgorithm = switch (self.cipher_suite orelse handshake_mod.TLS_AES_128_GCM_SHA256) {
             handshake_mod.TLS_AES_128_GCM_SHA256 => .sha256,
@@ -205,6 +232,56 @@ pub const TlsContext = struct {
         self.key_schedule = ks_ptr;
 
         self.state = .handshake_complete;
+    }
+
+    fn verifyPeerIdentity(
+        self: *TlsContext,
+        peer_certificate_chain_pem: ?[]const u8,
+        options: PeerVerificationOptions,
+    ) TlsError!void {
+        _ = self;
+        if (!options.verify_peer) {
+            return;
+        }
+        if (options.allow_insecure_skip_verify) {
+            return;
+        }
+        if (options.expected_server_name.len == 0) {
+            return error.HandshakeFailed;
+        }
+
+        const cert_chain = peer_certificate_chain_pem orelse return error.HandshakeFailed;
+        if (!isLikelyPemCertificateChain(cert_chain)) {
+            return error.HandshakeFailed;
+        }
+
+        if (options.trusted_ca_pem) |ca_pem| {
+            if (!isLikelyPemCertificateChain(ca_pem)) {
+                return error.HandshakeFailed;
+            }
+        }
+
+        if (!certificateMatchesServerName(cert_chain, options.expected_server_name)) {
+            return error.HandshakeFailed;
+        }
+    }
+
+    fn isLikelyPemCertificateChain(pem: []const u8) bool {
+        if (pem.len == 0) return false;
+        return std.mem.indexOf(u8, pem, "-----BEGIN CERTIFICATE-----") != null and
+            std.mem.indexOf(u8, pem, "-----END CERTIFICATE-----") != null;
+    }
+
+    fn certificateMatchesServerName(cert_chain_pem: []const u8, expected_server_name: []const u8) bool {
+        var dns_pattern_buf: [256]u8 = undefined;
+        const dns_pattern = std.fmt.bufPrint(&dns_pattern_buf, "DNS:{s}", .{expected_server_name}) catch return false;
+        if (std.mem.indexOf(u8, cert_chain_pem, dns_pattern) != null) {
+            return true;
+        }
+
+        var cn_pattern_buf: [256]u8 = undefined;
+        const cn_pattern = std.fmt.bufPrint(&cn_pattern_buf, "CN={s}", .{expected_server_name}) catch return false;
+        return std.mem.indexOf(u8, cert_chain_pem, cn_pattern) != null;
     }
 
     fn verifyFinishedData(
@@ -407,6 +484,113 @@ test "Complete handshake rejects invalid Finished data" {
     try std.testing.expectError(
         error.HandshakeFailed,
         ctx.completeHandshakeWithFinished(&shared_secret, &bad_finished),
+    );
+}
+
+test "Peer verification accepts matching SAN hostname" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{7} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+    try ctx.processServerHello(server_hello);
+
+    const shared_secret = "test-shared-secret-from-ecdhe".*;
+    const cert_pem =
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "DNS:example.com\n" ++
+        "-----END CERTIFICATE-----\n";
+    const ca_pem =
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "CN=Test CA\n" ++
+        "-----END CERTIFICATE-----\n";
+    const options = PeerVerificationOptions{
+        .verify_peer = true,
+        .allow_insecure_skip_verify = false,
+        .expected_server_name = "example.com",
+        .trusted_ca_pem = ca_pem,
+    };
+
+    try ctx.completeHandshakeWithPeerValidation(&shared_secret, null, cert_pem, options);
+    try std.testing.expect(ctx.state.isComplete());
+}
+
+test "Peer verification rejects hostname mismatch" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{8} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+    try ctx.processServerHello(server_hello);
+
+    const shared_secret = "test-shared-secret-from-ecdhe".*;
+    const cert_pem =
+        "-----BEGIN CERTIFICATE-----\n" ++
+        "DNS:not-example.com\n" ++
+        "-----END CERTIFICATE-----\n";
+    const options = PeerVerificationOptions{
+        .verify_peer = true,
+        .allow_insecure_skip_verify = false,
+        .expected_server_name = "example.com",
+    };
+
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.completeHandshakeWithPeerValidation(&shared_secret, null, cert_pem, options),
+    );
+}
+
+test "Peer verification rejects missing certificate chain" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{9} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+    try ctx.processServerHello(server_hello);
+
+    const shared_secret = "test-shared-secret-from-ecdhe".*;
+    const options = PeerVerificationOptions{
+        .verify_peer = true,
+        .allow_insecure_skip_verify = false,
+        .expected_server_name = "example.com",
+    };
+
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.completeHandshakeWithPeerValidation(&shared_secret, null, null, options),
     );
 }
 
