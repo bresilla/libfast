@@ -25,7 +25,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 
 ## Epoch 2 - TLS 1.3/QUIC Handshake Compliance
 
-### Slice 2.1 - ServerHello parsing
+### Slice 2.1 - ServerHello parsing [done]
 - Parse selected cipher suite from ServerHello rather than hardcoding.
 - Reject unsupported versions/cipher suites with explicit errors.
 
