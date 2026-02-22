@@ -121,6 +121,15 @@ pub const QuicConnection = struct {
             const decoded = frame_mod.StreamFrame.decode(payload) catch {
                 return types_mod.QuicError.InvalidPacket;
             };
+            const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+            const stream = conn.getOrCreateStream(decoded.frame.stream_id) catch {
+                return types_mod.QuicError.StreamError;
+            };
+
+            stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch {
+                return types_mod.QuicError.InvalidPacket;
+            };
+
             try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
             return;
         }
@@ -150,6 +159,37 @@ pub const QuicConnection = struct {
                         .reason = "peer close",
                     },
                 });
+            },
+            0x04 => {
+                const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                const stream = conn.getOrCreateStream(decoded.frame.stream_id) catch {
+                    return types_mod.QuicError.StreamError;
+                };
+
+                stream.recv_state = .reset_read;
+                stream.fin_received = true;
+
+                try self.events.append(self.allocator, .{
+                    .stream_closed = .{
+                        .id = decoded.frame.stream_id,
+                        .error_code = decoded.frame.error_code,
+                    },
+                });
+            },
+            0x05 => {
+                const decoded = frame_mod.StopSendingFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                const stream = conn.getOrCreateStream(decoded.frame.stream_id) catch {
+                    return types_mod.QuicError.StreamError;
+                };
+                stream.reset(decoded.frame.error_code);
             },
             else => {
                 // Unknown/unhandled frame type in this slice: ignore.
@@ -839,6 +879,101 @@ test "poll routes connection close frame to closing event" {
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(@as(u64, 0x0a), event.?.closing.error_code);
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "poll routes STREAM frame into stream data and readable event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 4,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 4,
+        .offset = 0,
+        .data = "hello-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_readable);
+    try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
+
+    var read_buf: [64]u8 = undefined;
+    const n = try conn.streamRead(4, &read_buf);
+    try std.testing.expectEqual(@as(usize, 12), n);
+    try std.testing.expectEqualStrings("hello-stream", read_buf[0..n]);
+}
+
+test "poll routes RESET_STREAM frame to stream_closed event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 20,
+        .packet_number = 5,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const reset_frame = frame_mod.ResetStreamFrame{
+        .stream_id = 4,
+        .error_code = 99,
+        .final_size = 0,
+    };
+    packet_len += try reset_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_closed);
+    try std.testing.expectEqual(@as(u64, 4), event.?.stream_closed.id);
+    try std.testing.expectEqual(@as(?u64, 99), event.?.stream_closed.error_code);
 }
 
 test "ssh mode rejects unidirectional stream open" {

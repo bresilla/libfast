@@ -181,6 +181,32 @@ pub const ResetStreamFrame = struct {
         pos += try varint.encode(self.final_size, buf[pos..]);
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: ResetStreamFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x04) return error.InvalidFrameType;
+
+        const stream_id_result = try varint.decode(buf[pos..]);
+        pos += stream_id_result.len;
+
+        const error_code_result = try varint.decode(buf[pos..]);
+        pos += error_code_result.len;
+
+        const final_size_result = try varint.decode(buf[pos..]);
+        pos += final_size_result.len;
+
+        return .{
+            .frame = ResetStreamFrame{
+                .stream_id = stream_id_result.value,
+                .error_code = error_code_result.value,
+                .final_size = final_size_result.value,
+            },
+            .consumed = pos,
+        };
+    }
 };
 
 /// STOP_SENDING frame (0x05)
@@ -194,6 +220,28 @@ pub const StopSendingFrame = struct {
         pos += try varint.encode(self.stream_id, buf[pos..]);
         pos += try varint.encode(self.error_code, buf[pos..]);
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: StopSendingFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x05) return error.InvalidFrameType;
+
+        const stream_id_result = try varint.decode(buf[pos..]);
+        pos += stream_id_result.len;
+
+        const error_code_result = try varint.decode(buf[pos..]);
+        pos += error_code_result.len;
+
+        return .{
+            .frame = StopSendingFrame{
+                .stream_id = stream_id_result.value,
+                .error_code = error_code_result.value,
+            },
+            .consumed = pos,
+        };
     }
 };
 
@@ -606,6 +654,34 @@ test "connection close frame encode" {
     const decoded = try ConnectionCloseFrame.decode(buf[0..encoded_len]);
     try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
     try std.testing.expectEqualStrings(frame.reason, decoded.frame.reason);
+}
+
+test "reset stream frame encode/decode" {
+    var buf: [100]u8 = undefined;
+    const frame = ResetStreamFrame{
+        .stream_id = 8,
+        .error_code = 42,
+        .final_size = 12,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    const decoded = try ResetStreamFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
+    try std.testing.expectEqual(frame.final_size, decoded.frame.final_size);
+}
+
+test "stop sending frame encode/decode" {
+    var buf: [100]u8 = undefined;
+    const frame = StopSendingFrame{
+        .stream_id = 9,
+        .error_code = 7,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    const decoded = try StopSendingFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
 }
 
 test "ping frame decode" {
