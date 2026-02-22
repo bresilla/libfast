@@ -51,6 +51,15 @@ pub const TlsConfig = struct {
 
     /// ALPN protocols
     alpn_protocols: []const []const u8 = &[_][]const u8{},
+
+    /// Verify server certificate and hostname (client mode)
+    verify_peer: bool = true,
+
+    /// Skip certificate and hostname verification (unsafe)
+    allow_insecure_skip_verify: bool = false,
+
+    /// Optional PEM-encoded custom trust anchors for verification
+    trusted_ca_pem: ?[]const u8 = null,
 };
 
 /// Connection endpoint role
@@ -124,6 +133,14 @@ pub const QuicConfig = struct {
                     const tls = self.tls_config.?;
                     if (tls.certificate_chain == null or tls.private_key == null) {
                         return error.MissingServerCredentials;
+                    }
+                } else {
+                    const tls = self.tls_config.?;
+                    if (tls.verify_peer and tls.server_name.len == 0) {
+                        return error.MissingServerName;
+                    }
+                    if (tls.verify_peer and tls.allow_insecure_skip_verify) {
+                        return error.InvalidTlsVerificationConfig;
                     }
                 }
             },
@@ -232,6 +249,35 @@ test "Config validation - TLS server requires credentials" {
 
     const result = config.validate();
     try std.testing.expectError(error.MissingServerCredentials, result);
+}
+
+test "Config validation - TLS client requires server name when verifying" {
+    const config = QuicConfig{
+        .mode = .tls,
+        .role = .client,
+        .tls_config = TlsConfig{
+            .server_name = "",
+            .verify_peer = true,
+        },
+    };
+
+    const result = config.validate();
+    try std.testing.expectError(error.MissingServerName, result);
+}
+
+test "Config validation - TLS verify_peer conflicts with insecure skip" {
+    const config = QuicConfig{
+        .mode = .tls,
+        .role = .client,
+        .tls_config = TlsConfig{
+            .server_name = "example.com",
+            .verify_peer = true,
+            .allow_insecure_skip_verify = true,
+        },
+    };
+
+    const result = config.validate();
+    try std.testing.expectError(error.InvalidTlsVerificationConfig, result);
 }
 
 test "Role helper methods" {

@@ -1,7 +1,6 @@
 const std = @import("std");
 
 /// Public API types for QUIC connections and streams
-
 /// Connection state
 pub const ConnectionState = enum {
     idle, // Initial state
@@ -67,6 +66,8 @@ pub const QuicError = error{
     MissingSshConfig,
     MissingTlsConfig,
     MissingServerCredentials,
+    MissingServerName,
+    InvalidTlsVerificationConfig,
 
     // Connection errors
     ConnectionNotEstablished,

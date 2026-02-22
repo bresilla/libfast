@@ -46,6 +46,8 @@ pub const QuicConnection = struct {
                 error.MissingSshConfig => types_mod.QuicError.MissingSshConfig,
                 error.MissingTlsConfig => types_mod.QuicError.MissingTlsConfig,
                 error.MissingServerCredentials => types_mod.QuicError.MissingServerCredentials,
+                error.MissingServerName => types_mod.QuicError.MissingServerName,
+                error.InvalidTlsVerificationConfig => types_mod.QuicError.InvalidTlsVerificationConfig,
             };
         };
 
