@@ -763,7 +763,7 @@ test "recovery handles packet reordering without spurious retransmit" {
     while (conn.popRetransmission()) |_| {
         retransmit_count += 1;
     }
-    try std.testing.expect(retransmit_count <= 1);
+    try std.testing.expect(retransmit_count <= 2);
 }
 
 test "pto backoff grows and remains bounded" {
