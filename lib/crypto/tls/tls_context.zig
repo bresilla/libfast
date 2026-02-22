@@ -6,7 +6,6 @@ const crypto_mod = @import("../crypto.zig");
 /// TLS 1.3 context for QUIC connections
 ///
 /// Manages the TLS handshake state and key derivation
-
 pub const TlsError = error{
     HandshakeFailed,
     InvalidState,
@@ -100,11 +99,20 @@ pub const TlsContext = struct {
             return error.InvalidState;
         }
 
-        _ = server_hello_data;
+        const parsed = handshake_mod.parseServerHello(server_hello_data) catch |err| {
+            return switch (err) {
+                error.UnsupportedVersion => error.HandshakeFailed,
+                else => error.HandshakeFailed,
+            };
+        };
 
-        // Simplified implementation: assume TLS_AES_128_GCM_SHA256
-        // Full implementation would parse the ServerHello message to extract the cipher suite
-        self.cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256;
+        switch (parsed.cipher_suite) {
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_AES_256_GCM_SHA384,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+            => self.cipher_suite = parsed.cipher_suite,
+            else => return error.UnsupportedCipherSuite,
+        }
 
         self.state = .server_hello_received;
     }
@@ -233,8 +241,14 @@ test "Complete handshake flow" {
     const client_hello = try ctx.startClientHandshake("example.com");
     defer allocator.free(client_hello);
 
-    // Simulate server hello (empty for now)
-    const server_hello = &[_]u8{};
+    const random: [32]u8 = [_]u8{1} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
     try ctx.processServerHello(server_hello);
 
     // Complete with shared secret
@@ -244,6 +258,28 @@ test "Complete handshake flow" {
     try std.testing.expect(ctx.state.isComplete());
     try std.testing.expect(ctx.handshake_client_secret != null);
     try std.testing.expect(ctx.application_client_secret != null);
+}
+
+test "Process ServerHello rejects unsupported cipher suite" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{3} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = 0x9999,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try std.testing.expectError(error.UnsupportedCipherSuite, ctx.processServerHello(server_hello));
 }
 
 test "Get cipher suite info" {
