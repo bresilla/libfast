@@ -18,6 +18,17 @@ pub const PacketError = error{
 
 /// Packet number encoding/decoding
 pub const PacketNumberUtil = struct {
+    pub fn encodedLengthForPacketNumber(pn: PacketNumber) u8 {
+        return if (pn <= 0xFF)
+            1
+        else if (pn <= 0xFFFF)
+            2
+        else if (pn <= 0xFFFFFF)
+            3
+        else
+            4;
+    }
+
     /// Encode packet number with truncation
     /// Only encodes the least significant bytes needed
     pub fn encode(pn: PacketNumber, largest_acked: PacketNumber, buf: []u8) PacketError!u8 {
@@ -91,6 +102,27 @@ pub const PacketNumberUtil = struct {
     }
 };
 
+fn writePacketNumberBytes(pn: PacketNumber, pn_len: u8, out: []u8) PacketError!void {
+    if (pn_len < 1 or pn_len > 4) return error.InvalidPacketNumber;
+    if (out.len < pn_len) return error.BufferTooSmall;
+
+    var i: usize = 0;
+    while (i < pn_len) : (i += 1) {
+        const shift: u6 = @intCast((pn_len - 1 - i) * 8);
+        out[i] = @intCast((pn >> shift) & 0xFF);
+    }
+}
+
+fn readPacketNumberBytes(input: []const u8) PacketError!PacketNumber {
+    if (input.len == 0 or input.len > 4) return error.InvalidPacketNumber;
+
+    var pn: u64 = 0;
+    for (input) |byte| {
+        pn = (pn << 8) | byte;
+    }
+    return pn;
+}
+
 /// Long Header packet format (RFC 9000, Section 17.2)
 pub const LongHeader = struct {
     packet_type: PacketType,
@@ -117,8 +149,9 @@ pub const LongHeader = struct {
         };
 
         // Long Header: 1xxx xxxx (first bit = 1, fixed bit = 1)
-        // Format: 11TT LLLL where TT = type, LLLL = packet number length - 1
-        const first_byte = 0b11000000 | (type_bits << 4);
+        // Format: 11TT xxPP where TT = type, PP = packet number length - 1
+        const pn_len = PacketNumberUtil.encodedLengthForPacketNumber(self.packet_number);
+        const first_byte = 0b11000000 | (type_bits << 4) | ((pn_len - 1) & 0x03);
         buf[pos] = first_byte; // We'll update packet number length later
         pos += 1;
 
@@ -154,11 +187,10 @@ pub const LongHeader = struct {
         const payload_len_size = try varint.encode(self.payload_len, buf[pos..]);
         pos += payload_len_size;
 
-        // Packet number (placeholder for now, will be encoded with proper length)
-        // For now, encode as 4 bytes (maximum)
-        if (pos + 4 > buf.len) return error.BufferTooSmall;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(self.packet_number & 0xFFFFFFFF), .big);
-        pos += 4;
+        // Packet number (variable 1-4 bytes)
+        if (pos + pn_len > buf.len) return error.BufferTooSmall;
+        try writePacketNumberBytes(self.packet_number, pn_len, buf[pos..][0..pn_len]);
+        pos += pn_len;
 
         return pos;
     }
@@ -176,8 +208,9 @@ pub const LongHeader = struct {
         // Check long header bit
         if ((first_byte & 0x80) == 0) return error.InvalidPacketType;
 
-        // Extract packet type
+        // Extract packet type and packet number length
         const type_bits = (first_byte >> 4) & 0x03;
+        const pn_len: u8 = @intCast((first_byte & 0x03) + 1);
         const packet_type: PacketType = switch (type_bits) {
             0b00 => .initial,
             0b01 => .zero_rtt,
@@ -223,10 +256,10 @@ pub const LongHeader = struct {
         pos += payload_len_result.len;
         const payload_len = payload_len_result.value;
 
-        // Packet number (we'll just read 4 bytes for now)
-        if (pos + 4 > buf.len) return error.UnexpectedEof;
-        const packet_number = std.mem.readInt(u32, buf[pos..][0..4], .big);
-        pos += 4;
+        // Packet number (variable 1-4 bytes)
+        if (pos + pn_len > buf.len) return error.UnexpectedEof;
+        const packet_number = try readPacketNumberBytes(buf[pos..][0..pn_len]);
+        pos += pn_len;
 
         const header = LongHeader{
             .packet_type = packet_type,
@@ -255,11 +288,14 @@ pub const ShortHeader = struct {
         if (buf.len < 1 + self.dest_conn_id.len) return error.BufferTooSmall;
 
         // First byte: 0 (short header) | 1 (fixed bit) | S (spin bit) | R R (reserved) | K (key phase) | PP (pn length)
-        // For now: 01000000 (fixed bit set, rest zeros)
+        const pn_len = PacketNumberUtil.encodedLengthForPacketNumber(self.packet_number);
+
+        // 01000000 (fixed bit set) + packet number length bits
         var first_byte: u8 = 0b01000000;
         if (self.key_phase) {
             first_byte |= 0b00000100; // Set key phase bit
         }
+        first_byte |= (pn_len - 1) & 0x03;
         buf[pos] = first_byte;
         pos += 1;
 
@@ -267,10 +303,10 @@ pub const ShortHeader = struct {
         @memcpy(buf[pos..][0..self.dest_conn_id.len], self.dest_conn_id.slice());
         pos += self.dest_conn_id.len;
 
-        // Packet number (4 bytes for now)
-        if (pos + 4 > buf.len) return error.BufferTooSmall;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(self.packet_number & 0xFFFFFFFF), .big);
-        pos += 4;
+        // Packet number (variable 1-4 bytes)
+        if (pos + pn_len > buf.len) return error.BufferTooSmall;
+        try writePacketNumberBytes(self.packet_number, pn_len, buf[pos..][0..pn_len]);
+        pos += pn_len;
 
         return pos;
     }
@@ -288,18 +324,19 @@ pub const ShortHeader = struct {
         // Check short header bit
         if ((first_byte & 0x80) != 0) return error.InvalidPacketType;
 
-        // Extract key phase bit
+        // Extract key phase and packet number length bits
         const key_phase = (first_byte & 0x04) != 0;
+        const pn_len: u8 = @intCast((first_byte & 0x03) + 1);
 
         // Destination Connection ID
         if (pos + dcid_len > buf.len) return error.UnexpectedEof;
         const dest_conn_id = try ConnectionId.init(buf[pos..][0..dcid_len]);
         pos += dcid_len;
 
-        // Packet number (4 bytes for now)
-        if (pos + 4 > buf.len) return error.UnexpectedEof;
-        const packet_number = std.mem.readInt(u32, buf[pos..][0..4], .big);
-        pos += 4;
+        // Packet number (variable 1-4 bytes)
+        if (pos + pn_len > buf.len) return error.UnexpectedEof;
+        const packet_number = try readPacketNumberBytes(buf[pos..][0..pn_len]);
+        pos += pn_len;
 
         const header = ShortHeader{
             .dest_conn_id = dest_conn_id,
@@ -327,6 +364,11 @@ test "packet number encode/decode" {
     try std.testing.expectEqual(@as(u8, 2), len2);
     const decoded2 = try PacketNumberUtil.decode(buf[0..len2], 800);
     try std.testing.expectEqual(@as(u64, 1000), decoded2);
+
+    try std.testing.expectEqual(@as(u8, 1), PacketNumberUtil.encodedLengthForPacketNumber(0x12));
+    try std.testing.expectEqual(@as(u8, 2), PacketNumberUtil.encodedLengthForPacketNumber(0x1234));
+    try std.testing.expectEqual(@as(u8, 3), PacketNumberUtil.encodedLengthForPacketNumber(0x123456));
+    try std.testing.expectEqual(@as(u8, 4), PacketNumberUtil.encodedLengthForPacketNumber(0x12345678));
 }
 
 test "long header initial packet encode/decode" {
@@ -365,7 +407,7 @@ test "short header packet encode/decode" {
 
     const header = ShortHeader{
         .dest_conn_id = dcid,
-        .packet_number = 12345,
+        .packet_number = 0x123456,
         .key_phase = true,
     };
 
@@ -374,6 +416,35 @@ test "short header packet encode/decode" {
 
     const result = try ShortHeader.decode(buf[0..encoded_len], dcid.len);
     try std.testing.expect(result.header.dest_conn_id.eql(&dcid));
-    try std.testing.expectEqual(@as(u64, 12345), result.header.packet_number);
+    try std.testing.expectEqual(@as(u64, 0x123456), result.header.packet_number);
     try std.testing.expectEqual(true, result.header.key_phase);
+
+    // short header first byte encodes packet number length in low bits
+    try std.testing.expectEqual(@as(u8, 0b00000010), buf[0] & 0x03);
+}
+
+test "long header packet number length bits" {
+    var buf: [128]u8 = undefined;
+
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    const header = LongHeader{
+        .packet_type = .initial,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = &.{},
+        .payload_len = 10,
+        .packet_number = 0xAB,
+    };
+
+    const encoded_len = try header.encode(&buf);
+    try std.testing.expect(encoded_len > 0);
+
+    // low bits hold packet number length minus 1, so for 1-byte PN => 0
+    try std.testing.expectEqual(@as(u8, 0), buf[0] & 0x03);
+
+    const result = try LongHeader.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(@as(u64, 0xAB), result.header.packet_number);
 }
