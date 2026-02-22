@@ -4,21 +4,21 @@ This plan tracks the path from prototype to production-ready QUIC library.
 
 ## Epoch 1 - Handshake and Connection Correctness
 
-### Slice 1.1 - API event consistency
+### Slice 1.1 - API event consistency [done]
 - Fix `stream_closed` event payload shape to match public API types.
 - Add regression tests for event payload correctness.
 
-### Slice 1.2 - Connection lifecycle correctness
+### Slice 1.2 - Connection lifecycle correctness [done]
 - Remove premature connected signaling from `connect()`.
 - Emit `connected` exactly once when connection transitions in `poll()`.
 - Add tests for event ordering (`connect` then `poll` then `connected`).
 
-### Slice 1.3 - Transport API wiring
+### Slice 1.3 - Transport API wiring [done]
 - Replace non-existent UDP initialization calls with real socket bind paths.
 - Ensure client binds ephemeral local port and server binds configured address.
 - Normalize address parsing to IPv4/IPv6 capable parser.
 
-### Slice 1.4 - Packet receive pipeline (MVP)
+### Slice 1.4 - Packet receive pipeline (MVP) [done]
 - In `poll()`, receive datagrams and parse packet headers.
 - Convert parse failures into protocol/network events or errors.
 - Track basic receive counters and packet visibility for future loss logic.
