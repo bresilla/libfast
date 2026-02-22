@@ -448,3 +448,31 @@ test "long header packet number length bits" {
     const result = try LongHeader.decode(buf[0..encoded_len]);
     try std.testing.expectEqual(@as(u64, 0xAB), result.header.packet_number);
 }
+
+test "packet decode malformed corpus" {
+    try std.testing.expectError(error.UnexpectedEof, LongHeader.decode(&[_]u8{}));
+    try std.testing.expectError(error.UnexpectedEof, LongHeader.decode(&[_]u8{ 0xC0, 0x00, 0x00 }));
+    try std.testing.expectError(error.InvalidPacketType, LongHeader.decode(&[_]u8{ 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 }));
+
+    try std.testing.expectError(error.UnexpectedEof, ShortHeader.decode(&[_]u8{0x40}, 8));
+    try std.testing.expectError(error.UnexpectedEof, ShortHeader.decode(&[_]u8{ 0x41, 0xAA }, 8));
+}
+
+test "packet decode fuzz smoke" {
+    var prng = std.Random.DefaultPrng.init(0xBAD5EED);
+    const rand = prng.random();
+
+    var buf: [96]u8 = undefined;
+    var i: usize = 0;
+    while (i < 1500) : (i += 1) {
+        rand.bytes(&buf);
+        const len: usize = rand.intRangeAtMost(usize, 1, buf.len);
+        const sample = buf[0..len];
+
+        if ((sample[0] & 0x80) != 0) {
+            _ = LongHeader.decode(sample) catch continue;
+        } else {
+            _ = ShortHeader.decode(sample, 8) catch continue;
+        }
+    }
+}

@@ -8,7 +8,6 @@ const std = @import("std");
 /// - 01xxxxxx: 2 bytes (14-bit value, max 16383)
 /// - 10xxxxxx: 4 bytes (30-bit value, max 1073741823)
 /// - 11xxxxxx: 8 bytes (62-bit value, max 4611686018427387903)
-
 /// Maximum value that can be encoded in a varint
 pub const MAX_VARINT: u64 = 4611686018427387903;
 
@@ -235,5 +234,34 @@ test "varint round trip" {
         const result = try decode(buf[0..enc_len]);
         try std.testing.expectEqual(val, result.value);
         try std.testing.expectEqual(enc_len, result.len);
+    }
+}
+
+test "varint decode malformed corpus" {
+    const malformed = [_][]const u8{
+        &[_]u8{},
+        &[_]u8{0x40},
+        &[_]u8{ 0x80, 0x00 },
+        &[_]u8{ 0xC0, 0x00, 0x00, 0x00 },
+    };
+
+    for (malformed) |sample| {
+        try std.testing.expectError(error.UnexpectedEof, decode(sample));
+    }
+}
+
+test "varint decode fuzz smoke" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+
+    var buf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        rand.bytes(&buf);
+        const len: usize = rand.intRangeAtMost(usize, 0, buf.len);
+        const sample = buf[0..len];
+
+        const result = decode(sample) catch continue;
+        try std.testing.expect(result.len <= sample.len);
     }
 }

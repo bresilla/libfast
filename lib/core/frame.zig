@@ -738,3 +738,43 @@ test "path response frame encode/decode" {
     const decoded = try PathResponseFrame.decode(buf[0..len]);
     try std.testing.expectEqualSlices(u8, &frame.data, &decoded.frame.data);
 }
+
+test "frame decode malformed corpus" {
+    try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
+    try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
+    try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(&[_]u8{0x1c}));
+    try std.testing.expectError(error.UnexpectedEof, PathChallengeFrame.decode(&[_]u8{0x1a}));
+    try std.testing.expectError(error.UnexpectedEof, PathResponseFrame.decode(&[_]u8{0x1b}));
+}
+
+test "frame decode fuzz smoke" {
+    var prng = std.Random.DefaultPrng.init(0xF00D1234);
+    const rand = prng.random();
+
+    var buf: [128]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        rand.bytes(&buf);
+        const len: usize = rand.intRangeAtMost(usize, 1, buf.len);
+        const sample = buf[0..len];
+
+        const type_result = varint.decode(sample) catch continue;
+        const frame_type = type_result.value;
+
+        if (types.FrameType.isStreamFrame(frame_type)) {
+            _ = StreamFrame.decode(sample) catch continue;
+            continue;
+        }
+
+        switch (frame_type) {
+            0x01 => _ = PingFrame.decode(sample) catch continue,
+            0x02, 0x03 => _ = AckFrame.decode(sample) catch continue,
+            0x04 => _ = ResetStreamFrame.decode(sample) catch continue,
+            0x05 => _ = StopSendingFrame.decode(sample) catch continue,
+            0x1a => _ = PathChallengeFrame.decode(sample) catch continue,
+            0x1b => _ = PathResponseFrame.decode(sample) catch continue,
+            0x1c, 0x1d => _ = ConnectionCloseFrame.decode(sample) catch continue,
+            else => {},
+        }
+    }
+}
