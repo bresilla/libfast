@@ -58,6 +58,10 @@ pub const Connection = struct {
     pto_count: u32,
     next_pto_at: ?time.Instant,
 
+    /// PATH_CHALLENGE / PATH_RESPONSE tracking
+    expected_path_response: ?[8]u8,
+    pending_path_responses: std.ArrayList([8]u8),
+
     /// Flow control
     max_data_local: u64,
     max_data_remote: u64,
@@ -103,6 +107,8 @@ pub const Connection = struct {
             .retransmission_queue = .{},
             .pto_count = 0,
             .next_pto_at = null,
+            .expected_path_response = null,
+            .pending_path_responses = .{},
             .max_data_local = params.initial_max_data,
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
@@ -146,6 +152,8 @@ pub const Connection = struct {
             .retransmission_queue = .{},
             .pto_count = 0,
             .next_pto_at = null,
+            .expected_path_response = null,
+            .pending_path_responses = .{},
             .max_data_local = params.initial_max_data,
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
@@ -165,6 +173,7 @@ pub const Connection = struct {
         self.streams.deinit();
         self.loss_detection.deinit();
         self.retransmission_queue.deinit(self.allocator);
+        self.pending_path_responses.deinit(self.allocator);
     }
 
     /// Open a new stream
@@ -218,6 +227,37 @@ pub const Connection = struct {
     /// Mark peer/path as validated for amplification-limit purposes.
     pub fn markPeerValidated(self: *Connection) void {
         self.peer_validated = true;
+    }
+
+    /// Begin path validation: requires PATH_RESPONSE echo before enabling validated path.
+    pub fn beginPathValidation(self: *Connection, challenge_data: [8]u8) void {
+        self.expected_path_response = challenge_data;
+        self.peer_validated = false;
+    }
+
+    /// Queue a PATH_RESPONSE token when a PATH_CHALLENGE is received.
+    pub fn onPathChallenge(self: *Connection, challenge_data: [8]u8) Error!void {
+        try self.pending_path_responses.append(self.allocator, challenge_data);
+    }
+
+    /// Pop the next pending PATH_RESPONSE token to send.
+    pub fn popPathResponse(self: *Connection) ?[8]u8 {
+        if (self.pending_path_responses.items.len == 0) {
+            return null;
+        }
+        return self.pending_path_responses.orderedRemove(0);
+    }
+
+    /// Process a received PATH_RESPONSE token.
+    pub fn onPathResponse(self: *Connection, response_data: [8]u8) bool {
+        if (self.expected_path_response) |expected| {
+            if (std.mem.eql(u8, &expected, &response_data)) {
+                self.expected_path_response = null;
+                self.markPeerValidated();
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Start closing the connection
@@ -792,4 +832,43 @@ test "recovery remains stable under mixed loss and timeout stress" {
         try std.testing.expect(conn.availableSendBudget() <= conn.max_data_remote);
         try std.testing.expect(conn.pto_count <= round + 1);
     }
+}
+
+test "path challenge queues matching path response" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const token = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    try conn.onPathChallenge(token);
+
+    const queued = conn.popPathResponse();
+    try std.testing.expect(queued != null);
+    try std.testing.expectEqualSlices(u8, &token, &queued.?);
+}
+
+test "path response validates peer and lifts amplification cap" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.updateDataReceived(1000);
+    try std.testing.expectEqual(@as(u64, 3000), conn.availableSendBudget());
+
+    const token = [_]u8{ 1, 1, 2, 2, 3, 3, 4, 4 };
+    conn.beginPathValidation(token);
+    try std.testing.expect(!conn.peer_validated);
+
+    const ok = conn.onPathResponse(token);
+    try std.testing.expect(ok);
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.availableSendBudget() > 3000);
 }

@@ -494,6 +494,20 @@ pub const PathChallengeFrame = struct {
         pos += 8;
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: PathChallengeFrame, consumed: usize } {
+        var pos: usize = 0;
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x1a) return error.InvalidFrameType;
+
+        if (pos + 8 > buf.len) return error.UnexpectedEof;
+        var data: [8]u8 = undefined;
+        @memcpy(&data, buf[pos..][0..8]);
+        pos += 8;
+
+        return .{ .frame = .{ .data = data }, .consumed = pos };
+    }
 };
 
 /// PATH_RESPONSE frame (0x1b)
@@ -507,6 +521,20 @@ pub const PathResponseFrame = struct {
         @memcpy(buf[pos..][0..8], &self.data);
         pos += 8;
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: PathResponseFrame, consumed: usize } {
+        var pos: usize = 0;
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x1b) return error.InvalidFrameType;
+
+        if (pos + 8 > buf.len) return error.UnexpectedEof;
+        var data: [8]u8 = undefined;
+        @memcpy(&data, buf[pos..][0..8]);
+        pos += 8;
+
+        return .{ .frame = .{ .data = data }, .consumed = pos };
     }
 };
 
@@ -691,4 +719,22 @@ test "ping frame decode" {
     const decoded = try PingFrame.decode(buf[0..len]);
     _ = decoded.frame;
     try std.testing.expectEqual(len, decoded.consumed);
+}
+
+test "path challenge frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const len = try frame.encode(&buf);
+
+    const decoded = try PathChallengeFrame.decode(buf[0..len]);
+    try std.testing.expectEqualSlices(u8, &frame.data, &decoded.frame.data);
+}
+
+test "path response frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = PathResponseFrame{ .data = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 } };
+    const len = try frame.encode(&buf);
+
+    const decoded = try PathResponseFrame.decode(buf[0..len]);
+    try std.testing.expectEqualSlices(u8, &frame.data, &decoded.frame.data);
 }

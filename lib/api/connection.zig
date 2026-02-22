@@ -222,6 +222,24 @@ pub const QuicConnection = struct {
                 };
                 stream.reset(decoded.frame.error_code);
             },
+            0x1a => {
+                const decoded = frame_mod.PathChallengeFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onPathChallenge(decoded.frame.data) catch {
+                    return types_mod.QuicError.OutOfMemory;
+                };
+            },
+            0x1b => {
+                const decoded = frame_mod.PathResponseFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                _ = conn.onPathResponse(decoded.frame.data);
+            },
             else => {
                 // Unknown/unhandled frame type in this slice: ignore.
             },
@@ -1104,6 +1122,86 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     try std.testing.expect(event.? == .stream_closed);
     try std.testing.expectEqual(@as(u64, 4), event.?.stream_closed.id);
     try std.testing.expectEqual(@as(?u64, 99), event.?.stream_closed.error_code);
+}
+
+test "poll routes PATH_CHALLENGE frame and queues response token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 16,
+        .packet_number = 6,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const challenge = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try challenge.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const pending = conn.internal_conn.?.popPathResponse();
+    try std.testing.expect(pending != null);
+    try std.testing.expectEqualSlices(u8, &challenge.data, &pending.?);
+}
+
+test "poll routes PATH_RESPONSE frame and validates peer path" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent();
+
+    const token = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    conn.internal_conn.?.beginPathValidation(token);
+    try std.testing.expect(!conn.internal_conn.?.peer_validated);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 16,
+        .packet_number = 7,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const response = frame_mod.PathResponseFrame{ .data = token };
+    packet_len += try response.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.internal_conn.?.peer_validated);
 }
 
 test "ssh mode rejects unidirectional stream open" {
