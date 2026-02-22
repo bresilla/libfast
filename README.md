@@ -227,9 +227,24 @@ No external dependencies required!
 ## Documentation
 
 - [PLAN.md](PLAN.md) - Complete implementation roadmap
-- [TEST_COVERAGE.md](TEST_COVERAGE.md) - Test coverage report
 - [examples/README.md](examples/README.md) - Example applications
 - [ssh_quic_spec.md](ssh_quic_spec.md) - SSH/QUIC specification
+
+## Release Gates
+
+- Local gate: `make ci`
+- CI gate: `.github/workflows/ci.yml`
+- Required checks before release:
+  - `zig build test --summary all`
+  - `zig build -Doptimize=ReleaseFast`
+  - Interop matrix lanes for `quiche`, `ngtcp2`, and `msquic`
+
+## Security Reporting
+
+- Report vulnerabilities privately to: `security@libfast.dev`
+- Include reproduction steps, affected version, and impact details
+- Do not open public issues for unpatched security defects
+- Target initial triage within 3 business days
 
 ## References
 
@@ -248,7 +263,7 @@ No external dependencies required!
 
 ## License
 
-[License information to be added]
+[MIT](LICENSE)
 
 ## Version
 
