@@ -52,6 +52,7 @@ pub const Connection = struct {
         InvalidState,
         ConnectionClosed,
         StreamError,
+        UnsupportedStreamType,
         FlowControlError,
         InvalidPacket,
     } || std.mem.Allocator.Error;
@@ -65,7 +66,7 @@ pub const Connection = struct {
     ) Error!Connection {
         const params = TransportParameters{};
 
-        return Connection{
+        var conn = Connection{
             .local_conn_id = local_conn_id,
             .remote_conn_id = remote_conn_id,
             .state = .handshaking,
@@ -83,6 +84,14 @@ pub const Connection = struct {
             .data_received = 0,
             .allocator = allocator,
         };
+
+        // SSH/QUIC reserves stream 0 for global/auth traffic.
+        // Channel streams begin at 4 for client-initiated bidirectional streams.
+        if (mode == .ssh) {
+            conn.streams.next_client_bidi = 4;
+        }
+
+        return conn;
     }
 
     /// Create a new server connection
@@ -94,7 +103,7 @@ pub const Connection = struct {
     ) Error!Connection {
         const params = TransportParameters{};
 
-        return Connection{
+        var conn = Connection{
             .local_conn_id = local_conn_id,
             .remote_conn_id = remote_conn_id,
             .state = .handshaking,
@@ -112,6 +121,13 @@ pub const Connection = struct {
             .data_received = 0,
             .allocator = allocator,
         };
+
+        // SSH/QUIC reserves stream 0 and maps server-initiated channels to 5, 9, 13...
+        if (mode == .ssh) {
+            conn.streams.next_server_bidi = 5;
+        }
+
+        return conn;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -122,6 +138,11 @@ pub const Connection = struct {
     pub fn openStream(self: *Connection, bidirectional: bool) Error!StreamId {
         if (self.state != .established) {
             return error.InvalidState;
+        }
+
+        // SSH/QUIC channels are always bidirectional streams.
+        if (self.mode == .ssh and !bidirectional) {
+            return error.UnsupportedStreamType;
         }
 
         const stream_type = if (bidirectional)
@@ -320,6 +341,33 @@ test "connection stream opening" {
 
     const s = conn.getStream(stream_id).?;
     try std.testing.expect(s.isBidirectional());
+}
+
+test "ssh stream id assignment and bidi-only policy" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var client_conn = try Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    defer client_conn.deinit();
+    client_conn.markEstablished();
+
+    try std.testing.expectError(error.UnsupportedStreamType, client_conn.openStream(false));
+
+    const c1 = try client_conn.openStream(true);
+    const c2 = try client_conn.openStream(true);
+    try std.testing.expectEqual(@as(u64, 4), c1);
+    try std.testing.expectEqual(@as(u64, 8), c2);
+
+    var server_conn = try Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    defer server_conn.deinit();
+    server_conn.markEstablished();
+
+    const s1 = try server_conn.openStream(true);
+    const s2 = try server_conn.openStream(true);
+    try std.testing.expectEqual(@as(u64, 5), s1);
+    try std.testing.expectEqual(@as(u64, 9), s2);
 }
 
 test "connection manager" {

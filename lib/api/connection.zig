@@ -174,12 +174,14 @@ pub const QuicConnection = struct {
             .tls => .tls,
         };
 
-        internal_conn.* = try conn_internal.Connection.initClient(
+        internal_conn.* = conn_internal.Connection.initClient(
             self.allocator,
             quic_mode,
             local_cid,
             remote_cid,
-        );
+        ) catch {
+            return types_mod.QuicError.InvalidConfig;
+        };
         self.internal_conn = internal_conn;
 
         self.state = .connecting;
@@ -247,8 +249,12 @@ pub const QuicConnection = struct {
 
         const conn = self.internal_conn.?;
 
-        const stream_id = conn.openStream(bidirectional) catch {
-            return types_mod.QuicError.StreamLimitReached;
+        const stream_id = conn.openStream(bidirectional) catch |err| {
+            return switch (err) {
+                error.UnsupportedStreamType => types_mod.QuicError.StreamError,
+                error.StreamError => types_mod.QuicError.StreamLimitReached,
+                else => types_mod.QuicError.StreamError,
+            };
         };
 
         // Add event
@@ -694,4 +700,23 @@ test "poll maps invalid packet header to closing event" {
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(@as(u64, 1), event.?.closing.error_code);
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "ssh mode rejects unidirectional stream open" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try std.testing.expectError(types_mod.QuicError.StreamError, conn.openStream(false));
 }
