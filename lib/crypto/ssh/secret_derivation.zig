@@ -7,7 +7,6 @@ const kex_methods = @import("kex_methods.zig");
 /// Converts SSH key exchange outputs (K, H) into QUIC secrets
 /// using HMAC-HASH(K, H) where HASH is the hash algorithm from
 /// the key exchange method.
-
 pub const DerivationError = error{
     InvalidHashAlgorithm,
     DerivationFailed,
@@ -55,29 +54,30 @@ pub fn deriveQuicSecrets(
 
     // Derive client initial secret: HMAC-HASH(K, "client" || H)
     const client_label = "client";
-    var client_input: std.ArrayList(u8) = .{};
-    defer client_input.deinit(std.heap.page_allocator);
-    try client_input.appendSlice(std.heap.page_allocator, client_label);
-    try client_input.appendSlice(std.heap.page_allocator, exchange_hash);
 
     switch (hash_algorithm) {
         .sha256 => {
             var client_hmac = crypto.auth.hmac.sha2.HmacSha256.init(shared_secret);
-            client_hmac.update(client_input.items);
+            client_hmac.update(client_label);
+            client_hmac.update(exchange_hash);
             client_hmac.final(&secrets.client_initial_secret);
         },
         .sha384 => {
             var client_hmac = crypto.auth.hmac.sha2.HmacSha384.init(shared_secret);
-            client_hmac.update(client_input.items);
+            client_hmac.update(client_label);
+            client_hmac.update(exchange_hash);
             var client_digest: [48]u8 = undefined;
+            defer @memset(&client_digest, 0);
             client_hmac.final(&client_digest);
             // Truncate to 32 bytes for QUIC
             @memcpy(&secrets.client_initial_secret, client_digest[0..32]);
         },
         .sha512 => {
             var client_hmac = crypto.auth.hmac.sha2.HmacSha512.init(shared_secret);
-            client_hmac.update(client_input.items);
+            client_hmac.update(client_label);
+            client_hmac.update(exchange_hash);
             var client_digest: [64]u8 = undefined;
+            defer @memset(&client_digest, 0);
             client_hmac.final(&client_digest);
             // Truncate to 32 bytes for QUIC
             @memcpy(&secrets.client_initial_secret, client_digest[0..32]);
@@ -86,29 +86,30 @@ pub fn deriveQuicSecrets(
 
     // Derive server initial secret: HMAC-HASH(K, "server" || H)
     const server_label = "server";
-    var server_input: std.ArrayList(u8) = .{};
-    defer server_input.deinit(std.heap.page_allocator);
-    try server_input.appendSlice(std.heap.page_allocator, server_label);
-    try server_input.appendSlice(std.heap.page_allocator, exchange_hash);
 
     switch (hash_algorithm) {
         .sha256 => {
             var server_hmac = crypto.auth.hmac.sha2.HmacSha256.init(shared_secret);
-            server_hmac.update(server_input.items);
+            server_hmac.update(server_label);
+            server_hmac.update(exchange_hash);
             server_hmac.final(&secrets.server_initial_secret);
         },
         .sha384 => {
             var server_hmac = crypto.auth.hmac.sha2.HmacSha384.init(shared_secret);
-            server_hmac.update(server_input.items);
+            server_hmac.update(server_label);
+            server_hmac.update(exchange_hash);
             var server_digest: [48]u8 = undefined;
+            defer @memset(&server_digest, 0);
             server_hmac.final(&server_digest);
             // Truncate to 32 bytes for QUIC
             @memcpy(&secrets.server_initial_secret, server_digest[0..32]);
         },
         .sha512 => {
             var server_hmac = crypto.auth.hmac.sha2.HmacSha512.init(shared_secret);
-            server_hmac.update(server_input.items);
+            server_hmac.update(server_label);
+            server_hmac.update(exchange_hash);
             var server_digest: [64]u8 = undefined;
+            defer @memset(&server_digest, 0);
             server_hmac.final(&server_digest);
             // Truncate to 32 bytes for QUIC
             @memcpy(&secrets.server_initial_secret, server_digest[0..32]);
@@ -131,51 +132,63 @@ pub fn expandLabel(
 ) DerivationError!void {
     if (output.len < length) return error.DerivationFailed;
 
-    // Build HKDF info: length || "tls13 " || label || context_length || context
-    var info: std.ArrayList(u8) = .{};
-    defer info.deinit(std.heap.page_allocator);
+    // Build HKDF info directly into HMAC input stream to avoid heap allocations.
+    if (length > 0xFFFF) return error.DerivationFailed;
 
-    // Length (2 bytes, big-endian)
-    try info.append(std.heap.page_allocator, @intCast((length >> 8) & 0xFF));
-    try info.append(std.heap.page_allocator, @intCast(length & 0xFF));
+    const length_be = [2]u8{
+        @intCast((length >> 8) & 0xFF),
+        @intCast(length & 0xFF),
+    };
 
-    // Label prefix + label
     const prefix = "tls13 ";
-    const full_label_len: u8 = @intCast(prefix.len + label.len);
-    try info.append(std.heap.page_allocator, full_label_len);
-    try info.appendSlice(std.heap.page_allocator, prefix);
-    try info.appendSlice(std.heap.page_allocator, label);
+    if (prefix.len + label.len > 255) return error.DerivationFailed;
+    if (context.len > 255) return error.DerivationFailed;
 
-    // Context length + context
+    const full_label_len: u8 = @intCast(prefix.len + label.len);
     const context_len: u8 = @intCast(context.len);
-    try info.append(std.heap.page_allocator, context_len);
-    if (context.len > 0) {
-        try info.appendSlice(std.heap.page_allocator, context);
-    }
+    const counter = [_]u8{0x01};
 
     // Use HMAC as PRF for HKDF-Expand
     switch (hash_algorithm) {
         .sha256 => {
             var hmac = crypto.auth.hmac.sha2.HmacSha256.init(secret);
-            hmac.update(info.items);
-            hmac.update(&[_]u8{0x01}); // HKDF counter
+            hmac.update(&length_be);
+            hmac.update(&[_]u8{full_label_len});
+            hmac.update(prefix);
+            hmac.update(label);
+            hmac.update(&[_]u8{context_len});
+            if (context.len > 0) hmac.update(context);
+            hmac.update(&counter); // HKDF counter
             var digest: [32]u8 = undefined;
+            defer @memset(&digest, 0);
             hmac.final(&digest);
             @memcpy(output[0..@min(length, 32)], digest[0..@min(length, 32)]);
         },
         .sha384 => {
             var hmac = crypto.auth.hmac.sha2.HmacSha384.init(secret);
-            hmac.update(info.items);
-            hmac.update(&[_]u8{0x01});
+            hmac.update(&length_be);
+            hmac.update(&[_]u8{full_label_len});
+            hmac.update(prefix);
+            hmac.update(label);
+            hmac.update(&[_]u8{context_len});
+            if (context.len > 0) hmac.update(context);
+            hmac.update(&counter);
             var digest: [48]u8 = undefined;
+            defer @memset(&digest, 0);
             hmac.final(&digest);
             @memcpy(output[0..@min(length, 48)], digest[0..@min(length, 48)]);
         },
         .sha512 => {
             var hmac = crypto.auth.hmac.sha2.HmacSha512.init(secret);
-            hmac.update(info.items);
-            hmac.update(&[_]u8{0x01});
+            hmac.update(&length_be);
+            hmac.update(&[_]u8{full_label_len});
+            hmac.update(prefix);
+            hmac.update(label);
+            hmac.update(&[_]u8{context_len});
+            if (context.len > 0) hmac.update(context);
+            hmac.update(&counter);
             var digest: [64]u8 = undefined;
+            defer @memset(&digest, 0);
             hmac.final(&digest);
             @memcpy(output[0..@min(length, 64)], digest[0..@min(length, 64)]);
         },

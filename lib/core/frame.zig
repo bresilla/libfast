@@ -43,7 +43,13 @@ pub const Frame = union(enum) {
 pub const PaddingFrame = struct {};
 
 /// PING frame (0x01)
-pub const PingFrame = struct {};
+pub const PingFrame = struct {
+    pub fn decode(buf: []const u8) FrameError!struct { frame: PingFrame, consumed: usize } {
+        const type_result = try varint.decode(buf);
+        if (type_result.value != 0x01) return error.InvalidFrameType;
+        return .{ .frame = PingFrame{}, .consumed = type_result.len };
+    }
+};
 
 /// ACK frame (0x02-0x03)
 pub const AckFrame = struct {
@@ -98,6 +104,67 @@ pub const AckFrame = struct {
 
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: AckFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+
+        const has_ecn = switch (type_result.value) {
+            0x02 => false,
+            0x03 => true,
+            else => return error.InvalidFrameType,
+        };
+
+        const largest_acked_result = try varint.decode(buf[pos..]);
+        pos += largest_acked_result.len;
+
+        const ack_delay_result = try varint.decode(buf[pos..]);
+        pos += ack_delay_result.len;
+
+        const ack_range_count_result = try varint.decode(buf[pos..]);
+        pos += ack_range_count_result.len;
+
+        const first_ack_range_result = try varint.decode(buf[pos..]);
+        pos += first_ack_range_result.len;
+
+        // Decode and ignore additional ranges for now; not yet routed.
+        var i: u64 = 0;
+        while (i < ack_range_count_result.value) : (i += 1) {
+            const gap_result = try varint.decode(buf[pos..]);
+            pos += gap_result.len;
+            const range_len_result = try varint.decode(buf[pos..]);
+            pos += range_len_result.len;
+        }
+
+        var ecn_counts: ?EcnCounts = null;
+        if (has_ecn) {
+            const ect0_result = try varint.decode(buf[pos..]);
+            pos += ect0_result.len;
+            const ect1_result = try varint.decode(buf[pos..]);
+            pos += ect1_result.len;
+            const ce_result = try varint.decode(buf[pos..]);
+            pos += ce_result.len;
+
+            ecn_counts = EcnCounts{
+                .ect0_count = ect0_result.value,
+                .ect1_count = ect1_result.value,
+                .ecn_ce_count = ce_result.value,
+            };
+        }
+
+        return .{
+            .frame = AckFrame{
+                .largest_acked = largest_acked_result.value,
+                .ack_delay = ack_delay_result.value,
+                .first_ack_range = first_ack_range_result.value,
+                .ack_ranges = &.{},
+                .ecn_counts = ecn_counts,
+            },
+            .consumed = pos,
+        };
+    }
 };
 
 /// RESET_STREAM frame (0x04)
@@ -114,6 +181,32 @@ pub const ResetStreamFrame = struct {
         pos += try varint.encode(self.final_size, buf[pos..]);
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: ResetStreamFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x04) return error.InvalidFrameType;
+
+        const stream_id_result = try varint.decode(buf[pos..]);
+        pos += stream_id_result.len;
+
+        const error_code_result = try varint.decode(buf[pos..]);
+        pos += error_code_result.len;
+
+        const final_size_result = try varint.decode(buf[pos..]);
+        pos += final_size_result.len;
+
+        return .{
+            .frame = ResetStreamFrame{
+                .stream_id = stream_id_result.value,
+                .error_code = error_code_result.value,
+                .final_size = final_size_result.value,
+            },
+            .consumed = pos,
+        };
+    }
 };
 
 /// STOP_SENDING frame (0x05)
@@ -127,6 +220,28 @@ pub const StopSendingFrame = struct {
         pos += try varint.encode(self.stream_id, buf[pos..]);
         pos += try varint.encode(self.error_code, buf[pos..]);
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: StopSendingFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x05) return error.InvalidFrameType;
+
+        const stream_id_result = try varint.decode(buf[pos..]);
+        pos += stream_id_result.len;
+
+        const error_code_result = try varint.decode(buf[pos..]);
+        pos += error_code_result.len;
+
+        return .{
+            .frame = StopSendingFrame{
+                .stream_id = stream_id_result.value,
+                .error_code = error_code_result.value,
+            },
+            .consumed = pos,
+        };
     }
 };
 
@@ -379,6 +494,20 @@ pub const PathChallengeFrame = struct {
         pos += 8;
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: PathChallengeFrame, consumed: usize } {
+        var pos: usize = 0;
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x1a) return error.InvalidFrameType;
+
+        if (pos + 8 > buf.len) return error.UnexpectedEof;
+        var data: [8]u8 = undefined;
+        @memcpy(&data, buf[pos..][0..8]);
+        pos += 8;
+
+        return .{ .frame = .{ .data = data }, .consumed = pos };
+    }
 };
 
 /// PATH_RESPONSE frame (0x1b)
@@ -392,6 +521,20 @@ pub const PathResponseFrame = struct {
         @memcpy(buf[pos..][0..8], &self.data);
         pos += 8;
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: PathResponseFrame, consumed: usize } {
+        var pos: usize = 0;
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x1b) return error.InvalidFrameType;
+
+        if (pos + 8 > buf.len) return error.UnexpectedEof;
+        var data: [8]u8 = undefined;
+        @memcpy(&data, buf[pos..][0..8]);
+        pos += 8;
+
+        return .{ .frame = .{ .data = data }, .consumed = pos };
     }
 };
 
@@ -417,6 +560,47 @@ pub const ConnectionCloseFrame = struct {
         pos += self.reason.len;
 
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: ConnectionCloseFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+
+        const is_transport_close = switch (type_result.value) {
+            0x1c => true,
+            0x1d => false,
+            else => return error.InvalidFrameType,
+        };
+
+        const error_code_result = try varint.decode(buf[pos..]);
+        pos += error_code_result.len;
+
+        var frame_type: ?u64 = null;
+        if (is_transport_close) {
+            const frame_type_result = try varint.decode(buf[pos..]);
+            pos += frame_type_result.len;
+            frame_type = frame_type_result.value;
+        }
+
+        const reason_len_result = try varint.decode(buf[pos..]);
+        pos += reason_len_result.len;
+
+        const reason_len = reason_len_result.value;
+        if (pos + reason_len > buf.len) return error.UnexpectedEof;
+
+        const reason = buf[pos..][0..reason_len];
+        pos += reason_len;
+
+        return .{
+            .frame = ConnectionCloseFrame{
+                .error_code = error_code_result.value,
+                .frame_type = frame_type,
+                .reason = reason,
+            },
+            .consumed = pos,
+        };
     }
 };
 
@@ -479,6 +663,9 @@ test "ack frame encode" {
 
     const encoded_len = try frame.encode(buf);
     try std.testing.expect(encoded_len > 0);
+
+    const decoded = try AckFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.largest_acked, decoded.frame.largest_acked);
 }
 
 test "connection close frame encode" {
@@ -491,4 +678,103 @@ test "connection close frame encode" {
 
     const encoded_len = try frame.encode(&buf);
     try std.testing.expect(encoded_len > 0);
+
+    const decoded = try ConnectionCloseFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
+    try std.testing.expectEqualStrings(frame.reason, decoded.frame.reason);
+}
+
+test "reset stream frame encode/decode" {
+    var buf: [100]u8 = undefined;
+    const frame = ResetStreamFrame{
+        .stream_id = 8,
+        .error_code = 42,
+        .final_size = 12,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    const decoded = try ResetStreamFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
+    try std.testing.expectEqual(frame.final_size, decoded.frame.final_size);
+}
+
+test "stop sending frame encode/decode" {
+    var buf: [100]u8 = undefined;
+    const frame = StopSendingFrame{
+        .stream_id = 9,
+        .error_code = 7,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    const decoded = try StopSendingFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.error_code, decoded.frame.error_code);
+}
+
+test "ping frame decode" {
+    var buf: [8]u8 = undefined;
+    const len = try varint.encode(0x01, &buf);
+
+    const decoded = try PingFrame.decode(buf[0..len]);
+    _ = decoded.frame;
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
+test "path challenge frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const len = try frame.encode(&buf);
+
+    const decoded = try PathChallengeFrame.decode(buf[0..len]);
+    try std.testing.expectEqualSlices(u8, &frame.data, &decoded.frame.data);
+}
+
+test "path response frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = PathResponseFrame{ .data = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 } };
+    const len = try frame.encode(&buf);
+
+    const decoded = try PathResponseFrame.decode(buf[0..len]);
+    try std.testing.expectEqualSlices(u8, &frame.data, &decoded.frame.data);
+}
+
+test "frame decode malformed corpus" {
+    try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
+    try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
+    try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(&[_]u8{0x1c}));
+    try std.testing.expectError(error.UnexpectedEof, PathChallengeFrame.decode(&[_]u8{0x1a}));
+    try std.testing.expectError(error.UnexpectedEof, PathResponseFrame.decode(&[_]u8{0x1b}));
+}
+
+test "frame decode fuzz smoke" {
+    var prng = std.Random.DefaultPrng.init(0xF00D1234);
+    const rand = prng.random();
+
+    var buf: [128]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        rand.bytes(&buf);
+        const len: usize = rand.intRangeAtMost(usize, 1, buf.len);
+        const sample = buf[0..len];
+
+        const type_result = varint.decode(sample) catch continue;
+        const frame_type = type_result.value;
+
+        if (types.FrameType.isStreamFrame(frame_type)) {
+            _ = StreamFrame.decode(sample) catch continue;
+            continue;
+        }
+
+        switch (frame_type) {
+            0x01 => _ = PingFrame.decode(sample) catch continue,
+            0x02, 0x03 => _ = AckFrame.decode(sample) catch continue,
+            0x04 => _ = ResetStreamFrame.decode(sample) catch continue,
+            0x05 => _ = StopSendingFrame.decode(sample) catch continue,
+            0x1a => _ = PathChallengeFrame.decode(sample) catch continue,
+            0x1b => _ = PathResponseFrame.decode(sample) catch continue,
+            0x1c, 0x1d => _ = ConnectionCloseFrame.decode(sample) catch continue,
+            else => {},
+        }
+    }
 }

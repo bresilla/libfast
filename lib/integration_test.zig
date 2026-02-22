@@ -314,3 +314,66 @@ test "integration: SSH key exchange packet flow" {
 
     try std.testing.expect(decoded_cancel.reason_phrase.len > 0);
 }
+
+test "integration: ssh channel streams run without ssh window parameters" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try libfast.ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    const remote_cid = try libfast.ConnectionId.init(&[_]u8{ 20, 21, 22, 23 });
+
+    var conn = try libfast.connection.Connection.initClient(
+        allocator,
+        .ssh,
+        local_cid,
+        remote_cid,
+    );
+    defer conn.deinit();
+    conn.markEstablished();
+
+    // SSH/QUIC channel streams use QUIC defaults and do not require
+    // SSH-level window or packet-size parameters.
+    try std.testing.expect(conn.max_data_remote > 0);
+    try std.testing.expect(conn.streams.max_stream_data > 0);
+
+    const s1 = try conn.openStream(true);
+    const s2 = try conn.openStream(true);
+    const s3 = try conn.openStream(true);
+    try std.testing.expectEqual(@as(u64, 4), s1);
+    try std.testing.expectEqual(@as(u64, 8), s2);
+    try std.testing.expectEqual(@as(u64, 12), s3);
+
+    const stream = conn.getStream(s1).?;
+    const write_len = try stream.write("channel-data");
+    try std.testing.expectEqual(@as(usize, 12), write_len);
+}
+
+test "integration: ssh stream flow works without window adjust messages" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try libfast.ConnectionId.init(&[_]u8{ 30, 31, 32, 33 });
+    const remote_cid = try libfast.ConnectionId.init(&[_]u8{ 40, 41, 42, 43 });
+
+    var conn = try libfast.connection.Connection.initClient(
+        allocator,
+        .ssh,
+        local_cid,
+        remote_cid,
+    );
+    defer conn.deinit();
+    conn.markEstablished();
+
+    const stream_id = try conn.openStream(true);
+    const stream = conn.getStream(stream_id).?;
+
+    try stream.appendRecvData("chunk-a", 0, false);
+    try stream.appendRecvData("chunk-b", stream.recv_offset, false);
+    try stream.appendRecvData(&[_]u8{}, stream.recv_offset, true);
+
+    var buf: [64]u8 = undefined;
+    const n1 = try stream.read(&buf);
+    try std.testing.expectEqual(@as(usize, 14), n1);
+    try std.testing.expectEqualStrings("chunk-achunk-b", buf[0..n1]);
+
+    // Stream closure is detected without any explicit SSH window-adjust signaling.
+    try std.testing.expectError(error.StreamNotReadable, stream.read(&buf));
+}

@@ -1,6 +1,13 @@
-.PHONY: build install
+.PHONY: build test ci install
 
 build:
+	zig build -Doptimize=ReleaseFast
+
+test:
+	zig build test --summary all
+
+ci:
+	zig build test --summary all
 	zig build -Doptimize=ReleaseFast
 
 install: build

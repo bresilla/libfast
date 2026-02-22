@@ -4,7 +4,6 @@ const std = @import("std");
 ///
 /// This implements the TLS 1.3 handshake protocol adapted for QUIC transport.
 /// Messages are sent via CRYPTO frames rather than TLS records.
-
 pub const HandshakeError = error{
     InvalidMessage,
     BufferTooSmall,
@@ -183,6 +182,50 @@ pub const ServerHello = struct {
         return data.toOwnedSlice(allocator);
     }
 };
+
+pub const ParsedServerHello = struct {
+    random: [32]u8,
+    cipher_suite: u16,
+};
+
+/// Parse a TLS ServerHello message and extract key fields.
+pub fn parseServerHello(data: []const u8) HandshakeError!ParsedServerHello {
+    if (data.len < 4) return error.InvalidMessage;
+
+    if (data[0] != @intFromEnum(HandshakeType.server_hello)) {
+        return error.InvalidMessage;
+    }
+
+    const msg_len: usize = (@as(usize, data[1]) << 16) | (@as(usize, data[2]) << 8) | data[3];
+    if (data.len < 4 + msg_len) return error.InvalidMessage;
+
+    var pos: usize = 4;
+
+    // Legacy version must be TLS 1.2 for TLS 1.3 handshake messages.
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const legacy_version: u16 = (@as(u16, data[pos]) << 8) | data[pos + 1];
+    if (legacy_version != 0x0303) return error.UnsupportedVersion;
+    pos += 2;
+
+    if (pos + 32 > data.len) return error.InvalidMessage;
+    var random: [32]u8 = undefined;
+    @memcpy(&random, data[pos .. pos + 32]);
+    pos += 32;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    const session_id_len = data[pos];
+    pos += 1;
+    if (pos + session_id_len > data.len) return error.InvalidMessage;
+    pos += session_id_len;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const cipher_suite: u16 = (@as(u16, data[pos]) << 8) | data[pos + 1];
+
+    return ParsedServerHello{
+        .random = random,
+        .cipher_suite = cipher_suite,
+    };
+}
 
 /// TLS extension
 pub const Extension = struct {
@@ -366,4 +409,36 @@ test "HandshakeType toString" {
     try std.testing.expectEqualStrings("ClientHello", HandshakeType.client_hello.toString());
     try std.testing.expectEqualStrings("ServerHello", HandshakeType.server_hello.toString());
     try std.testing.expectEqualStrings("Finished", HandshakeType.finished.toString());
+}
+
+test "Parse ServerHello" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{2} ** 32;
+    const server_hello = ServerHello{
+        .random = random,
+        .cipher_suite = TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]Extension{},
+    };
+
+    const encoded = try server_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    const parsed = try parseServerHello(encoded);
+    try std.testing.expectEqual(TLS_AES_128_GCM_SHA256, parsed.cipher_suite);
+    try std.testing.expectEqualSlices(u8, &random, &parsed.random);
+}
+
+test "Parse ServerHello invalid version" {
+    // Valid server hello prefix with invalid legacy version 0x0301
+    var msg = [_]u8{0} ** 44;
+    msg[0] = @intFromEnum(HandshakeType.server_hello);
+    msg[3] = 40; // content length
+    msg[4] = 0x03;
+    msg[5] = 0x01;
+    msg[38] = 0; // session id len
+    msg[39] = 0x13;
+    msg[40] = 0x01;
+
+    try std.testing.expectError(error.UnsupportedVersion, parseServerHello(&msg));
 }
