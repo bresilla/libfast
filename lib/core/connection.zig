@@ -34,6 +34,9 @@ pub const Connection = struct {
     /// Is this a server connection?
     is_server: bool,
 
+    /// Address/path validation state for amplification limits
+    peer_validated: bool,
+
     /// QUIC version
     version: u32,
 
@@ -88,6 +91,7 @@ pub const Connection = struct {
             .state = .handshaking,
             .mode = mode,
             .is_server = false,
+            .peer_validated = true,
             .version = types.QUIC_VERSION_1,
             .local_params = params,
             .remote_params = null,
@@ -130,6 +134,7 @@ pub const Connection = struct {
             .state = .handshaking,
             .mode = mode,
             .is_server = true,
+            .peer_validated = false,
             .version = types.QUIC_VERSION_1,
             .local_params = params,
             .remote_params = null,
@@ -207,6 +212,12 @@ pub const Connection = struct {
     /// Mark connection as established
     pub fn markEstablished(self: *Connection) void {
         self.state = .established;
+        self.peer_validated = true;
+    }
+
+    /// Mark peer/path as validated for amplification-limit purposes.
+    pub fn markPeerValidated(self: *Connection) void {
+        self.peer_validated = true;
     }
 
     /// Start closing the connection
@@ -231,6 +242,39 @@ pub const Connection = struct {
         if (self.data_sent + additional_data > self.max_data_remote) {
             return error.FlowControlError;
         }
+    }
+
+    fn amplificationBudget(self: *Connection) u64 {
+        if (!self.is_server or self.peer_validated) {
+            return std.math.maxInt(u64);
+        }
+
+        if (self.data_received == 0) {
+            return 0;
+        }
+
+        const max_send = if (self.data_received > std.math.maxInt(u64) / 3)
+            std.math.maxInt(u64)
+        else
+            self.data_received * 3;
+
+        if (self.data_sent >= max_send) {
+            return 0;
+        }
+        return max_send - self.data_sent;
+    }
+
+    /// Available send budget considering flow-control, congestion, and amplification limits.
+    pub fn availableSendBudget(self: *Connection) u64 {
+        const flow_budget = if (self.data_sent >= self.max_data_remote)
+            0
+        else
+            self.max_data_remote - self.data_sent;
+
+        const congestion_budget = self.congestion_controller.availableWindow();
+        const amplification_budget = self.amplificationBudget();
+
+        return @min(flow_budget, @min(congestion_budget, amplification_budget));
     }
 
     /// Update data sent
@@ -544,6 +588,47 @@ test "connection flow control" {
 
     // Should fail if exceeding limit
     try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(conn.max_data_remote + 1));
+}
+
+test "connection send budget tracks congestion window" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    const initial_budget = conn.availableSendBudget();
+    try std.testing.expect(initial_budget > 0);
+
+    conn.trackPacketSent(4000, true);
+    const reduced_budget = conn.availableSendBudget();
+    try std.testing.expect(reduced_budget < initial_budget);
+}
+
+test "connection enforces server amplification budget before validation" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    // No bytes received yet => cannot send due to amplification limit.
+    try std.testing.expectEqual(@as(u64, 0), conn.availableSendBudget());
+
+    conn.updateDataReceived(1000);
+    try std.testing.expectEqual(@as(u64, 3000), conn.availableSendBudget());
+
+    conn.updateDataSent(2500);
+    try std.testing.expectEqual(@as(u64, 500), conn.availableSendBudget());
+
+    // Validation removes amplification cap.
+    conn.markPeerValidated();
+    try std.testing.expect(conn.availableSendBudget() > 500);
 }
 
 test "connection ack integrates congestion accounting" {

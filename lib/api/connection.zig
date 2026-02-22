@@ -400,8 +400,16 @@ pub const QuicConnection = struct {
         // Get stream
         const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
+        const budget = conn.availableSendBudget();
+        if (budget == 0) {
+            return types_mod.QuicError.FlowControlError;
+        }
+
+        const write_len: usize = @intCast(@min(@as(u64, data.len), budget));
+        const write_data = data[0..write_len];
+
         // Write data to stream
-        const written = stream.write(data) catch {
+        const written = stream.write(write_data) catch {
             return types_mod.QuicError.StreamError;
         };
 
@@ -773,6 +781,40 @@ test "closeStream is FIN-based half close" {
     try stream.appendRecvData(&[_]u8{}, stream.recv_offset, true);
     const eof_len = try conn.streamRead(stream_id, &read_buf);
     try std.testing.expectEqual(@as(usize, 0), eof_len);
+}
+
+test "streamWrite respects congestion send budget" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    const stream_id = try conn.openStream(true);
+    _ = conn.nextEvent();
+
+    // Limit send budget to 5 bytes.
+    internal_conn.congestion_controller.congestion_window = 5;
+    internal_conn.congestion_controller.bytes_in_flight = 0;
+
+    const written = try conn.streamWrite(stream_id, "abcdefghij", .no_finish);
+    try std.testing.expectEqual(@as(usize, 5), written);
+
+    // Exhaust budget and ensure write is blocked.
+    internal_conn.congestion_controller.bytes_in_flight = 5;
+    try std.testing.expectError(
+        types_mod.QuicError.FlowControlError,
+        conn.streamWrite(stream_id, "x", .no_finish),
+    );
 }
 
 test "poll parses received long-header packet and updates visibility stats" {
