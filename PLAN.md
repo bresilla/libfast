@@ -37,7 +37,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Validate certificate chain and hostname for client mode.
 - Add config options for trust anchors and verification policy.
 
-### Slice 2.4 - Handshake test vectors
+### Slice 2.4 - Handshake test vectors [done]
 - Add deterministic handshake vectors and negative tests.
 - Validate state machine transitions and failure modes.
 
