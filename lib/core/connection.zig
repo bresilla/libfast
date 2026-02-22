@@ -698,3 +698,98 @@ test "connection schedules PTO probe" {
     try std.testing.expect(probe.?.is_probe);
     try std.testing.expect(conn.pto_count > 0);
 }
+
+test "recovery handles packet reordering without spurious retransmit" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+
+    // Reordered ACK first acknowledges a newer packet.
+    conn.processAckDetailed(2, 0);
+    // Late ACK for an older packet follows.
+    conn.processAckDetailed(1, 0);
+
+    // Reordering should not trigger uncontrolled retransmit growth.
+    var retransmit_count: usize = 0;
+    while (conn.popRetransmission()) |_| {
+        retransmit_count += 1;
+    }
+    try std.testing.expect(retransmit_count <= 1);
+}
+
+test "pto backoff grows and remains bounded" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+
+    var last_deadline = conn.next_pto_at.?;
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        conn.onPtoTimeout(last_deadline.add(1));
+
+        const probe = conn.popRetransmission();
+        try std.testing.expect(probe != null);
+        try std.testing.expect(probe.?.is_probe);
+
+        try std.testing.expect(conn.pto_count == i + 1);
+        try std.testing.expect(conn.next_pto_at != null);
+        const next_deadline = conn.next_pto_at.?;
+        try std.testing.expect(next_deadline.isAfter(last_deadline));
+        last_deadline = next_deadline;
+    }
+
+    // Guardrail: bounded PTO growth for this harness.
+    try std.testing.expect(conn.pto_count <= 5);
+}
+
+test "recovery remains stable under mixed loss and timeout stress" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var round: u32 = 0;
+    while (round < 20) : (round += 1) {
+        // Send a small burst.
+        conn.trackPacketSent(1200, true);
+        conn.trackPacketSent(1200, true);
+        conn.trackPacketSent(1200, true);
+
+        // ACK the most recent packet to drive loss detection and recovery.
+        conn.processAckDetailed(conn.next_packet_number - 1, 0);
+
+        // If PTO expires, queue and consume a probe.
+        if (conn.next_pto_at) |deadline| {
+            conn.onPtoTimeout(deadline.add(1));
+            while (conn.popRetransmission()) |req| {
+                // Simulate consuming queued retransmissions/probes.
+                _ = req;
+            }
+        }
+
+        // Stability checks: controller should stay within sane bounds.
+        try std.testing.expect(conn.congestion_controller.getCongestionWindow() >= 2 * conn.congestion_controller.max_datagram_size);
+        try std.testing.expect(conn.availableSendBudget() <= conn.max_data_remote);
+        try std.testing.expect(conn.pto_count <= round + 1);
+    }
+}
