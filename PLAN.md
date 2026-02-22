@@ -29,7 +29,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Parse selected cipher suite from ServerHello rather than hardcoding.
 - Reject unsupported versions/cipher suites with explicit errors.
 
-### Slice 2.2 - Transcript and Finished verification
+### Slice 2.2 - Transcript and Finished verification [in progress]
 - Build transcript from real handshake bytes.
 - Verify Finished MAC before marking handshake complete.
 
