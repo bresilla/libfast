@@ -80,7 +80,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Feed ACK ranges into loss detection state.
 - Update in-flight accounting and RTT sampling from ACKed packets.
 
-### Slice 4.2 - Retransmission scheduler
+### Slice 4.2 - Retransmission scheduler [done]
 - Retransmit lost ack-eliciting frames with PTO-based probing.
 - Avoid spurious retransmits across packet number spaces.
 
