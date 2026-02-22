@@ -64,7 +64,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Ensure peer-side EOF signaling on FIN and support half-close behavior.
 - Add integration tests for close/write/read ordering across both peers.
 
-### Slice 3.6 - SSH/QUIC bidirectional stream policy
+### Slice 3.6 - SSH/QUIC bidirectional stream policy [done]
 - Enforce bidirectional streams for SSH channel mapping.
 - Reject or ignore unidirectional stream open attempts in SSH/QUIC mode.
 - Add tests for stream ID parity and initiator rules (client: 4,8,12; server: 5,9,13).
