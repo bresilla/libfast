@@ -102,7 +102,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Implement PATH_CHALLENGE/PATH_RESPONSE behavior.
 - Enforce pre-validation amplification budget on server.
 
-### Slice 5.3 - Fuzzing and negative testing
+### Slice 5.3 - Fuzzing and negative testing [done]
 - Add fuzz targets for packet/frame/varint decode.
 - Add malformed input corpus and crash regression suite.
 
