@@ -11,6 +11,7 @@ const core_types = @import("../core/types.zig");
 const varint = @import("../utils/varint.zig");
 
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
+const CLOSE_REASON_MAX_LEN: usize = 256;
 
 /// Public QUIC connection handle
 pub const QuicConnection = struct {
@@ -36,6 +37,13 @@ pub const QuicConnection = struct {
     // Basic packet visibility counters
     packets_received: u64,
     packets_invalid: u64,
+
+    // Connection close state tracking
+    close_reason_buf: [CLOSE_REASON_MAX_LEN]u8,
+    close_reason_len: usize,
+    close_error_code: u64,
+    drain_pending: bool,
+    closed_event_emitted: bool,
 
     /// Initialize a new QUIC connection
     pub fn init(
@@ -63,7 +71,40 @@ pub const QuicConnection = struct {
             .remote_addr = null,
             .packets_received = 0,
             .packets_invalid = 0,
+            .close_reason_buf = [_]u8{0} ** CLOSE_REASON_MAX_LEN,
+            .close_reason_len = 0,
+            .close_error_code = 0,
+            .drain_pending = false,
+            .closed_event_emitted = false,
         };
+    }
+
+    fn setCloseReason(self: *QuicConnection, reason: []const u8) void {
+        const len = @min(reason.len, CLOSE_REASON_MAX_LEN);
+        @memcpy(self.close_reason_buf[0..len], reason[0..len]);
+        self.close_reason_len = len;
+    }
+
+    fn closeReason(self: *QuicConnection) []const u8 {
+        return self.close_reason_buf[0..self.close_reason_len];
+    }
+
+    fn enterDraining(
+        self: *QuicConnection,
+        error_code: u64,
+        reason: []const u8,
+    ) types_mod.QuicError!void {
+        self.setCloseReason(reason);
+        self.close_error_code = error_code;
+        self.drain_pending = true;
+        self.state = .draining;
+
+        try self.events.append(self.allocator, .{
+            .closing = .{
+                .error_code = error_code,
+                .reason = self.closeReason(),
+            },
+        });
     }
 
     fn shortHeaderDcidLen(self: *QuicConnection) u8 {
@@ -99,13 +140,7 @@ pub const QuicConnection = struct {
             return;
         }
 
-        self.state = .draining;
-        try self.events.append(self.allocator, .{
-            .closing = .{
-                .error_code = 1,
-                .reason = reason,
-            },
-        });
+        try self.enterDraining(1, reason);
     }
 
     fn routeFrame(self: *QuicConnection, payload: []const u8) types_mod.QuicError!void {
@@ -152,13 +187,8 @@ pub const QuicConnection = struct {
                 const decoded = frame_mod.ConnectionCloseFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
                 };
-                self.state = .draining;
-                try self.events.append(self.allocator, .{
-                    .closing = .{
-                        .error_code = decoded.frame.error_code,
-                        .reason = "peer close",
-                    },
-                });
+
+                try self.enterDraining(decoded.frame.error_code, decoded.frame.reason);
             },
             0x04 => {
                 const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
@@ -476,6 +506,24 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ConnectionClosed;
         }
 
+        if (self.state == .draining) {
+            if (self.drain_pending) {
+                self.drain_pending = false;
+                return;
+            }
+
+            self.state = .closed;
+            if (self.internal_conn) |conn| {
+                conn.markClosed();
+            }
+
+            if (!self.closed_event_emitted) {
+                self.closed_event_emitted = true;
+                try self.events.append(self.allocator, .{ .closed = {} });
+            }
+            return;
+        }
+
         // Transition from connecting to established (simplified handshake)
         if (self.state == .connecting) {
             self.state = .established;
@@ -552,16 +600,11 @@ pub const QuicConnection = struct {
             return;
         }
 
-        // Send connection close frame (simplified - just transition state)
-        self.state = .draining;
+        if (self.internal_conn) |conn| {
+            conn.close(error_code, reason);
+        }
 
-        // Add closing event
-        self.events.append(self.allocator, .{
-            .closing = .{
-                .error_code = error_code,
-                .reason = reason,
-            },
-        }) catch {};
+        self.enterDraining(error_code, reason) catch {};
     }
 
     /// Clean up resources
@@ -878,7 +921,44 @@ test "poll routes connection close frame to closing event" {
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(@as(u64, 0x0a), event.?.closing.error_code);
+    try std.testing.expectEqualStrings("bye", event.?.closing.reason);
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "draining transitions to closed and emits closed event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try conn.close(55, "closing-now");
+    const closing_event = conn.nextEvent();
+    try std.testing.expect(closing_event != null);
+    try std.testing.expect(closing_event.? == .closing);
+    try std.testing.expectEqual(@as(u64, 55), closing_event.?.closing.error_code);
+    try std.testing.expectEqualStrings("closing-now", closing_event.?.closing.reason);
+
+    // First poll in draining acts as grace period
+    try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    // Second poll transitions to closed and emits closed event
+    try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.closed, conn.getState());
+
+    const closed_event = conn.nextEvent();
+    try std.testing.expect(closed_event != null);
+    try std.testing.expect(closed_event.? == .closed);
 }
 
 test "poll routes STREAM frame into stream data and readable event" {
