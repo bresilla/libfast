@@ -1,5 +1,5 @@
 const std = @import("std");
-const runquic = @import("runquic");
+const libfast = @import("libfast");
 
 /// Minimal TLS/QUIC echo client
 ///
@@ -10,7 +10,6 @@ const runquic = @import("runquic");
 /// - Send and receive data
 ///
 /// Usage: zig build run-tls-client
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -20,10 +19,10 @@ pub fn main() !void {
 
     // Configure TLS mode
     const server_name = "localhost";
-    const config = runquic.QuicConfig.tlsClient(server_name);
+    const config = libfast.QuicConfig.tlsClient(server_name);
 
     // Create connection
-    var conn = try runquic.QuicConnection.init(allocator, config);
+    var conn = try libfast.QuicConnection.init(allocator, config);
     defer conn.deinit();
 
     std.log.info("Connecting to {s}:4434...", .{server_name});

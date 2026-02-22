@@ -4,7 +4,7 @@ build:
 	zig build -Doptimize=ReleaseFast
 
 install: build
-	install -Dm644 "./zig-out/lib/librunquic.a" "$(HOME)/.local/lib/librunquic.a"
+	install -Dm644 "./zig-out/lib/libfast.a" "$(HOME)/.local/lib/libfast.a"
 
 # Release
 # ==================================================================================================

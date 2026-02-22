@@ -1,6 +1,6 @@
-# RunQUIC Examples
+# libfast Examples
 
-This directory contains example applications demonstrating how to use the RunQUIC library.
+This directory contains example applications demonstrating how to use the libfast library.
 
 ## Building Examples
 
@@ -74,16 +74,16 @@ zig build run-tls-client
 ### SSH Mode
 
 ```zig
-const runquic = @import("runquic");
+const libfast = @import("libfast");
 
 // Create SSH mode configuration
-const config = runquic.QuicConfig.sshClient(
+const config = libfast.QuicConfig.sshClient(
     "server.example.com",
     "obfuscation-keyword"
 );
 
 // Initialize connection
-var conn = try runquic.QuicConnection.init(allocator, config);
+var conn = try libfast.QuicConnection.init(allocator, config);
 defer conn.deinit();
 
 // Connect to server
@@ -103,13 +103,13 @@ const n = try stream.read(&buf);
 ### TLS Mode
 
 ```zig
-const runquic = @import("runquic");
+const libfast = @import("libfast");
 
 // Create TLS mode configuration
-const config = runquic.QuicConfig.tlsClient("server.example.com");
+const config = libfast.QuicConfig.tlsClient("server.example.com");
 
 // Same connection API as SSH mode
-var conn = try runquic.QuicConnection.init(allocator, config);
+var conn = try libfast.QuicConnection.init(allocator, config);
 defer conn.deinit();
 
 // The crypto layer is abstracted - stream I/O is identical

@@ -1,5 +1,5 @@
 const std = @import("std");
-const runquic = @import("runquic");
+const libfast = @import("libfast");
 
 /// Minimal TLS/QUIC echo server
 ///
@@ -10,7 +10,6 @@ const runquic = @import("runquic");
 /// - Read and echo data back
 ///
 /// Usage: zig build run-tls-server
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -22,10 +21,10 @@ pub fn main() !void {
     const certificate = ""; // TODO: Load from file
     const private_key = ""; // TODO: Load from file
 
-    const config = runquic.QuicConfig.tlsServer(certificate, private_key);
+    const config = libfast.QuicConfig.tlsServer(certificate, private_key);
 
     // Create connection
-    var conn = try runquic.QuicConnection.init(allocator, config);
+    var conn = try libfast.QuicConnection.init(allocator, config);
     defer conn.deinit();
 
     std.log.info("Server ready, waiting for connections...", .{});
@@ -59,7 +58,7 @@ pub fn main() !void {
     std.log.info("Server shutting down", .{});
 }
 
-fn handleStream(conn: *runquic.QuicConnection, stream_id: u64) !void {
+fn handleStream(conn: *libfast.QuicConnection, stream_id: u64) !void {
     _ = conn;
     _ = stream_id;
 
