@@ -8,6 +8,7 @@ const crypto_mod = @import("../crypto/crypto.zig");
 const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
+const varint = @import("../utils/varint.zig");
 
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 
@@ -105,6 +106,55 @@ pub const QuicConnection = struct {
                 .reason = reason,
             },
         });
+    }
+
+    fn routeFrame(self: *QuicConnection, payload: []const u8) types_mod.QuicError!void {
+        if (payload.len == 0) return;
+
+        const frame_type_result = varint.decode(payload) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+
+        const frame_type = frame_type_result.value;
+
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            const decoded = frame_mod.StreamFrame.decode(payload) catch {
+                return types_mod.QuicError.InvalidPacket;
+            };
+            try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
+            return;
+        }
+
+        switch (frame_type) {
+            0x01 => {
+                _ = frame_mod.PingFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+            },
+            0x02, 0x03 => {
+                const decoded = frame_mod.AckFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+                if (self.internal_conn) |conn| {
+                    conn.processAck(decoded.frame.largest_acked);
+                }
+            },
+            0x1c, 0x1d => {
+                const decoded = frame_mod.ConnectionCloseFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+                self.state = .draining;
+                try self.events.append(self.allocator, .{
+                    .closing = .{
+                        .error_code = decoded.frame.error_code,
+                        .reason = "peer close",
+                    },
+                });
+            },
+            else => {
+                // Unknown/unhandled frame type in this slice: ignore.
+            },
+        }
     }
 
     /// Start connecting (client only)
@@ -409,18 +459,19 @@ pub const QuicConnection = struct {
                 conn.updateDataReceived(packet.len);
             }
 
-            _ = self.decodePacketHeader(packet) catch {
+            const header_len = self.decodePacketHeader(packet) catch {
                 self.packets_invalid += 1;
                 try self.queueProtocolViolation("invalid packet header");
                 return;
             };
 
-            if (packet.len > 0) {
-                const frame_result = frame_mod.StreamFrame.decode(packet) catch null;
-                if (frame_result) |decoded| {
-                    try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
-                }
-            }
+            if (header_len >= packet.len) return;
+
+            self.routeFrame(packet[header_len..]) catch {
+                self.packets_invalid += 1;
+                try self.queueProtocolViolation("invalid frame payload");
+                return;
+            };
         }
     }
 
@@ -699,6 +750,94 @@ test "poll maps invalid packet header to closing event" {
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(@as(u64, 1), event.?.closing.error_code);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "poll routes ACK frame into connection ack tracking" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 2,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 7,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(@as(u64, 7), conn.internal_conn.?.largest_acked);
+}
+
+test "poll routes connection close frame to closing event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try conn.poll();
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 16,
+        .packet_number = 3,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const close_frame = frame_mod.ConnectionCloseFrame{
+        .error_code = 0x0a,
+        .frame_type = null,
+        .reason = "bye",
+    };
+    packet_len += try close_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(@as(u64, 0x0a), event.?.closing.error_code);
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
 
