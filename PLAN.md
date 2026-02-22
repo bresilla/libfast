@@ -98,7 +98,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Remove page allocator usage in secret derivation paths.
 - Zeroize transient sensitive buffers consistently.
 
-### Slice 5.2 - Path validation and anti-amplification
+### Slice 5.2 - Path validation and anti-amplification [done]
 - Implement PATH_CHALLENGE/PATH_RESPONSE behavior.
 - Enforce pre-validation amplification budget on server.
 
