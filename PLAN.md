@@ -69,7 +69,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Reject or ignore unidirectional stream open attempts in SSH/QUIC mode.
 - Add tests for stream ID parity and initiator rules (client: 4,8,12; server: 5,9,13).
 
-### Slice 3.7 - SSH transport cleanup compatibility tests
+### Slice 3.7 - SSH transport cleanup compatibility tests [done]
 - Add integration tests proving no dependence on SSH `initial_window_size`/`maximum_packet_size`.
 - Assert behavior without SSH-level `CHANNEL_WINDOW_ADJUST` semantics.
 - Validate concurrent channel streams over QUIC-only flow control.
