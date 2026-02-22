@@ -106,7 +106,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Add fuzz targets for packet/frame/varint decode.
 - Add malformed input corpus and crash regression suite.
 
-### Slice 5.4 - Release and compliance
+### Slice 5.4 - Release and compliance [done]
 - Finalize license and security reporting policy.
 - Add interop CI matrix and publish release gates.
 
