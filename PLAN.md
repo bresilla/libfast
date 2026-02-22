@@ -84,7 +84,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Retransmit lost ack-eliciting frames with PTO-based probing.
 - Avoid spurious retransmits across packet number spaces.
 
-### Slice 4.3 - Congestion controller wiring
+### Slice 4.3 - Congestion controller wiring [done]
 - Integrate NewReno cwnd updates with send pacing decisions.
 - Enforce send budget under congestion and amplification limits.
 
