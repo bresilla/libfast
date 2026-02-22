@@ -75,6 +75,9 @@ pub const TlsContext = struct {
         if (!self.is_client) {
             return error.InvalidState;
         }
+        if (self.state != .idle) {
+            return error.InvalidState;
+        }
 
         _ = server_name;
 
@@ -161,6 +164,10 @@ pub const TlsContext = struct {
         peer_certificate_chain_pem: ?[]const u8,
         peer_options: ?PeerVerificationOptions,
     ) TlsError!void {
+        if (!self.is_client or self.state != .server_hello_received) {
+            return error.InvalidState;
+        }
+
         if (peer_options) |opts| {
             try self.verifyPeerIdentity(peer_certificate_chain_pem, opts);
         }
@@ -592,6 +599,112 @@ test "Peer verification rejects missing certificate chain" {
         error.HandshakeFailed,
         ctx.completeHandshakeWithPeerValidation(&shared_secret, null, null, options),
     );
+}
+
+test "Deterministic handshake vector with valid Finished" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{11} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+    try ctx.processServerHello(server_hello);
+
+    // Build expected Finished verify_data from deterministic inputs.
+    var ks = try key_schedule_mod.KeySchedule.init(allocator, .sha256);
+    defer ks.deinit();
+
+    const shared_secret = "deterministic-shared-secret".*;
+    const early_secret = try ks.deriveEarlySecret(null);
+    defer allocator.free(early_secret);
+    const handshake_secret = try ks.deriveHandshakeSecret(early_secret, &shared_secret);
+    defer allocator.free(handshake_secret);
+    ks.updateTranscript(ctx.transcript.items);
+    const hs_secrets = try ks.deriveHandshakeTrafficSecrets(handshake_secret);
+    defer {
+        @memset(hs_secrets.client, 0);
+        allocator.free(hs_secrets.client);
+        @memset(hs_secrets.server, 0);
+        allocator.free(hs_secrets.server);
+    }
+
+    var finished_key: [32]u8 = undefined;
+    try keys_mod.hkdfExpandLabel(
+        hs_secrets.server,
+        "finished",
+        "",
+        finished_key.len,
+        .sha256,
+        &finished_key,
+    );
+
+    var verify_data: [32]u8 = undefined;
+    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&finished_key);
+    hmac.update(ks.transcript_hash);
+    hmac.final(&verify_data);
+
+    try ctx.completeHandshakeWithFinished(&shared_secret, &verify_data);
+    try std.testing.expect(ctx.state.isComplete());
+}
+
+test "State machine rejects complete handshake before server hello" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const shared_secret = "test-shared-secret".*;
+    try std.testing.expectError(
+        error.InvalidState,
+        ctx.completeHandshakeWithFinished(&shared_secret, null),
+    );
+}
+
+test "State machine rejects duplicate server hello" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{13} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]handshake_mod.Extension{},
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try ctx.processServerHello(server_hello);
+    try std.testing.expectError(error.InvalidState, ctx.processServerHello(server_hello));
+}
+
+test "State machine rejects starting handshake twice" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const client_hello = try ctx.startClientHandshake("example.com");
+    defer allocator.free(client_hello);
+
+    try std.testing.expectError(error.InvalidState, ctx.startClientHandshake("example.com"));
 }
 
 test "Get cipher suite info" {
