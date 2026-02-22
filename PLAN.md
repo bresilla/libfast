@@ -47,7 +47,7 @@ This plan tracks the path from prototype to production-ready QUIC library.
 - Implement variable packet number length encode/decode paths.
 - Integrate PN protection bits with header protection flow.
 
-### Slice 3.2 - Frame decode coverage
+### Slice 3.2 - Frame decode coverage [done]
 - Add decode implementations for frequently used control frames.
 - Route decoded frames into stream and connection state updates.
 
