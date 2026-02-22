@@ -9,6 +9,7 @@ const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
 const varint = @import("../utils/varint.zig");
+const time_mod = @import("../utils/time.zig");
 
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 const CLOSE_REASON_MAX_LEN: usize = 256;
@@ -525,6 +526,10 @@ pub const QuicConnection = struct {
                 try self.events.append(self.allocator, .{ .closed = {} });
             }
             return;
+        }
+
+        if (self.internal_conn) |conn| {
+            conn.onPtoTimeout(time_mod.Instant.now());
         }
 
         // Transition from connecting to established (simplified handshake)

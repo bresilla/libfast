@@ -15,6 +15,12 @@ const StreamId = types.StreamId;
 
 /// QUIC Connection
 pub const Connection = struct {
+    pub const RetransmissionRequest = struct {
+        packet_number: u64,
+        size: usize,
+        is_probe: bool,
+    };
+
     /// Connection IDs
     local_conn_id: ConnectionId,
     remote_conn_id: ConnectionId,
@@ -45,6 +51,9 @@ pub const Connection = struct {
     /// Recovery and congestion control
     loss_detection: loss_detection.LossDetection,
     congestion_controller: congestion.CongestionController,
+    retransmission_queue: std.ArrayList(RetransmissionRequest),
+    pto_count: u32,
+    next_pto_at: ?time.Instant,
 
     /// Flow control
     max_data_local: u64,
@@ -87,6 +96,9 @@ pub const Connection = struct {
             .largest_acked = 0,
             .loss_detection = loss_detection.LossDetection.init(allocator),
             .congestion_controller = congestion.CongestionController.init(1200),
+            .retransmission_queue = .{},
+            .pto_count = 0,
+            .next_pto_at = null,
             .max_data_local = params.initial_max_data,
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
@@ -126,6 +138,9 @@ pub const Connection = struct {
             .largest_acked = 0,
             .loss_detection = loss_detection.LossDetection.init(allocator),
             .congestion_controller = congestion.CongestionController.init(1200),
+            .retransmission_queue = .{},
+            .pto_count = 0,
+            .next_pto_at = null,
             .max_data_local = params.initial_max_data,
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
@@ -144,6 +159,7 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection) void {
         self.streams.deinit();
         self.loss_detection.deinit();
+        self.retransmission_queue.deinit(self.allocator);
     }
 
     /// Open a new stream
@@ -258,6 +274,8 @@ pub const Connection = struct {
         if (ack_result.acked_packet) |acked| {
             if (acked.in_flight) {
                 self.congestion_controller.onPacketAcked(acked.size, acked.packet_number);
+                self.pto_count = 0;
+                self.next_pto_at = now.add(self.loss_detection.getPto());
             }
         }
 
@@ -275,6 +293,14 @@ pub const Connection = struct {
 
             if (bytes_lost > 0) {
                 self.congestion_controller.onPacketsLost(bytes_lost, largest_lost);
+
+                for (ack_result.lost_packets.items) |lost| {
+                    self.retransmission_queue.append(self.allocator, .{
+                        .packet_number = lost.packet_number,
+                        .size = lost.size,
+                        .is_probe = false,
+                    }) catch {};
+                }
             }
         }
 
@@ -286,12 +312,48 @@ pub const Connection = struct {
     /// Track a sent packet for RTT/loss/congestion accounting.
     pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
         const pn = self.nextPacketNumber();
-        const sent = loss_detection.SentPacket.init(pn, time.Instant.now(), packet_size, ack_eliciting);
+        const now = time.Instant.now();
+        const sent = loss_detection.SentPacket.init(pn, now, packet_size, ack_eliciting);
 
         self.loss_detection.onPacketSent(.application, sent) catch {};
         if (sent.in_flight) {
             self.congestion_controller.onPacketSent(packet_size);
         }
+
+        if (ack_eliciting) {
+            self.next_pto_at = now.add(self.loss_detection.getPto());
+        }
+    }
+
+    /// Schedule probe retransmission when PTO expires.
+    pub fn onPtoTimeout(self: *Connection, now: time.Instant) void {
+        if (self.next_pto_at) |deadline| {
+            if (now.isBefore(deadline)) {
+                return;
+            }
+
+            self.retransmission_queue.append(self.allocator, .{
+                .packet_number = self.next_packet_number,
+                .size = @intCast(self.congestion_controller.max_datagram_size),
+                .is_probe = true,
+            }) catch {};
+
+            self.pto_count += 1;
+
+            const base_pto = self.loss_detection.getPto();
+            const shift: u6 = @intCast(@min(self.pto_count, 20));
+            const backoff = (@as(u64, 1) << shift);
+            self.next_pto_at = now.add(base_pto * backoff);
+        }
+    }
+
+    /// Pop next pending retransmission request, if any.
+    pub fn popRetransmission(self: *Connection) ?RetransmissionRequest {
+        if (self.retransmission_queue.items.len == 0) {
+            return null;
+        }
+
+        return self.retransmission_queue.orderedRemove(0);
     }
 };
 
@@ -505,4 +567,49 @@ test "connection ack integrates congestion accounting" {
 
     try std.testing.expect(conn.largest_acked >= 2);
     try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
+}
+
+test "connection schedules retransmission for lost packets" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+    conn.trackPacketSent(1200, true); // pn 3
+    conn.trackPacketSent(1200, true); // pn 4
+
+    conn.processAckDetailed(4, 0);
+
+    const retransmit = conn.popRetransmission();
+    try std.testing.expect(retransmit != null);
+    try std.testing.expect(!retransmit.?.is_probe);
+}
+
+test "connection schedules PTO probe" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+    try std.testing.expect(conn.next_pto_at != null);
+
+    const trigger_time = conn.next_pto_at.?.add(1);
+    conn.onPtoTimeout(trigger_time);
+
+    const probe = conn.popRetransmission();
+    try std.testing.expect(probe != null);
+    try std.testing.expect(probe.?.is_probe);
+    try std.testing.expect(conn.pto_count > 0);
 }
