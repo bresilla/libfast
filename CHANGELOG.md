@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.7] - 2026-02-24
+
+### <!-- 0 -->⛰️  Features
+
+- Implement robust flow control and keep-alive
+
 ## [0.0.6] - 2026-02-22
 
 ### <!-- 0 -->⛰️  Features

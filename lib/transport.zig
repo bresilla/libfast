@@ -74,12 +74,42 @@ pub const QuicTransport = struct {
     }
 
     /// Send data on a stream
+    ///
+    /// Blocks if the flow control window is full, polling for
+    /// MAX_STREAM_DATA from the peer (like SSH WINDOW_ADJUST).
     pub fn sendOnStream(self: *Self, stream_id: u64, data: []const u8) !void {
         const stream = self.connection.getStream(stream_id) orelse return error.StreamNotFound;
-        try stream.write(data);
 
-        // Immediately try to flush
-        try self.flush();
+        var written: usize = 0;
+        var stall_count: u32 = 0;
+        while (written < data.len) {
+            // How much can we write within the flow control window?
+            const total_produced = stream.send_offset + stream.send_buffer.items.len;
+            const available = if (stream.send_max > total_produced)
+                @as(usize, @intCast(stream.send_max - total_produced))
+            else
+                0;
+
+            if (available == 0) {
+                // Window full — flush pending data, then poll for window updates
+                stall_count += 1;
+                if (stall_count > 3000) {
+                    // ~30 seconds with no window progress — peer is likely dead
+                    return error.ConnectionStalled;
+                }
+                try self.flush();
+                self.poll(10) catch {};
+                continue;
+            }
+
+            stall_count = 0;
+            const chunk = @min(data.len - written, available);
+            try stream.write(data[written .. written + chunk]);
+            written += chunk;
+
+            // Flush each chunk so the peer sees data and can send window updates
+            try self.flush();
+        }
     }
 
     /// Receive data from a stream
@@ -143,6 +173,9 @@ pub const QuicTransport = struct {
         self.processPacket(packet_buffer[0..recv_len]) catch {
             // Silently ignore packet processing errors
         };
+
+        // Send MAX_STREAM_DATA updates after receiving data
+        self.sendWindowUpdates() catch {};
     }
 
     /// Process received QUIC packet
@@ -209,6 +242,11 @@ pub const QuicTransport = struct {
             };
 
             switch (frame_type) {
+                .ping => {
+                    // PING frame — no payload, just acknowledge receipt
+                    break;
+                },
+
                 .stream => {
                     const stream_frame = frame.StreamFrame.decode(
                         self.allocator,
@@ -321,6 +359,27 @@ pub const QuicTransport = struct {
         if (self.connection.needsAck()) {
             try self.sendAck();
         }
+
+        // Send MAX_STREAM_DATA updates (sliding window flow control)
+        try self.sendWindowUpdates();
+    }
+
+    /// Send MAX_STREAM_DATA frames for streams whose receive window is running low
+    fn sendWindowUpdates(self: *Self) !void {
+        var stream_it = self.connection.streams.iterator();
+        while (stream_it.next()) |entry| {
+            const stream = entry.value_ptr.*;
+            if (stream.needsMaxStreamDataUpdate()) {
+                const new_max = stream.slideRecvWindow();
+                const max_data_frame = frame.MaxStreamDataFrame{
+                    .stream_id = stream.stream_id,
+                    .maximum_stream_data = new_max,
+                };
+                var max_data_buf: [17]u8 = undefined;
+                const encoded_len = try max_data_frame.encode(&max_data_buf);
+                try self.sendPacket(max_data_buf[0..encoded_len]);
+            }
+        }
     }
 
     /// Send a QUIC packet with given payload
@@ -383,6 +442,16 @@ pub const QuicTransport = struct {
         const encoded_len = try ack_frame.encode(&buffer);
 
         try self.sendPacket(buffer[0..encoded_len]);
+    }
+
+    /// Send a keepalive probe (QUIC PING frame).
+    ///
+    /// Sending a UDP packet to a dead peer provokes an ICMP
+    /// port-unreachable response.  The next poll() delivers that
+    /// as ConnectionRefused so the caller can detect a dead peer.
+    pub fn sendKeepalive(self: *Self) !void {
+        const ping_payload = [_]u8{0x01}; // PING frame
+        try self.sendPacket(&ping_payload);
     }
 
     /// Check if connection is ready

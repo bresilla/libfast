@@ -31,6 +31,8 @@ pub const Stream = struct {
     // Out-of-order received data (offset -> data)
     recv_chunks: std.AutoHashMap(u64, []u8),
 
+    pub const initial_window: u64 = 2 * 1024 * 1024; // 2MB, matches OpenSSH
+
     const Self = @This();
 
     /// Initialize a new stream
@@ -41,10 +43,10 @@ pub const Stream = struct {
             .state = .open,
             .send_buffer = .{},
             .send_offset = 0,
-            .send_max = 1024 * 1024, // Default 1MB flow control limit
+            .send_max = initial_window,
             .recv_buffer = .{},
             .recv_offset = 0,
-            .recv_max = 1024 * 1024, // Default 1MB
+            .recv_max = initial_window,
             .recv_chunks = std.AutoHashMap(u64, []u8).init(allocator),
         };
     }
@@ -208,9 +210,14 @@ pub const Stream = struct {
 
     /// Check if stream needs to send MAX_STREAM_DATA update
     pub fn needsMaxStreamDataUpdate(self: *const Self) bool {
-        // Send update if we've consumed more than half our window
-        const consumed = self.recv_offset;
-        return consumed > (self.recv_max / 2);
+        const remaining = if (self.recv_max > self.recv_offset) self.recv_max - self.recv_offset else 0;
+        return remaining < initial_window / 2;
+    }
+
+    /// Slide the receive window forward and return the new max offset.
+    pub fn slideRecvWindow(self: *Self) u64 {
+        self.recv_max = self.recv_offset + initial_window;
+        return self.recv_max;
     }
 };
 

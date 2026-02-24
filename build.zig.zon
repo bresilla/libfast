@@ -1,6 +1,6 @@
 .{
     .name = .libfast,
-    .version = "0.0.6",
+    .version = "0.0.7",
     .dependencies = .{
         // zquic removed - building custom minimal QUIC for SSH/QUIC
     },
