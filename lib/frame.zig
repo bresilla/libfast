@@ -9,6 +9,7 @@ const std = @import("std");
 /// - CONNECTION_CLOSE frames (teardown)
 
 pub const FrameType = enum(u8) {
+    ping = 0x01,
     stream = 0x08, // Base type, actual value varies with flags
     max_stream_data = 0x05,
     ack = 0x02,
