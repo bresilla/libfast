@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.10] - 2026-02-27
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Correctly parse multiple frames in a single packet
+
 ## [0.0.9] - 2026-02-27
 
 ### <!-- 1 -->🐛 Bug Fixes
