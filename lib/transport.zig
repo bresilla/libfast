@@ -142,12 +142,12 @@ pub const QuicTransport = struct {
             .usec = @intCast((timeout_ms % 1000) * 1000),
         };
 
-        posix.setsockopt(
+        try posix.setsockopt(
             self.socket,
             posix.SOL.SOCKET,
             posix.SO.RCVTIMEO,
-            &std.mem.toBytes(timeout),
-        ) catch {};
+            std.mem.asBytes(&timeout),
+        );
 
         var packet_buffer: [2048]u8 = undefined;
         var src_addr: posix.sockaddr.storage = undefined;
@@ -175,21 +175,12 @@ pub const QuicTransport = struct {
         self.processPacket(packet_buffer[0..first_len]) catch {};
         packets_processed = 1;
 
-        // Switch to non-blocking and drain all queued packets
-        const zero_timeout = posix.timeval{ .sec = 0, .usec = 0 };
-        posix.setsockopt(
-            self.socket,
-            posix.SOL.SOCKET,
-            posix.SO.RCVTIMEO,
-            &std.mem.toBytes(zero_timeout),
-        ) catch {};
-
         while (packets_processed < 64) {
             src_addr_len = @sizeOf(posix.sockaddr.storage);
             const recv_len = posix.recvfrom(
                 self.socket,
                 &packet_buffer,
-                0,
+                posix.MSG.DONTWAIT,
                 @ptrCast(&src_addr),
                 &src_addr_len,
             ) catch break; // WouldBlock or error — done draining
@@ -259,7 +250,7 @@ pub const QuicTransport = struct {
             return;
         }
 
-        const offset: usize = 0;
+        var offset: usize = 0;
 
         while (offset < payload.len) {
             const frame_type = frame.FrameType.decode(payload[offset..]) catch |err| {
@@ -270,7 +261,7 @@ pub const QuicTransport = struct {
             switch (frame_type) {
                 .ping => {
                     // PING frame — no payload, just acknowledge receipt
-                    break;
+                    offset += 1;
                 },
 
                 .stream => {
@@ -293,14 +284,12 @@ pub const QuicTransport = struct {
                     stream.receiveData(stream_frame.offset, stream_frame.data) catch |err| {
                         std.log.warn("Failed to deliver data to stream {}: {}", .{ stream_frame.stream_id, err });
                     };
-
                     // Handle FIN
                     if (stream_frame.fin) {
                         stream.closeRemote();
                     }
 
-                    // Advance offset (this is approximate - real impl tracks frame length)
-                    break; // For now, process one frame per packet
+                    offset += try streamFrameLength(payload[offset..]);
                 },
 
                 .max_stream_data => {
@@ -308,13 +297,13 @@ pub const QuicTransport = struct {
                     if (self.connection.getStream(max_data_frame.stream_id)) |stream| {
                         stream.updateSendMax(max_data_frame.maximum_stream_data);
                     }
-                    break;
+                    offset += try maxStreamDataFrameLength(payload[offset..]);
                 },
 
                 .ack => {
                     const ack_frame = try frame.AckFrame.decode(payload[offset..]);
                     self.connection.recordAckedPacket(@intCast(ack_frame.largest_acknowledged));
-                    break;
+                    offset += try ackFrameLength(payload[offset..]);
                 },
 
                 .connection_close => {
@@ -323,6 +312,85 @@ pub const QuicTransport = struct {
                 },
             }
         }
+    }
+
+    fn streamFrameLength(buffer: []const u8) !usize {
+        if (buffer.len < 2) return error.BufferTooSmall;
+
+        var idx: usize = 1;
+        const type_byte = buffer[0];
+        const has_len = (type_byte & 0x02) != 0;
+        const has_off = (type_byte & 0x04) != 0;
+
+        const stream_id_varint = try decodeVarIntMeta(buffer[idx..]);
+        idx += stream_id_varint.bytes;
+
+        if (has_off) {
+            const off_varint = try decodeVarIntMeta(buffer[idx..]);
+            idx += off_varint.bytes;
+        }
+
+        if (has_len) {
+            const len_varint = try decodeVarIntMeta(buffer[idx..]);
+            idx += len_varint.bytes;
+            const data_len: usize = @intCast(len_varint.value);
+            if (idx + data_len > buffer.len) return error.BufferTooSmall;
+            return idx + data_len;
+        }
+
+        return buffer.len;
+    }
+
+    fn maxStreamDataFrameLength(buffer: []const u8) !usize {
+        if (buffer.len < 1) return error.BufferTooSmall;
+        var idx: usize = 1;
+
+        const stream_id_varint = try decodeVarIntMeta(buffer[idx..]);
+        idx += stream_id_varint.bytes;
+
+        const max_data_varint = try decodeVarIntMeta(buffer[idx..]);
+        idx += max_data_varint.bytes;
+
+        return idx;
+    }
+
+    fn ackFrameLength(buffer: []const u8) !usize {
+        if (buffer.len < 1) return error.BufferTooSmall;
+        var idx: usize = 1;
+
+        const largest_ack = try decodeVarIntMeta(buffer[idx..]);
+        idx += largest_ack.bytes;
+
+        const ack_delay = try decodeVarIntMeta(buffer[idx..]);
+        idx += ack_delay.bytes;
+
+        const ack_range_count = try decodeVarIntMeta(buffer[idx..]);
+        idx += ack_range_count.bytes;
+
+        return idx;
+    }
+
+    fn decodeVarIntMeta(buffer: []const u8) !struct { value: u64, bytes: usize } {
+        if (buffer.len < 1) return error.BufferTooSmall;
+
+        const prefix = buffer[0] >> 6;
+        const size: usize = switch (prefix) {
+            0b00 => 1,
+            0b01 => 2,
+            0b10 => 4,
+            0b11 => 8,
+            else => unreachable,
+        };
+
+        if (buffer.len < size) return error.BufferTooSmall;
+
+        return switch (size) {
+            1 => .{ .value = buffer[0] & 0x3F, .bytes = 1 },
+            2 => .{ .value = std.mem.readInt(u16, buffer[0..2], .big) & 0x3FFF, .bytes = 2 },
+            4 => .{ .value = std.mem.readInt(u32, buffer[0..4], .big) & 0x3FFFFFFF, .bytes = 4 },
+            8 => .{ .value = std.mem.readInt(u64, buffer[0..8], .big) & 0x3FFFFFFFFFFFFFFF, .bytes = 8 },
+            else => unreachable,
+        };
     }
 
     /// Flush pending data - send all queued frames
@@ -521,4 +589,50 @@ test "QuicTransport - basic initialization" {
     defer transport.deinit();
 
     try testing.expect(transport.isReady());
+}
+
+test "QuicTransport - process ACK and STREAM in one payload" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    defer posix.close(sock);
+
+    const client_secret = [_]u8{0xAA} ** 32;
+    const server_secret = [_]u8{0xBB} ** 32;
+
+    var transport = try QuicTransport.init(
+        allocator,
+        sock,
+        "local-conn",
+        "remote-conn",
+        client_secret,
+        server_secret,
+        false,
+        null,
+    );
+    defer transport.deinit();
+
+    var ack_buf: [64]u8 = undefined;
+    const ack_len = try (frame.AckFrame{ .largest_acknowledged = 7 }).encode(&ack_buf);
+
+    const stream_encoded = try (frame.StreamFrame{
+        .stream_id = 0,
+        .offset = 0,
+        .data = "hello",
+        .fin = false,
+    }).encode(allocator);
+    defer allocator.free(stream_encoded);
+
+    var payload = std.ArrayList(u8){};
+    defer payload.deinit(allocator);
+    try payload.appendSlice(allocator, ack_buf[0..ack_len]);
+    try payload.appendSlice(allocator, stream_encoded);
+
+    try transport.processFrames(payload.items);
+
+    var read_buf: [16]u8 = undefined;
+    const read_len = try transport.receiveFromStream(0, &read_buf);
+    try testing.expectEqual(@as(usize, 5), read_len);
+    try testing.expectEqualSlices(u8, "hello", read_buf[0..read_len]);
 }
