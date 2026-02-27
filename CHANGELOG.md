@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.9] - 2026-02-27
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Handle immediate shutdown errors in main loop
+
 ## [0.0.7] - 2026-02-24
 
 ### <!-- 0 -->⛰️  Features

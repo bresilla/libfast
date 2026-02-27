@@ -98,7 +98,12 @@ pub const QuicTransport = struct {
                     return error.ConnectionStalled;
                 }
                 try self.flush();
-                self.poll(10) catch {};
+                self.poll(10) catch |err| {
+                    if (err == error.ConnectionRefused or
+                        err == error.ConnectionResetByPeer or
+                        err == error.NetworkUnreachable)
+                        return err;
+                };
                 continue;
             }
 
@@ -131,7 +136,7 @@ pub const QuicTransport = struct {
     ///
     /// timeout_ms: milliseconds to wait (0 = non-blocking)
     pub fn poll(self: *Self, timeout_ms: u32) !void {
-        // Set socket timeout
+        // Set socket timeout for the first recv (blocking wait)
         const timeout = posix.timeval{
             .sec = @intCast(timeout_ms / 1000),
             .usec = @intCast((timeout_ms % 1000) * 1000),
@@ -144,37 +149,58 @@ pub const QuicTransport = struct {
             &std.mem.toBytes(timeout),
         ) catch {};
 
-        // Receive UDP packet
         var packet_buffer: [2048]u8 = undefined;
         var src_addr: posix.sockaddr.storage = undefined;
         var src_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        var packets_processed: u32 = 0;
 
-        const recv_len = posix.recvfrom(
+        // First recv: block up to timeout_ms
+        const first_len = posix.recvfrom(
             self.socket,
             &packet_buffer,
             0,
             @ptrCast(&src_addr),
             &src_addr_len,
         ) catch |err| {
-            if (err == error.WouldBlock) return; // Timeout, no data
+            if (err == error.WouldBlock) return;
             return err;
         };
 
-        if (recv_len == 0) return;
+        if (first_len == 0) return;
 
-        // Remember peer address (client address for server, server address for client)
         if (self.peer_address == null) {
             self.peer_address = src_addr;
         }
 
-        // std.log.debug("Received UDP datagram: {} bytes", .{recv_len});
+        self.processPacket(packet_buffer[0..first_len]) catch {};
+        packets_processed = 1;
 
-        // Process packet (errors are logged and ignored to prevent crashes)
-        self.processPacket(packet_buffer[0..recv_len]) catch {
-            // Silently ignore packet processing errors
-        };
+        // Switch to non-blocking and drain all queued packets
+        const zero_timeout = posix.timeval{ .sec = 0, .usec = 0 };
+        posix.setsockopt(
+            self.socket,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            &std.mem.toBytes(zero_timeout),
+        ) catch {};
 
-        // Send MAX_STREAM_DATA updates after receiving data
+        while (packets_processed < 64) {
+            src_addr_len = @sizeOf(posix.sockaddr.storage);
+            const recv_len = posix.recvfrom(
+                self.socket,
+                &packet_buffer,
+                0,
+                @ptrCast(&src_addr),
+                &src_addr_len,
+            ) catch break; // WouldBlock or error — done draining
+
+            if (recv_len == 0) break;
+
+            self.processPacket(packet_buffer[0..recv_len]) catch {};
+            packets_processed += 1;
+        }
+
+        // Send MAX_STREAM_DATA updates after processing all received data
         self.sendWindowUpdates() catch {};
     }
 
