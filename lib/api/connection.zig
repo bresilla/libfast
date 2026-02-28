@@ -482,7 +482,7 @@ pub const QuicConnection = struct {
         self: *QuicConnection,
         bidirectional: bool,
     ) types_mod.QuicError!types_mod.StreamId {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -513,7 +513,7 @@ pub const QuicConnection = struct {
         data: []const u8,
         finish: types_mod.StreamFinish,
     ) types_mod.QuicError!usize {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -869,6 +869,12 @@ pub const QuicConnection = struct {
 
 // Tests
 
+fn applyDefaultPeerTransportParams(conn: *QuicConnection, allocator: std.mem.Allocator) !void {
+    const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+}
+
 test "Create SSH client connection" {
     const allocator = std.testing.allocator;
 
@@ -1187,6 +1193,7 @@ test "closeStream is FIN-based half close" {
 
     conn.internal_conn = internal_conn;
     conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     const stream_id = try conn.openStream(true);
     _ = conn.nextEvent(); // drain stream_opened
@@ -1235,6 +1242,7 @@ test "streamWrite respects congestion send budget" {
 
     conn.internal_conn = internal_conn;
     conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     const stream_id = try conn.openStream(true);
     _ = conn.nextEvent();
@@ -1640,8 +1648,31 @@ test "ssh mode rejects unidirectional stream open" {
 
     conn.internal_conn = internal_conn;
     conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     try std.testing.expectError(types_mod.QuicError.StreamError, conn.openStream(false));
+}
+
+test "openStream requires negotiated handshake readiness" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try std.testing.expectError(types_mod.QuicError.ConnectionNotEstablished, conn.openStream(true));
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    _ = try conn.openStream(true);
 }
 
 test "applyPeerTransportParams rejects invalid peer parameters" {
@@ -1680,14 +1711,14 @@ test "applyPeerTransportParams rejects invalid peer parameters" {
 test "applyPeerTransportParams updates stream open limits" {
     const allocator = std.testing.allocator;
 
-    const config = config_mod.QuicConfig.tlsClient("example.com");
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
     var conn = try QuicConnection.init(allocator, config);
     defer conn.deinit();
 
     const internal_conn = try allocator.create(conn_internal.Connection);
     const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
     const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
-    internal_conn.* = try conn_internal.Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
     internal_conn.markEstablished();
 
     conn.internal_conn = internal_conn;
@@ -1703,7 +1734,7 @@ test "applyPeerTransportParams updates stream open limits" {
 
     _ = try conn.openStream(true);
     try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(true));
-    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(false));
+    try std.testing.expectError(types_mod.QuicError.StreamError, conn.openStream(false));
 }
 
 test "poll maps stream receive flow control violation to closing event" {
