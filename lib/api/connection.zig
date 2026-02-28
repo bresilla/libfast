@@ -974,6 +974,56 @@ pub const QuicConnection = struct {
         self.tls_server_hello_applied = true;
     }
 
+    /// Processes a TLS ClientHello in server mode and returns an encoded
+    /// ServerHello response generated from server policy.
+    pub fn processTlsClientHello(
+        self: *QuicConnection,
+        client_hello_data: []const u8,
+        server_supported_alpn: []const []const u8,
+    ) types_mod.QuicError![]u8 {
+        if (self.config.mode != .tls) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        if (self.config.role != .server) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        const tls_cfg = self.config.tls_config orelse return types_mod.QuicError.MissingTlsConfig;
+
+        const tls_ctx = if (self.tls_ctx) |ctx|
+            ctx
+        else blk: {
+            const created = try self.allocator.create(tls_context_mod.TlsContext);
+            created.* = tls_context_mod.TlsContext.init(self.allocator, false);
+            self.tls_ctx = created;
+            break :blk created;
+        };
+
+        const server_tp = try self.encodeLocalTransportParams();
+        defer self.allocator.free(server_tp);
+
+        const server_hello = tls_ctx.buildServerHelloFromClientHello(
+            client_hello_data,
+            if (server_supported_alpn.len > 0) server_supported_alpn else tls_cfg.alpn_protocols,
+            server_tp,
+        ) catch {
+            try self.queueProtocolViolation("tls client hello rejected");
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        const peer_tp = tls_ctx.getPeerTransportParams() orelse {
+            try self.queueTransportParameterError("missing peer transport params in tls client hello");
+            self.allocator.free(server_hello);
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        try self.applyPeerTransportParams(peer_tp);
+        self.tls_server_hello_applied = true;
+
+        return server_hello;
+    }
+
     /// Get next connection event
     pub fn nextEvent(self: *QuicConnection) ?types_mod.ConnectionEvent {
         if (self.events.items.len == 0) {
@@ -1381,6 +1431,79 @@ test "processTlsServerHello rejects missing peer transport params extension" {
         conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
     );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "processTlsClientHello builds server hello and applies peer params" {
+    const allocator = std.testing.allocator;
+
+    var server_cfg = config_mod.QuicConfig.tlsServer("cert", "key");
+    var tls_server_cfg = server_cfg.tls_config.?;
+    tls_server_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    server_cfg.tls_config = tls_server_cfg;
+
+    var server_conn = try QuicConnection.init(allocator, server_cfg);
+    defer server_conn.deinit();
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const server_internal = try allocator.create(conn_internal.Connection);
+    server_internal.* = try conn_internal.Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    server_conn.internal_conn = server_internal;
+    server_conn.state = .connecting;
+
+    var client_ctx = tls_context_mod.TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    client_tp.initial_max_data = 7777;
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{ "h2", "h3" };
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    const server_hello = try server_conn.processTlsClientHello(client_hello, &[_][]const u8{});
+    defer allocator.free(server_hello);
+
+    try std.testing.expect(server_conn.tls_ctx != null);
+    try std.testing.expect(server_conn.tls_ctx.?.getSelectedAlpn() != null);
+    try std.testing.expectEqualStrings("h3", server_conn.tls_ctx.?.getSelectedAlpn().?);
+    try std.testing.expect(server_conn.internal_conn.?.remote_params != null);
+    try std.testing.expectEqual(@as(u64, 7777), server_conn.internal_conn.?.remote_params.?.initial_max_data);
+}
+
+test "processTlsClientHello rejects ALPN no-overlap" {
+    const allocator = std.testing.allocator;
+
+    var server_cfg = config_mod.QuicConfig.tlsServer("cert", "key");
+    var tls_server_cfg = server_cfg.tls_config.?;
+    tls_server_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    server_cfg.tls_config = tls_server_cfg;
+
+    var server_conn = try QuicConnection.init(allocator, server_cfg);
+    defer server_conn.deinit();
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 3, 3, 3, 3 });
+    const server_internal = try allocator.create(conn_internal.Connection);
+    server_internal.* = try conn_internal.Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    server_conn.internal_conn = server_internal;
+    server_conn.state = .connecting;
+
+    var client_ctx = tls_context_mod.TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+    const client_tp_encoded = try transport_params_mod.TransportParams.defaultClient().encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{"h2"};
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        server_conn.processTlsClientHello(client_hello, &[_][]const u8{}),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, server_conn.getState());
 }
 
 test "processTlsServerHello rejects malformed ALPN extension payload" {
