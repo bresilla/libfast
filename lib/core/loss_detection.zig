@@ -445,12 +445,42 @@ test "Loss detection by packet threshold" {
     try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
     try ld.onPacketSent(.application, SentPacket.init(5, now, 1200, true));
 
-    // ACK packet 5 (packet threshold is 3, so 1 and 2 should be declared lost)
+    // ACK packet 5 (packet threshold is 3, so packet 1 is declared lost)
     var ack_result = try ld.onAckReceived(.application, 5, 0, now);
     defer ack_result.lost_packets.deinit(allocator);
 
-    // Packets 1 and 2 should be lost (5 - 3 = 2)
-    try std.testing.expect(ack_result.lost_packets.items.len >= 1);
+    try std.testing.expectEqual(@as(usize, 1), ack_result.lost_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), ack_result.lost_packets.items[0].packet_number);
+}
+
+test "RTT ack delay does not underflow below min_rtt" {
+    var rtt_stats = RttStats.init();
+
+    // Establish min RTT.
+    rtt_stats.updateRtt(100 * time_mod.Duration.MILLISECOND, 0);
+
+    // Large ACK delay should not push adjusted RTT below min RTT.
+    rtt_stats.updateRtt(105 * time_mod.Duration.MILLISECOND, 50 * time_mod.Duration.MILLISECOND);
+
+    try std.testing.expect(rtt_stats.smoothed_rtt >= 100 * time_mod.Duration.MILLISECOND);
+    try std.testing.expectEqual(@as(u64, 100 * time_mod.Duration.MILLISECOND), rtt_stats.min_rtt);
+}
+
+test "ACK for unsent packet updates largest_acked safely" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    // Acking a packet that was never tracked should not fail.
+    var ack_result = try ld.onAckReceived(.application, 42, 0, now);
+    defer ack_result.lost_packets.deinit(allocator);
+
+    try std.testing.expect(ack_result.acked_packet == null);
+    try std.testing.expect(ld.application.largest_acked != null);
+    try std.testing.expectEqual(@as(u64, 42), ld.application.largest_acked.?);
 }
 
 test "Loss detection by time threshold" {
