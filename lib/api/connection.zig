@@ -9,6 +9,7 @@ const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
 const transport_params_mod = @import("../core/transport_params.zig");
+const tls_context_mod = @import("../crypto/tls/tls_context.zig");
 const varint = @import("../utils/varint.zig");
 const time_mod = @import("../utils/time.zig");
 
@@ -29,6 +30,9 @@ pub const QuicConnection = struct {
 
     // Crypto context
     crypto_ctx: ?*crypto_mod.CryptoContext,
+
+    // TLS handshake context (TLS mode)
+    tls_ctx: ?*tls_context_mod.TlsContext,
 
     // Event queue
     events: std.ArrayList(types_mod.ConnectionEvent),
@@ -69,6 +73,7 @@ pub const QuicConnection = struct {
             .internal_conn = null,
             .socket = null,
             .crypto_ctx = null,
+            .tls_ctx = null,
             .events = .{},
             .remote_addr = null,
             .packets_received = 0,
@@ -297,6 +302,21 @@ pub const QuicConnection = struct {
         }
     }
 
+    fn encodeLocalTransportParams(self: *QuicConnection) types_mod.QuicError![]u8 {
+        var params = transport_params_mod.TransportParams.init();
+        params.max_idle_timeout = self.config.max_idle_timeout;
+        params.initial_max_data = self.config.initial_max_data;
+        params.initial_max_stream_data_bidi_local = self.config.initial_max_stream_data_bidi_local;
+        params.initial_max_stream_data_bidi_remote = self.config.initial_max_stream_data_bidi_remote;
+        params.initial_max_stream_data_uni = self.config.initial_max_stream_data_uni;
+        params.initial_max_streams_bidi = self.config.max_bidi_streams;
+        params.initial_max_streams_uni = self.config.max_uni_streams;
+
+        return params.encode(self.allocator) catch {
+            return types_mod.QuicError.InvalidConfig;
+        };
+    }
+
     /// Start connecting (client only)
     pub fn connect(
         self: *QuicConnection,
@@ -373,6 +393,29 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.InvalidConfig;
         };
         self.internal_conn = internal_conn;
+
+        if (self.config.mode == .tls) {
+            const tls_cfg = self.config.tls_config orelse return types_mod.QuicError.MissingTlsConfig;
+
+            const encoded_tp = try self.encodeLocalTransportParams();
+            defer self.allocator.free(encoded_tp);
+
+            const tls_ctx = try self.allocator.create(tls_context_mod.TlsContext);
+            errdefer self.allocator.destroy(tls_ctx);
+            tls_ctx.* = tls_context_mod.TlsContext.init(self.allocator, true);
+
+            const client_hello = tls_ctx.startClientHandshakeWithParams(
+                tls_cfg.server_name,
+                tls_cfg.alpn_protocols,
+                encoded_tp,
+            ) catch {
+                tls_ctx.deinit();
+                return types_mod.QuicError.HandshakeFailed;
+            };
+            defer self.allocator.free(client_hello);
+
+            self.tls_ctx = tls_ctx;
+        }
 
         self.state = .connecting;
     }
@@ -748,6 +791,11 @@ pub const QuicConnection = struct {
             self.allocator.destroy(ctx);
         }
 
+        if (self.tls_ctx) |ctx| {
+            ctx.deinit();
+            self.allocator.destroy(ctx);
+        }
+
         self.events.deinit(self.allocator);
         self.state = .closed;
     }
@@ -775,6 +823,23 @@ test "Create TLS client connection" {
 
     try std.testing.expectEqual(types_mod.ConnectionState.idle, conn.state);
     try std.testing.expectEqual(config_mod.QuicMode.tls, conn.config.mode);
+}
+
+test "TLS connect wires config ALPN into ClientHello" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try std.testing.expect(conn.tls_ctx != null);
+    try std.testing.expect(conn.tls_ctx.?.state == .client_hello_sent);
+    try std.testing.expect(std.mem.indexOf(u8, conn.tls_ctx.?.transcript.items, "h3") != null);
 }
 
 test "Connection state transitions" {
