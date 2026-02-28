@@ -153,6 +153,14 @@ pub const QuicConnection = struct {
         try self.enterDraining(@intFromEnum(core_types.ErrorCode.transport_parameter_error), reason);
     }
 
+    fn queueFlowControlError(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.flow_control_error), reason);
+    }
+
     fn transitionToEstablished(self: *QuicConnection) types_mod.QuicError!void {
         if (self.state != .connecting) {
             return;
@@ -201,8 +209,12 @@ pub const QuicConnection = struct {
                 return types_mod.QuicError.StreamError;
             };
 
-            stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch {
-                return types_mod.QuicError.InvalidPacket;
+            stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch |err| {
+                return switch (err) {
+                    error.FlowControlError => types_mod.QuicError.FlowControlError,
+                    error.OutOfOrderData, error.StreamClosed => types_mod.QuicError.ProtocolViolation,
+                    else => types_mod.QuicError.InvalidPacket,
+                };
             };
 
             try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
@@ -628,6 +640,11 @@ pub const QuicConnection = struct {
                 self.packets_invalid += 1;
                 if (err == types_mod.QuicError.ProtocolViolation) {
                     try self.queueProtocolViolation("frame not allowed during handshake");
+                    return;
+                }
+
+                if (err == types_mod.QuicError.FlowControlError) {
+                    try self.queueFlowControlError("stream flow control exceeded");
                     return;
                 }
 
@@ -1390,4 +1407,53 @@ test "applyPeerTransportParams updates stream open limits" {
     _ = try conn.openStream(true);
     try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(true));
     try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(false));
+}
+
+test "poll maps stream receive flow control violation to closing event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.streams.setLocalReceiveStreamDataLimits(4, 4, 4);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 21,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 1,
+        .offset = 0,
+        .data = "12345",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    _ = conn.nextEvent(); // connected
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.flow_control_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
