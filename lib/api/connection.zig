@@ -300,6 +300,31 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ProtocolViolation;
         }
 
+        if (packet_space == .zero_rtt) {
+            if (frame_type == 0x00 or frame_type == 0x01 or frame_type == 0x1c or frame_type == 0x1d) {
+                return;
+            }
+
+            if (core_types.FrameType.isStreamFrame(frame_type)) {
+                return;
+            }
+
+            return switch (frame_type) {
+                0x04,
+                0x05, // RESET_STREAM, STOP_SENDING
+                0x10,
+                0x11, // MAX_DATA, MAX_STREAM_DATA
+                0x12,
+                0x13, // MAX_STREAMS
+                0x14,
+                0x15, // DATA_BLOCKED, STREAM_DATA_BLOCKED
+                0x16,
+                0x17, // STREAMS_BLOCKED
+                => {},
+                else => types_mod.QuicError.ProtocolViolation,
+            };
+        }
+
         if (frame_type == 0x01 or frame_type == 0x1c or frame_type == 0x1d) {
             return;
         }
@@ -2942,4 +2967,91 @@ test "poll rejects MAX_DATA frame in Initial packet space" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         closing.?.closing.error_code,
     );
+}
+
+test "poll rejects PATH_CHALLENGE frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 16,
+        .packet_number = 30,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const challenge = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try challenge.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll allows STREAM frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 31,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 4,
+        .offset = 0,
+        .data = "zrtt-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_readable);
+    try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
 }
