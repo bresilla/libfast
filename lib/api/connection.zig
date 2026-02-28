@@ -296,6 +296,14 @@ pub const QuicConnection = struct {
             return;
         }
 
+        if (isReservedFrameType(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (!isKnownFrameType(frame_type) and packet_space != .application) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
         if (core_types.FrameType.isStreamFrame(frame_type)) {
             return types_mod.QuicError.ProtocolViolation;
         }
@@ -304,6 +312,48 @@ pub const QuicConnection = struct {
             0x04, 0x05, 0x1a, 0x1b => return types_mod.QuicError.ProtocolViolation,
             else => {},
         }
+    }
+
+    fn isKnownFrameType(frame_type: u64) bool {
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            return true;
+        }
+
+        return switch (frame_type) {
+            0x00, // PADDING
+            0x01, // PING
+            0x02,
+            0x03, // ACK
+            0x04, // RESET_STREAM
+            0x05, // STOP_SENDING
+            0x06, // CRYPTO
+            0x07, // NEW_TOKEN
+            0x10, // MAX_DATA
+            0x11, // MAX_STREAM_DATA
+            0x12,
+            0x13, // MAX_STREAMS
+            0x14, // DATA_BLOCKED
+            0x15, // STREAM_DATA_BLOCKED
+            0x16,
+            0x17, // STREAMS_BLOCKED
+            0x18, // NEW_CONNECTION_ID
+            0x19, // RETIRE_CONNECTION_ID
+            0x1a, // PATH_CHALLENGE
+            0x1b, // PATH_RESPONSE
+            0x1c,
+            0x1d, // CONNECTION_CLOSE
+            0x1e, // HANDSHAKE_DONE
+            => true,
+            else => false,
+        };
+    }
+
+    fn isReservedFrameType(frame_type: u64) bool {
+        if (frame_type < 0x1f) {
+            return false;
+        }
+
+        return (frame_type & 0x1f) == 0x1f;
     }
 
     fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!void {
@@ -2448,7 +2498,9 @@ test "poll rejects stream frame in Initial packet space even when established" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    const event = conn.nextEvent();
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    const event = if (first.? == .connected) conn.nextEvent() else first;
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(
@@ -2456,4 +2508,80 @@ test "poll rejects stream frame in Initial packet space even when established" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "poll rejects reserved frame type in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 23,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1f; // reserved frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const first_is_closing = first != null and first.? == .closing;
+    const second_is_closing = second != null and second.? == .closing;
+    try std.testing.expect(first_is_closing or second_is_closing);
+
+    const event = if (first_is_closing) first.? else second.?;
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.closing.error_code,
+    );
+}
+
+test "poll ignores unknown frame type in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 24,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x2b; // unknown frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
 }
