@@ -339,6 +339,11 @@ pub const Connection = struct {
         self.remote_params = params;
         self.max_data_remote = params.initial_max_data;
         self.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+        self.streams.setRemoteStreamDataLimits(
+            params.initial_max_stream_data_bidi_local,
+            params.initial_max_stream_data_bidi_remote,
+            params.initial_max_stream_data_uni,
+        );
     }
 
     /// Process received ACK
@@ -656,6 +661,27 @@ test "connection applies remote stream limits" {
     _ = try conn.openStream(true);
     try std.testing.expectError(error.StreamError, conn.openStream(true));
     try std.testing.expectError(error.StreamError, conn.openStream(false));
+}
+
+test "connection applies remote per-stream data limits" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var remote = TransportParameters{};
+    remote.initial_max_stream_data_bidi_remote = 4;
+    conn.setRemoteParams(remote);
+
+    const stream_id = try conn.openStream(true);
+    const s = conn.getStream(stream_id).?;
+
+    try std.testing.expectEqual(@as(u64, 4), s.max_stream_data_remote);
+    try std.testing.expectEqual(@as(usize, 4), try s.write("abcdef"));
 }
 
 test "connection send budget tracks congestion window" {

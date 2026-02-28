@@ -206,6 +206,9 @@ pub const StreamManager = struct {
     max_local_streams_uni: u64,
     local_opened_bidi: u64,
     local_opened_uni: u64,
+    remote_max_stream_data_bidi_local: u64,
+    remote_max_stream_data_bidi_remote: u64,
+    remote_max_stream_data_uni: u64,
     max_stream_data: u64,
     allocator: std.mem.Allocator,
     is_server: bool,
@@ -221,6 +224,9 @@ pub const StreamManager = struct {
             .max_local_streams_uni = 100,
             .local_opened_bidi = 0,
             .local_opened_uni = 0,
+            .remote_max_stream_data_bidi_local = max_stream_data,
+            .remote_max_stream_data_bidi_remote = max_stream_data,
+            .remote_max_stream_data_uni = max_stream_data,
             .max_stream_data = max_stream_data,
             .allocator = allocator,
             .is_server = is_server,
@@ -230,6 +236,40 @@ pub const StreamManager = struct {
     pub fn setLocalOpenLimits(self: *StreamManager, max_streams_bidi: u64, max_streams_uni: u64) void {
         self.max_local_streams_bidi = max_streams_bidi;
         self.max_local_streams_uni = max_streams_uni;
+    }
+
+    pub fn setRemoteStreamDataLimits(self: *StreamManager, bidi_local: u64, bidi_remote: u64, uni: u64) void {
+        self.remote_max_stream_data_bidi_local = bidi_local;
+        self.remote_max_stream_data_bidi_remote = bidi_remote;
+        self.remote_max_stream_data_uni = uni;
+
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.max_stream_data_remote = self.sendLimitForStream(entry.key_ptr.*);
+        }
+    }
+
+    fn isLocallyInitiated(self: StreamManager, stream_type: StreamType) bool {
+        return if (self.is_server) stream_type.isServerInitiated() else stream_type.isClientInitiated();
+    }
+
+    fn sendLimitForStreamType(self: StreamManager, stream_type: StreamType) u64 {
+        if (stream_type.isBidirectional()) {
+            if (self.isLocallyInitiated(stream_type)) {
+                return self.remote_max_stream_data_bidi_remote;
+            }
+            return self.remote_max_stream_data_bidi_local;
+        }
+
+        if (self.isLocallyInitiated(stream_type)) {
+            return self.remote_max_stream_data_uni;
+        }
+
+        return 0;
+    }
+
+    fn sendLimitForStream(self: StreamManager, stream_id: StreamId) u64 {
+        return self.sendLimitForStreamType(StreamType.fromStreamId(stream_id));
     }
 
     pub fn deinit(self: *StreamManager) void {
@@ -279,7 +319,8 @@ pub const StreamManager = struct {
             },
         };
 
-        const stream = Stream.init(self.allocator, stream_id, self.max_stream_data);
+        var stream = Stream.init(self.allocator, stream_id, self.max_stream_data);
+        stream.max_stream_data_remote = self.sendLimitForStream(stream_id);
         try self.streams.put(stream_id, stream);
 
         if (stream_type.isBidirectional()) {
@@ -302,7 +343,8 @@ pub const StreamManager = struct {
             return stream;
         }
 
-        const stream = Stream.init(self.allocator, stream_id, self.max_stream_data);
+        var stream = Stream.init(self.allocator, stream_id, self.max_stream_data);
+        stream.max_stream_data_remote = self.sendLimitForStream(stream_id);
         try self.streams.put(stream_id, stream);
         return self.streams.getPtr(stream_id).?;
     }
@@ -385,6 +427,25 @@ test "stream manager enforces local stream limits" {
     _ = try manager.createStream(.client_bidi);
     try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_bidi));
     try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_uni));
+}
+
+test "stream manager applies remote send limits by stream type" {
+    const allocator = std.testing.allocator;
+
+    var manager = StreamManager.init(allocator, false, 1024);
+    defer manager.deinit();
+
+    manager.setRemoteStreamDataLimits(333, 111, 22);
+
+    const client_bidi = try manager.createStream(.client_bidi);
+    const client_uni = try manager.createStream(.client_uni);
+    const server_bidi = try manager.getOrCreateStream(1);
+    const server_uni = try manager.getOrCreateStream(3);
+
+    try std.testing.expectEqual(@as(u64, 111), manager.getStream(client_bidi).?.max_stream_data_remote);
+    try std.testing.expectEqual(@as(u64, 22), manager.getStream(client_uni).?.max_stream_data_remote);
+    try std.testing.expectEqual(@as(u64, 333), server_bidi.max_stream_data_remote);
+    try std.testing.expectEqual(@as(u64, 0), server_uni.max_stream_data_remote);
 }
 
 test "stream flow control" {
