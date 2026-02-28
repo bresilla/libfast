@@ -48,6 +48,9 @@ pub const QuicConnection = struct {
     // Negotiated protocol metadata
     negotiated_alpn: ?[]const u8,
 
+    // TLS integrated handshake progression marker
+    tls_server_hello_applied: bool,
+
     // Connection close state tracking
     close_reason_buf: [CLOSE_REASON_MAX_LEN]u8,
     close_reason_len: usize,
@@ -83,6 +86,7 @@ pub const QuicConnection = struct {
             .packets_received = 0,
             .packets_invalid = 0,
             .negotiated_alpn = null,
+            .tls_server_hello_applied = false,
             .close_reason_buf = [_]u8{0} ** CLOSE_REASON_MAX_LEN,
             .close_reason_len = 0,
             .close_error_code = 0,
@@ -192,6 +196,8 @@ pub const QuicConnection = struct {
     }
 
     fn isTlsNegotiatedForEstablish(self: *const QuicConnection) bool {
+        if (!self.tls_server_hello_applied) return false;
+
         const conn = self.internal_conn orelse return false;
         if (conn.remote_params == null) return false;
 
@@ -437,6 +443,7 @@ pub const QuicConnection = struct {
             defer self.allocator.free(client_hello);
 
             self.tls_ctx = tls_ctx;
+            self.tls_server_hello_applied = false;
         }
 
         self.state = .connecting;
@@ -771,6 +778,7 @@ pub const QuicConnection = struct {
         };
 
         try self.applyPeerTransportParams(peer_tp);
+        self.tls_server_hello_applied = true;
     }
 
     /// Get next connection event
@@ -828,7 +836,7 @@ pub const QuicConnection = struct {
         return switch (self.config.mode) {
             .tls => blk: {
                 const tls_ctx = self.tls_ctx orelse break :blk false;
-                break :blk tls_ctx.state.isComplete();
+                break :blk self.tls_server_hello_applied and tls_ctx.state.isComplete();
             },
             .ssh => true,
         };
@@ -964,12 +972,20 @@ test "connected event carries negotiated ALPN metadata" {
 
     try conn.connect("127.0.0.1", 4433);
 
-    const tls_ctx = conn.tls_ctx.?;
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.initial_max_data = 4096;
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
     var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
     const ext = [_]tls_handshake_mod.Extension{
         .{
             .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
             .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
         },
     };
     const random: [32]u8 = [_]u8{7} ** 32;
@@ -980,10 +996,7 @@ test "connected event carries negotiated ALPN metadata" {
     };
     const server_hello_bytes = try server_hello.encode(allocator);
     defer allocator.free(server_hello_bytes);
-    try tls_ctx.processServerHello(server_hello_bytes);
-    try tls_ctx.completeHandshake("test-shared-secret-from-ecdhe");
-
-    try applyDefaultPeerTransportParams(&conn, allocator);
+    try conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe");
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1171,7 +1184,7 @@ test "negotiation snapshot exposes mode ALPN and peer params" {
     try std.testing.expectEqual(@as(u64, 3), snapshot.?.peer_initial_max_streams_uni);
 }
 
-test "isHandshakeNegotiated requires TLS completion and peer transport params" {
+test "isHandshakeNegotiated requires integrated TLS server hello processing" {
     const allocator = std.testing.allocator;
 
     var config = config_mod.QuicConfig.tlsClient("example.com");
@@ -1207,14 +1220,32 @@ test "isHandshakeNegotiated requires TLS completion and peer transport params" {
 
     try tls_ctx.processServerHello(server_hello_bytes);
     try tls_ctx.completeHandshake("test-shared-secret-from-ecdhe");
-
-    try std.testing.expect(!conn.isHandshakeNegotiated());
-
     const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
     defer allocator.free(encoded);
     try conn.applyPeerTransportParams(encoded);
 
-    try std.testing.expect(conn.isHandshakeNegotiated());
+    // Manual steps are not enough; integrated processing marks completion.
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    var conn2 = try QuicConnection.init(allocator, config);
+    defer conn2.deinit();
+    try conn2.connect("127.0.0.1", 4433);
+    conn2.internal_conn.?.markEstablished();
+    conn2.state = .established;
+
+    var tp_ext = transport_params_mod.TransportParams.defaultServer();
+    const encoded_tp_ext = try tp_ext.encode(allocator);
+    defer allocator.free(encoded_tp_ext);
+    const ext_with_tp = [_]tls_handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_payload },
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = encoded_tp_ext },
+    };
+    const integrated_server_hello = tls_handshake_mod.ServerHello{ .random = random, .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256, .extensions = &ext_with_tp };
+    const integrated_server_hello_bytes = try integrated_server_hello.encode(allocator);
+    defer allocator.free(integrated_server_hello_bytes);
+
+    try conn2.processTlsServerHello(integrated_server_hello_bytes, "test-shared-secret-from-ecdhe");
+    try std.testing.expect(conn2.isHandshakeNegotiated());
 }
 
 test "isHandshakeNegotiated requires peer transport params in SSH mode" {
