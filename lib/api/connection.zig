@@ -768,6 +768,35 @@ pub const QuicConnection = struct {
         return self.negotiated_alpn;
     }
 
+    /// Returns true when handshake negotiation is complete enough to gate app traffic.
+    ///
+    /// For TLS mode this requires:
+    /// - connection established state
+    /// - TLS handshake complete
+    /// - peer transport parameters applied
+    ///
+    /// For SSH mode this requires:
+    /// - connection established state
+    /// - peer transport parameters applied
+    pub fn isHandshakeNegotiated(self: *const QuicConnection) bool {
+        if (self.state != .established) {
+            return false;
+        }
+
+        const conn = self.internal_conn orelse return false;
+        if (conn.remote_params == null) {
+            return false;
+        }
+
+        return switch (self.config.mode) {
+            .tls => blk: {
+                const tls_ctx = self.tls_ctx orelse break :blk false;
+                break :blk tls_ctx.state.isComplete();
+            },
+            .ssh => true,
+        };
+    }
+
     /// Returns a point-in-time negotiation snapshot.
     pub fn getNegotiationSnapshot(self: *const QuicConnection) ?types_mod.NegotiationSnapshot {
         const conn = self.internal_conn orelse return null;
@@ -980,6 +1009,69 @@ test "negotiation snapshot exposes mode ALPN and peer params" {
     try std.testing.expectEqual(@as(u64, 45678), snapshot.?.peer_initial_max_data);
     try std.testing.expectEqual(@as(u64, 7), snapshot.?.peer_initial_max_streams_bidi);
     try std.testing.expectEqual(@as(u64, 3), snapshot.?.peer_initial_max_streams_uni);
+}
+
+test "isHandshakeNegotiated requires TLS completion and peer transport params" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    const tls_ctx = conn.tls_ctx.?;
+    const random: [32]u8 = [_]u8{11} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &[_]tls_handshake_mod.Extension{},
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try tls_ctx.processServerHello(server_hello_bytes);
+    try tls_ctx.completeHandshake("test-shared-secret-from-ecdhe");
+
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+
+    try std.testing.expect(conn.isHandshakeNegotiated());
+}
+
+test "isHandshakeNegotiated requires peer transport params in SSH mode" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+
+    try std.testing.expect(conn.isHandshakeNegotiated());
 }
 
 test "Connection state transitions" {
