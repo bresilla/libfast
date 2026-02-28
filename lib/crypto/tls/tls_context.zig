@@ -479,6 +479,29 @@ pub const TlsContext = struct {
         return null;
     }
 
+    /// Server-side ALPN selection policy.
+    ///
+    /// Selects the first protocol from `server_supported` that is present in
+    /// the client's offered ALPN wire payload.
+    pub fn selectServerAlpn(
+        offered_alpn_wire: []const u8,
+        server_supported: []const []const u8,
+    ) TlsError![]const u8 {
+        if (offered_alpn_wire.len < 2) return error.HandshakeFailed;
+
+        const list_len: usize = (@as(usize, offered_alpn_wire[0]) << 8) | offered_alpn_wire[1];
+        if (list_len + 2 != offered_alpn_wire.len) return error.HandshakeFailed;
+
+        for (server_supported) |candidate| {
+            if (candidate.len == 0) continue;
+            if (isAlpnInOffer(offered_alpn_wire, candidate)) {
+                return candidate;
+            }
+        }
+
+        return error.HandshakeFailed;
+    }
+
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
         const alpn_data_opt = handshake_mod.findExtension(
             extensions,
@@ -762,6 +785,30 @@ test "Process ServerHello rejects selected ALPN not offered by client" {
     defer allocator.free(server_hello);
 
     try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(server_hello));
+}
+
+test "selectServerAlpn picks first server-preferred overlap" {
+    const offered = [_]u8{
+        0x00, 0x06, // list len
+        0x02, 'h',
+        '2',  0x02,
+        'h',  '3',
+    };
+
+    const supported = [_][]const u8{ "h3", "h2" };
+    const selected = try TlsContext.selectServerAlpn(&offered, &supported);
+    try std.testing.expectEqualStrings("h3", selected);
+}
+
+test "selectServerAlpn fails when no overlap" {
+    const offered = [_]u8{
+        0x00, 0x03,
+        0x02, 'h',
+        '2',
+    };
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.selectServerAlpn(&offered, &supported));
 }
 
 test "Complete handshake flow" {
