@@ -10,6 +10,7 @@ const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
 const transport_params_mod = @import("../core/transport_params.zig");
 const tls_context_mod = @import("../crypto/tls/tls_context.zig");
+const tls_handshake_mod = @import("../crypto/tls/handshake.zig");
 const varint = @import("../utils/varint.zig");
 const time_mod = @import("../utils/time.zig");
 
@@ -43,6 +44,9 @@ pub const QuicConnection = struct {
     // Basic packet visibility counters
     packets_received: u64,
     packets_invalid: u64,
+
+    // Negotiated protocol metadata
+    negotiated_alpn: ?[]const u8,
 
     // Connection close state tracking
     close_reason_buf: [CLOSE_REASON_MAX_LEN]u8,
@@ -78,6 +82,7 @@ pub const QuicConnection = struct {
             .remote_addr = null,
             .packets_received = 0,
             .packets_invalid = 0,
+            .negotiated_alpn = null,
             .close_reason_buf = [_]u8{0} ** CLOSE_REASON_MAX_LEN,
             .close_reason_len = 0,
             .close_error_code = 0,
@@ -173,8 +178,13 @@ pub const QuicConnection = struct {
 
         const conn = self.internal_conn orelse return;
         conn.markEstablished();
+
+        if (self.tls_ctx) |tls_ctx| {
+            self.negotiated_alpn = tls_ctx.getSelectedAlpn();
+        }
+
         self.state = .established;
-        try self.events.append(self.allocator, .{ .connected = {} });
+        try self.events.append(self.allocator, .{ .connected = .{ .alpn = self.negotiated_alpn } });
     }
 
     fn validateFrameAllowedInState(self: *QuicConnection, frame_type: u64) types_mod.QuicError!void {
@@ -753,6 +763,11 @@ pub const QuicConnection = struct {
         return self.state;
     }
 
+    /// Returns negotiated ALPN protocol when available.
+    pub fn getNegotiatedAlpn(self: *const QuicConnection) ?[]const u8 {
+        return self.negotiated_alpn;
+    }
+
     /// Close the connection gracefully
     pub fn close(
         self: *QuicConnection,
@@ -842,6 +857,67 @@ test "TLS connect wires config ALPN into ClientHello" {
     try std.testing.expect(std.mem.indexOf(u8, conn.tls_ctx.?.transcript.items, "h3") != null);
 }
 
+test "connected event carries negotiated ALPN metadata" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const tls_ctx = conn.tls_ctx.?;
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const random: [32]u8 = [_]u8{7} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+    try tls_ctx.processServerHello(server_hello_bytes);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 9,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01;
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .connected);
+    try std.testing.expect(event.?.connected.alpn != null);
+    try std.testing.expectEqualStrings("h3", event.?.connected.alpn.?);
+    try std.testing.expect(conn.getNegotiatedAlpn() != null);
+    try std.testing.expectEqualStrings("h3", conn.getNegotiatedAlpn().?);
+}
+
 test "Connection state transitions" {
     const allocator = std.testing.allocator;
 
@@ -877,7 +953,7 @@ test "Event queue" {
     var conn = try QuicConnection.init(allocator, config);
     defer conn.deinit();
 
-    try conn.events.append(allocator, .{ .connected = {} });
+    try conn.events.append(allocator, .{ .connected = .{} });
 
     const event = conn.nextEvent();
     try std.testing.expect(event != null);

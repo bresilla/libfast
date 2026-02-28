@@ -151,7 +151,10 @@ pub const StreamInfo = struct {
 /// Connection event
 pub const ConnectionEvent = union(enum) {
     /// Connection established
-    connected: void,
+    connected: struct {
+        /// Negotiated ALPN protocol, when available (TLS mode)
+        alpn: ?[]const u8 = null,
+    },
 
     /// Stream opened (by remote peer)
     stream_opened: StreamId,
@@ -231,7 +234,7 @@ test "StreamInfo creation" {
 }
 
 test "ConnectionEvent variants" {
-    const event1 = ConnectionEvent{ .connected = {} };
+    const event1 = ConnectionEvent{ .connected = .{} };
     const event2 = ConnectionEvent{ .stream_opened = 4 };
     const event3 = ConnectionEvent{ .stream_readable = 8 };
     const event4 = ConnectionEvent{ .closing = .{ .error_code = 0, .reason = "No error" } };
