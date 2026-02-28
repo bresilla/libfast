@@ -202,7 +202,8 @@ pub const QuicConnection = struct {
             return;
         }
 
-        if (self.config.mode == .tls and !self.isTlsNegotiatedForEstablish()) {
+        const negotiation = self.buildNegotiationResult();
+        if (negotiation.mode == .tls and !negotiation.ready_for_establish) {
             return;
         }
 
@@ -218,19 +219,43 @@ pub const QuicConnection = struct {
     }
 
     fn isTlsNegotiatedForEstablish(self: *const QuicConnection) bool {
-        if (!self.tls_server_hello_applied) return false;
-
-        const conn = self.internal_conn orelse return false;
-        if (conn.remote_params == null) return false;
-
-        const tls_ctx = self.tls_ctx orelse return false;
-        return tls_ctx.state.isComplete();
+        const negotiation = self.buildNegotiationResult();
+        return negotiation.mode == .tls and negotiation.ready_for_establish;
     }
 
     fn negotiationMode(self: *const QuicConnection) types_mod.NegotiationMode {
         return switch (self.config.mode) {
             .tls => .tls,
             .ssh => .ssh,
+        };
+    }
+
+    fn buildNegotiationResult(self: *const QuicConnection) types_mod.NegotiationResult {
+        const mode = self.negotiationMode();
+
+        const has_peer_transport_params = blk: {
+            const conn = self.internal_conn orelse break :blk false;
+            break :blk conn.remote_params != null;
+        };
+
+        const tls_handshake_complete = blk: {
+            if (mode != .tls) break :blk false;
+            const tls_ctx = self.tls_ctx orelse break :blk false;
+            break :blk tls_ctx.state.isComplete();
+        };
+
+        const ready_for_establish = switch (mode) {
+            .tls => has_peer_transport_params and self.tls_server_hello_applied and tls_handshake_complete,
+            .ssh => has_peer_transport_params,
+        };
+
+        return .{
+            .mode = mode,
+            .has_peer_transport_params = has_peer_transport_params,
+            .tls_server_hello_applied = self.tls_server_hello_applied,
+            .tls_handshake_complete = tls_handshake_complete,
+            .selected_alpn = self.negotiated_alpn,
+            .ready_for_establish = ready_for_establish,
         };
     }
 
@@ -893,26 +918,25 @@ pub const QuicConnection = struct {
             return false;
         }
 
-        const conn = self.internal_conn orelse return false;
-        if (conn.remote_params == null) {
+        const caps = self.getModeCapabilities();
+        const negotiation = self.buildNegotiationResult();
+        if (!negotiation.has_peer_transport_params and caps.requires_peer_transport_params) {
             return false;
         }
 
-        const caps = self.getModeCapabilities();
-        return switch (self.config.mode) {
-            .tls => blk: {
-                const tls_ctx = self.tls_ctx orelse break :blk false;
-                if (caps.requires_integrated_tls_server_hello and !self.tls_server_hello_applied) {
-                    break :blk false;
-                }
-                break :blk tls_ctx.state.isComplete();
-            },
-            .ssh => true,
-        };
+        if (negotiation.mode == .tls and caps.requires_integrated_tls_server_hello and !negotiation.tls_server_hello_applied) {
+            return false;
+        }
+
+        return negotiation.ready_for_establish;
     }
 
     pub fn getModeCapabilities(self: *const QuicConnection) types_mod.ModeCapabilities {
         return types_mod.ModeCapabilities.forMode(self.negotiationMode());
+    }
+
+    pub fn getNegotiationResult(self: *const QuicConnection) types_mod.NegotiationResult {
+        return self.buildNegotiationResult();
     }
 
     /// Returns a point-in-time negotiation snapshot.
@@ -1360,6 +1384,56 @@ test "mode capabilities reflect tls and ssh modes" {
     try std.testing.expect(!ssh_caps.supports_unidirectional_streams);
     try std.testing.expect(!ssh_caps.supports_alpn);
     try std.testing.expect(!ssh_caps.requires_integrated_tls_server_hello);
+}
+
+test "negotiation result is normalized across modes" {
+    const allocator = std.testing.allocator;
+
+    var tls_config = config_mod.QuicConfig.tlsClient("example.com");
+    tls_config.tls_config.?.alpn_protocols = &[_][]const u8{"h3"};
+
+    var tls_conn = try QuicConnection.init(allocator, tls_config);
+    defer tls_conn.deinit();
+    try tls_conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const tls_ext = [_]tls_handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_payload },
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = encoded_server_params },
+    };
+    const random: [32]u8 = [_]u8{51} ** 32;
+    const tls_server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &tls_ext,
+    };
+    const tls_server_hello_bytes = try tls_server_hello.encode(allocator);
+    defer allocator.free(tls_server_hello_bytes);
+    try tls_conn.processTlsServerHello(tls_server_hello_bytes, "test-shared-secret-from-ecdhe");
+
+    const tls_result = tls_conn.getNegotiationResult();
+    try std.testing.expectEqual(types_mod.NegotiationMode.tls, tls_result.mode);
+    try std.testing.expect(tls_result.has_peer_transport_params);
+    try std.testing.expect(tls_result.tls_server_hello_applied);
+    try std.testing.expect(tls_result.tls_handshake_complete);
+    try std.testing.expect(tls_result.ready_for_establish);
+
+    const ssh_config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var ssh_conn = try QuicConnection.init(allocator, ssh_config);
+    defer ssh_conn.deinit();
+    try ssh_conn.connect("127.0.0.1", 4433);
+    try applyDefaultPeerTransportParams(&ssh_conn, allocator);
+
+    const ssh_result = ssh_conn.getNegotiationResult();
+    try std.testing.expectEqual(types_mod.NegotiationMode.ssh, ssh_result.mode);
+    try std.testing.expect(ssh_result.has_peer_transport_params);
+    try std.testing.expect(!ssh_result.tls_server_hello_applied);
+    try std.testing.expect(!ssh_result.tls_handshake_complete);
+    try std.testing.expect(ssh_result.ready_for_establish);
 }
 
 test "Connection state transitions" {

@@ -221,6 +221,16 @@ pub const ModeCapabilities = struct {
     }
 };
 
+/// Normalized negotiation result used by shared runtime logic.
+pub const NegotiationResult = struct {
+    mode: NegotiationMode,
+    has_peer_transport_params: bool,
+    tls_server_hello_applied: bool,
+    tls_handshake_complete: bool,
+    selected_alpn: ?[]const u8,
+    ready_for_establish: bool,
+};
+
 /// Snapshot of negotiated connection metadata.
 pub const NegotiationSnapshot = struct {
     mode: NegotiationMode,
