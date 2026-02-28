@@ -552,7 +552,7 @@ pub const QuicConnection = struct {
         stream_id: types_mod.StreamId,
         buffer: []u8,
     ) types_mod.QuicError!usize {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -575,7 +575,7 @@ pub const QuicConnection = struct {
         stream_id: types_mod.StreamId,
         error_code: u64,
     ) types_mod.QuicError!void {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -1502,6 +1502,8 @@ test "poll routes STREAM frame into stream data and readable event" {
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_readable);
     try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var read_buf: [64]u8 = undefined;
     const n = try conn.streamRead(4, &read_buf);
