@@ -1014,6 +1014,50 @@ fn applyDefaultPeerTransportParams(conn: *QuicConnection, allocator: std.mem.All
     try conn.applyPeerTransportParams(encoded);
 }
 
+fn applyPeerTransportParamsWithLimits(conn: *QuicConnection, allocator: std.mem.Allocator, max_bidi: u64, max_uni: u64) !void {
+    var params = transport_params_mod.TransportParams.defaultServer();
+    params.initial_max_streams_bidi = max_bidi;
+    params.initial_max_streams_uni = max_uni;
+
+    const encoded = try params.encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+}
+
+fn buildTlsServerHelloForTests(
+    allocator: std.mem.Allocator,
+    alpn: []const u8,
+    tp_payload: []const u8,
+) ![]u8 {
+    var alpn_wire: [8]u8 = undefined;
+    if (alpn.len == 0 or alpn.len > 5) return error.InvalidInput;
+
+    alpn_wire[0] = 0x00;
+    alpn_wire[1] = @intCast(alpn.len + 1);
+    alpn_wire[2] = @intCast(alpn.len);
+    @memcpy(alpn_wire[3 .. 3 + alpn.len], alpn);
+
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = alpn_wire[0 .. 3 + alpn.len],
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp_payload,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{61} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+
+    return server_hello.encode(allocator);
+}
+
 test "Create SSH client connection" {
     const allocator = std.testing.allocator;
 
@@ -1384,6 +1428,75 @@ test "mode capabilities reflect tls and ssh modes" {
     try std.testing.expect(!ssh_caps.supports_unidirectional_streams);
     try std.testing.expect(!ssh_caps.supports_alpn);
     try std.testing.expect(!ssh_caps.requires_integrated_tls_server_hello);
+}
+
+test "dual-mode regression stream policy tls vs ssh" {
+    const allocator = std.testing.allocator;
+
+    var tls_cfg = config_mod.QuicConfig.tlsClient("example.com");
+    tls_cfg.tls_config.?.alpn_protocols = &[_][]const u8{"h3"};
+    var tls_conn = try QuicConnection.init(allocator, tls_cfg);
+    defer tls_conn.deinit();
+    try tls_conn.connect("127.0.0.1", 4433);
+
+    var tls_tp = transport_params_mod.TransportParams.defaultServer();
+    tls_tp.initial_max_streams_bidi = 2;
+    tls_tp.initial_max_streams_uni = 1;
+    const tls_tp_encoded = try tls_tp.encode(allocator);
+    defer allocator.free(tls_tp_encoded);
+
+    const server_hello = try buildTlsServerHelloForTests(allocator, "h3", tls_tp_encoded);
+    defer allocator.free(server_hello);
+    try tls_conn.processTlsServerHello(server_hello, "test-shared-secret-from-ecdhe");
+    tls_conn.internal_conn.?.markEstablished();
+    tls_conn.state = .established;
+
+    _ = try tls_conn.openStream(false);
+
+    const ssh_cfg = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var ssh_conn = try QuicConnection.init(allocator, ssh_cfg);
+    defer ssh_conn.deinit();
+    try ssh_conn.connect("127.0.0.1", 4433);
+    ssh_conn.internal_conn.?.markEstablished();
+    ssh_conn.state = .established;
+    try applyPeerTransportParamsWithLimits(&ssh_conn, allocator, 2, 1);
+
+    try std.testing.expectError(types_mod.QuicError.StreamError, ssh_conn.openStream(false));
+}
+
+test "dual-mode regression negotiated stream limits enforced" {
+    const allocator = std.testing.allocator;
+
+    var tls_cfg = config_mod.QuicConfig.tlsClient("example.com");
+    tls_cfg.tls_config.?.alpn_protocols = &[_][]const u8{"h3"};
+    var tls_conn = try QuicConnection.init(allocator, tls_cfg);
+    defer tls_conn.deinit();
+    try tls_conn.connect("127.0.0.1", 4433);
+
+    var tls_tp = transport_params_mod.TransportParams.defaultServer();
+    tls_tp.initial_max_streams_bidi = 1;
+    const tls_tp_encoded = try tls_tp.encode(allocator);
+    defer allocator.free(tls_tp_encoded);
+
+    const server_hello = try buildTlsServerHelloForTests(allocator, "h3", tls_tp_encoded);
+    defer allocator.free(server_hello);
+    try tls_conn.processTlsServerHello(server_hello, "test-shared-secret-from-ecdhe");
+    tls_conn.internal_conn.?.markEstablished();
+    tls_conn.state = .established;
+
+    _ = try tls_conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, tls_conn.openStream(true));
+
+    const ssh_cfg = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var ssh_conn = try QuicConnection.init(allocator, ssh_cfg);
+    defer ssh_conn.deinit();
+    try ssh_conn.connect("127.0.0.1", 4433);
+    ssh_conn.internal_conn.?.markEstablished();
+    ssh_conn.state = .established;
+    try applyPeerTransportParamsWithLimits(&ssh_conn, allocator, 1, 0);
+
+    _ = try ssh_conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, ssh_conn.openStream(true));
 }
 
 test "negotiation result is normalized across modes" {
