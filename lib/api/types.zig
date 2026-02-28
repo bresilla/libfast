@@ -190,6 +190,24 @@ pub const StreamFinish = enum {
     finish,
 };
 
+/// Negotiation mode used by the connection.
+pub const NegotiationMode = enum {
+    tls,
+    ssh,
+};
+
+/// Snapshot of negotiated connection metadata.
+pub const NegotiationSnapshot = struct {
+    mode: NegotiationMode,
+    is_established: bool,
+    alpn: ?[]const u8,
+    peer_max_idle_timeout: u64,
+    peer_max_udp_payload_size: u64,
+    peer_initial_max_data: u64,
+    peer_initial_max_streams_bidi: u64,
+    peer_initial_max_streams_uni: u64,
+};
+
 // Tests
 
 test "ConnectionState methods" {

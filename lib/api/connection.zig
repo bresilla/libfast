@@ -768,6 +768,28 @@ pub const QuicConnection = struct {
         return self.negotiated_alpn;
     }
 
+    /// Returns a point-in-time negotiation snapshot.
+    pub fn getNegotiationSnapshot(self: *const QuicConnection) ?types_mod.NegotiationSnapshot {
+        const conn = self.internal_conn orelse return null;
+        const remote_params = conn.remote_params orelse core_types.TransportParameters{};
+
+        const mode: types_mod.NegotiationMode = switch (self.config.mode) {
+            .tls => .tls,
+            .ssh => .ssh,
+        };
+
+        return .{
+            .mode = mode,
+            .is_established = self.state == .established,
+            .alpn = self.negotiated_alpn,
+            .peer_max_idle_timeout = remote_params.max_idle_timeout,
+            .peer_max_udp_payload_size = remote_params.max_udp_payload_size,
+            .peer_initial_max_data = remote_params.initial_max_data,
+            .peer_initial_max_streams_bidi = remote_params.initial_max_streams_bidi,
+            .peer_initial_max_streams_uni = remote_params.initial_max_streams_uni,
+        };
+    }
+
     /// Close the connection gracefully
     pub fn close(
         self: *QuicConnection,
@@ -916,6 +938,48 @@ test "connected event carries negotiated ALPN metadata" {
     try std.testing.expectEqualStrings("h3", event.?.connected.alpn.?);
     try std.testing.expect(conn.getNegotiatedAlpn() != null);
     try std.testing.expectEqualStrings("h3", conn.getNegotiatedAlpn().?);
+}
+
+test "negotiation snapshot exposes mode ALPN and peer params" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    internal_conn.markEstablished();
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.max_idle_timeout = 12345;
+    encoded.initial_max_data = 45678;
+    encoded.initial_max_streams_bidi = 7;
+    encoded.initial_max_streams_uni = 3;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+    try conn.applyPeerTransportParams(payload);
+
+    conn.negotiated_alpn = "h3";
+
+    const snapshot = conn.getNegotiationSnapshot();
+    try std.testing.expect(snapshot != null);
+    try std.testing.expectEqual(types_mod.NegotiationMode.tls, snapshot.?.mode);
+    try std.testing.expect(snapshot.?.is_established);
+    try std.testing.expect(snapshot.?.alpn != null);
+    try std.testing.expectEqualStrings("h3", snapshot.?.alpn.?);
+    try std.testing.expectEqual(@as(u64, 12345), snapshot.?.peer_max_idle_timeout);
+    try std.testing.expectEqual(@as(u64, 45678), snapshot.?.peer_initial_max_data);
+    try std.testing.expectEqual(@as(u64, 7), snapshot.?.peer_initial_max_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.?.peer_initial_max_streams_uni);
 }
 
 test "Connection state transitions" {
