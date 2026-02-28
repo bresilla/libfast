@@ -5,7 +5,6 @@ const varint = @import("../utils/varint.zig");
 ///
 /// Transport parameters are exchanged during connection establishment
 /// to configure connection behavior.
-
 pub const TransportParamsError = error{
     InvalidParameter,
     InvalidLength,
@@ -16,6 +15,7 @@ pub const TransportParamsError = error{
     ValueTooLarge,
     UnexpectedEof,
     InvalidEncoding,
+    ProtocolViolation,
 };
 
 /// Transport parameter ID
@@ -211,6 +211,19 @@ pub const TransportParams = struct {
         var params = TransportParams.init();
         var offset: usize = 0;
 
+        var seen_max_idle_timeout = false;
+        var seen_max_udp_payload_size = false;
+        var seen_initial_max_data = false;
+        var seen_initial_max_stream_data_bidi_local = false;
+        var seen_initial_max_stream_data_bidi_remote = false;
+        var seen_initial_max_stream_data_uni = false;
+        var seen_initial_max_streams_bidi = false;
+        var seen_initial_max_streams_uni = false;
+        var seen_ack_delay_exponent = false;
+        var seen_max_ack_delay = false;
+        var seen_disable_active_migration = false;
+        var seen_active_connection_id_limit = false;
+
         while (offset < data.len) {
             // Read parameter ID
             const id_result = varint.decode(data[offset..]) catch {
@@ -223,7 +236,7 @@ pub const TransportParams = struct {
             const len_result = varint.decode(data[offset..]) catch {
                 return error.InvalidParameter;
             };
-            const param_len = len_result.value;
+            const param_len: usize = @intCast(len_result.value);
             offset += len_result.len;
 
             // Check bounds
@@ -237,72 +250,68 @@ pub const TransportParams = struct {
             // Parse parameter value
             switch (@as(TransportParamId, @enumFromInt(param_id))) {
                 .max_idle_timeout => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.max_idle_timeout = result.value;
-                    }
+                    if (seen_max_idle_timeout) return error.DuplicateParameter;
+                    seen_max_idle_timeout = true;
+                    params.max_idle_timeout = try decodeSingleVarInt(param_data);
                 },
                 .max_udp_payload_size => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.max_udp_payload_size = result.value;
-                    }
+                    if (seen_max_udp_payload_size) return error.DuplicateParameter;
+                    seen_max_udp_payload_size = true;
+                    params.max_udp_payload_size = try decodeSingleVarInt(param_data);
+                    if (params.max_udp_payload_size < 1200) return error.ProtocolViolation;
                 },
                 .initial_max_data => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.initial_max_data = result.value;
-                    }
+                    if (seen_initial_max_data) return error.DuplicateParameter;
+                    seen_initial_max_data = true;
+                    params.initial_max_data = try decodeSingleVarInt(param_data);
                 },
                 .initial_max_stream_data_bidi_local => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.initial_max_stream_data_bidi_local = result.value;
-                    }
+                    if (seen_initial_max_stream_data_bidi_local) return error.DuplicateParameter;
+                    seen_initial_max_stream_data_bidi_local = true;
+                    params.initial_max_stream_data_bidi_local = try decodeSingleVarInt(param_data);
                 },
                 .initial_max_stream_data_bidi_remote => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.initial_max_stream_data_bidi_remote = result.value;
-                    }
+                    if (seen_initial_max_stream_data_bidi_remote) return error.DuplicateParameter;
+                    seen_initial_max_stream_data_bidi_remote = true;
+                    params.initial_max_stream_data_bidi_remote = try decodeSingleVarInt(param_data);
                 },
                 .initial_max_stream_data_uni => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.initial_max_stream_data_uni = result.value;
-                    }
+                    if (seen_initial_max_stream_data_uni) return error.DuplicateParameter;
+                    seen_initial_max_stream_data_uni = true;
+                    params.initial_max_stream_data_uni = try decodeSingleVarInt(param_data);
                 },
                 .initial_max_streams_bidi => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.initial_max_streams_bidi = result.value;
-                    }
+                    if (seen_initial_max_streams_bidi) return error.DuplicateParameter;
+                    seen_initial_max_streams_bidi = true;
+                    params.initial_max_streams_bidi = try decodeSingleVarInt(param_data);
                 },
                 .initial_max_streams_uni => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.initial_max_streams_uni = result.value;
-                    }
+                    if (seen_initial_max_streams_uni) return error.DuplicateParameter;
+                    seen_initial_max_streams_uni = true;
+                    params.initial_max_streams_uni = try decodeSingleVarInt(param_data);
                 },
                 .ack_delay_exponent => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.ack_delay_exponent = result.value;
-                    }
+                    if (seen_ack_delay_exponent) return error.DuplicateParameter;
+                    seen_ack_delay_exponent = true;
+                    params.ack_delay_exponent = try decodeSingleVarInt(param_data);
+                    if (params.ack_delay_exponent > 20) return error.ProtocolViolation;
                 },
                 .max_ack_delay => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.max_ack_delay = result.value;
-                    }
+                    if (seen_max_ack_delay) return error.DuplicateParameter;
+                    seen_max_ack_delay = true;
+                    params.max_ack_delay = try decodeSingleVarInt(param_data);
+                    if (params.max_ack_delay >= 16384) return error.ProtocolViolation;
                 },
                 .active_connection_id_limit => {
-                    if (param_len > 0) {
-                        const result = varint.decode(param_data) catch return error.InvalidParameter;
-                        params.active_connection_id_limit = result.value;
-                    }
+                    if (seen_active_connection_id_limit) return error.DuplicateParameter;
+                    seen_active_connection_id_limit = true;
+                    params.active_connection_id_limit = try decodeSingleVarInt(param_data);
+                    if (params.active_connection_id_limit < 2) return error.ProtocolViolation;
                 },
                 .disable_active_migration => {
+                    if (seen_disable_active_migration) return error.DuplicateParameter;
+                    seen_disable_active_migration = true;
+                    if (param_len != 0) return error.InvalidLength;
                     params.disable_active_migration = true;
                 },
                 else => {
@@ -312,6 +321,13 @@ pub const TransportParams = struct {
         }
 
         return params;
+    }
+
+    fn decodeSingleVarInt(param_data: []const u8) TransportParamsError!u64 {
+        if (param_data.len == 0) return error.InvalidLength;
+        const result = varint.decode(param_data) catch return error.InvalidParameter;
+        if (result.len != param_data.len) return error.InvalidLength;
+        return result.value;
     }
 };
 
@@ -448,4 +464,83 @@ test "Transport params multiple parameters" {
     try std.testing.expectEqual(params.initial_max_streams_bidi, decoded.initial_max_streams_bidi);
     try std.testing.expectEqual(params.initial_max_streams_uni, decoded.initial_max_streams_uni);
     try std.testing.expectEqual(params.ack_delay_exponent, decoded.ack_delay_exponent);
+}
+
+test "Transport params duplicate parameter rejected" {
+    const allocator = std.testing.allocator;
+
+    var data: [32]u8 = undefined;
+    var offset: usize = 0;
+
+    var id_buf: [8]u8 = undefined;
+    var len_buf: [8]u8 = undefined;
+    var value_buf: [8]u8 = undefined;
+
+    const id_len = try varint.encode(@intFromEnum(TransportParamId.max_idle_timeout), &id_buf);
+    const value_len = try varint.encode(100, &value_buf);
+    const plen_len = try varint.encode(value_len, &len_buf);
+
+    @memcpy(data[offset..][0..id_len], id_buf[0..id_len]);
+    offset += id_len;
+    @memcpy(data[offset..][0..plen_len], len_buf[0..plen_len]);
+    offset += plen_len;
+    @memcpy(data[offset..][0..value_len], value_buf[0..value_len]);
+    offset += value_len;
+
+    @memcpy(data[offset..][0..id_len], id_buf[0..id_len]);
+    offset += id_len;
+    @memcpy(data[offset..][0..plen_len], len_buf[0..plen_len]);
+    offset += plen_len;
+    @memcpy(data[offset..][0..value_len], value_buf[0..value_len]);
+    offset += value_len;
+
+    try std.testing.expectError(error.DuplicateParameter, TransportParams.decode(allocator, data[0..offset]));
+}
+
+test "Transport params reject max_udp_payload_size below minimum" {
+    const allocator = std.testing.allocator;
+
+    var data: [32]u8 = undefined;
+    var offset: usize = 0;
+
+    var id_buf: [8]u8 = undefined;
+    var len_buf: [8]u8 = undefined;
+    var value_buf: [8]u8 = undefined;
+
+    const id_len = try varint.encode(@intFromEnum(TransportParamId.max_udp_payload_size), &id_buf);
+    const value_len = try varint.encode(1199, &value_buf);
+    const plen_len = try varint.encode(value_len, &len_buf);
+
+    @memcpy(data[offset..][0..id_len], id_buf[0..id_len]);
+    offset += id_len;
+    @memcpy(data[offset..][0..plen_len], len_buf[0..plen_len]);
+    offset += plen_len;
+    @memcpy(data[offset..][0..value_len], value_buf[0..value_len]);
+    offset += value_len;
+
+    try std.testing.expectError(error.ProtocolViolation, TransportParams.decode(allocator, data[0..offset]));
+}
+
+test "Transport params reject active_connection_id_limit below two" {
+    const allocator = std.testing.allocator;
+
+    var data: [32]u8 = undefined;
+    var offset: usize = 0;
+
+    var id_buf: [8]u8 = undefined;
+    var len_buf: [8]u8 = undefined;
+    var value_buf: [8]u8 = undefined;
+
+    const id_len = try varint.encode(@intFromEnum(TransportParamId.active_connection_id_limit), &id_buf);
+    const value_len = try varint.encode(1, &value_buf);
+    const plen_len = try varint.encode(value_len, &len_buf);
+
+    @memcpy(data[offset..][0..id_len], id_buf[0..id_len]);
+    offset += id_len;
+    @memcpy(data[offset..][0..plen_len], len_buf[0..plen_len]);
+    offset += plen_len;
+    @memcpy(data[offset..][0..value_len], value_buf[0..value_len]);
+    offset += value_len;
+
+    try std.testing.expectError(error.ProtocolViolation, TransportParams.decode(allocator, data[0..offset]));
 }

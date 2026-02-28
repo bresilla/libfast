@@ -151,7 +151,10 @@ pub const StreamInfo = struct {
 /// Connection event
 pub const ConnectionEvent = union(enum) {
     /// Connection established
-    connected: void,
+    connected: struct {
+        /// Negotiated ALPN protocol, when available (TLS mode)
+        alpn: ?[]const u8 = null,
+    },
 
     /// Stream opened (by remote peer)
     stream_opened: StreamId,
@@ -185,6 +188,59 @@ pub const StreamFinish = enum {
 
     /// Finish stream after this write
     finish,
+};
+
+/// Negotiation mode used by the connection.
+pub const NegotiationMode = enum {
+    tls,
+    ssh,
+};
+
+/// Explicit connection capability matrix by mode.
+pub const ModeCapabilities = struct {
+    supports_unidirectional_streams: bool,
+    supports_alpn: bool,
+    requires_integrated_tls_server_hello: bool,
+    requires_peer_transport_params: bool,
+
+    pub fn forMode(mode: NegotiationMode) ModeCapabilities {
+        return switch (mode) {
+            .tls => .{
+                .supports_unidirectional_streams = true,
+                .supports_alpn = true,
+                .requires_integrated_tls_server_hello = true,
+                .requires_peer_transport_params = true,
+            },
+            .ssh => .{
+                .supports_unidirectional_streams = false,
+                .supports_alpn = false,
+                .requires_integrated_tls_server_hello = false,
+                .requires_peer_transport_params = true,
+            },
+        };
+    }
+};
+
+/// Normalized negotiation result used by shared runtime logic.
+pub const NegotiationResult = struct {
+    mode: NegotiationMode,
+    has_peer_transport_params: bool,
+    tls_server_hello_applied: bool,
+    tls_handshake_complete: bool,
+    selected_alpn: ?[]const u8,
+    ready_for_establish: bool,
+};
+
+/// Snapshot of negotiated connection metadata.
+pub const NegotiationSnapshot = struct {
+    mode: NegotiationMode,
+    is_established: bool,
+    alpn: ?[]const u8,
+    peer_max_idle_timeout: u64,
+    peer_max_udp_payload_size: u64,
+    peer_initial_max_data: u64,
+    peer_initial_max_streams_bidi: u64,
+    peer_initial_max_streams_uni: u64,
 };
 
 // Tests
@@ -231,7 +287,7 @@ test "StreamInfo creation" {
 }
 
 test "ConnectionEvent variants" {
-    const event1 = ConnectionEvent{ .connected = {} };
+    const event1 = ConnectionEvent{ .connected = .{} };
     const event2 = ConnectionEvent{ .stream_opened = 4 };
     const event3 = ConnectionEvent{ .stream_readable = 8 };
     const event4 = ConnectionEvent{ .closing = .{ .error_code = 0, .reason = "No error" } };
@@ -240,4 +296,18 @@ test "ConnectionEvent variants" {
     _ = event2;
     _ = event3;
     _ = event4;
+}
+
+test "ModeCapabilities matrix" {
+    const tls_caps = ModeCapabilities.forMode(.tls);
+    try std.testing.expect(tls_caps.supports_unidirectional_streams);
+    try std.testing.expect(tls_caps.supports_alpn);
+    try std.testing.expect(tls_caps.requires_integrated_tls_server_hello);
+    try std.testing.expect(tls_caps.requires_peer_transport_params);
+
+    const ssh_caps = ModeCapabilities.forMode(.ssh);
+    try std.testing.expect(!ssh_caps.supports_unidirectional_streams);
+    try std.testing.expect(!ssh_caps.supports_alpn);
+    try std.testing.expect(!ssh_caps.requires_integrated_tls_server_hello);
+    try std.testing.expect(ssh_caps.requires_peer_transport_params);
 }

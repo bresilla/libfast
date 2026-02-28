@@ -3,12 +3,14 @@ const handshake_mod = @import("handshake.zig");
 const key_schedule_mod = @import("key_schedule.zig");
 const keys_mod = @import("../keys.zig");
 const crypto_mod = @import("../crypto.zig");
+const transport_params_mod = @import("../../core/transport_params.zig");
 
 /// TLS 1.3 context for QUIC connections
 ///
 /// Manages the TLS handshake state and key derivation
 pub const TlsError = error{
     HandshakeFailed,
+    AlpnMismatch,
     InvalidState,
     UnsupportedCipherSuite,
     OutOfMemory,
@@ -57,6 +59,15 @@ pub const TlsContext = struct {
     application_client_secret: ?[]u8 = null,
     application_server_secret: ?[]u8 = null,
 
+    /// Negotiated ALPN (when available)
+    selected_alpn: ?[]u8 = null,
+
+    /// Encoded ALPN protocols offered by the client (wire format payload)
+    offered_alpn: ?[]u8 = null,
+
+    /// Raw peer QUIC transport parameters from TLS extensions.
+    peer_transport_params: ?[]u8 = null,
+
     /// Initialize TLS context
     pub fn init(allocator: std.mem.Allocator, is_client: bool) TlsContext {
         return TlsContext{
@@ -64,6 +75,9 @@ pub const TlsContext = struct {
             .is_client = is_client,
             .state = .idle,
             .transcript = .{},
+            .selected_alpn = null,
+            .offered_alpn = null,
+            .peer_transport_params = null,
         };
     }
 
@@ -71,6 +85,16 @@ pub const TlsContext = struct {
     pub fn startClientHandshake(
         self: *TlsContext,
         server_name: []const u8,
+    ) TlsError![]u8 {
+        return self.startClientHandshakeWithParams(server_name, &[_][]const u8{}, &[_]u8{});
+    }
+
+    /// Start TLS handshake (client) with ALPN and QUIC transport parameters.
+    pub fn startClientHandshakeWithParams(
+        self: *TlsContext,
+        server_name: []const u8,
+        alpn_protocols: []const []const u8,
+        quic_transport_params: []const u8,
     ) TlsError![]u8 {
         if (!self.is_client) {
             return error.InvalidState;
@@ -80,6 +104,22 @@ pub const TlsContext = struct {
         }
 
         _ = server_name;
+        _ = transport_params_mod.TransportParams.decode(self.allocator, quic_transport_params) catch {
+            return error.HandshakeFailed;
+        };
+
+        if (self.selected_alpn) |alpn| {
+            self.allocator.free(alpn);
+            self.selected_alpn = null;
+        }
+        if (self.offered_alpn) |offered| {
+            self.allocator.free(offered);
+            self.offered_alpn = null;
+        }
+        if (self.peer_transport_params) |tp| {
+            self.allocator.free(tp);
+            self.peer_transport_params = null;
+        }
 
         // Generate random
         var random: [32]u8 = undefined;
@@ -92,18 +132,131 @@ pub const TlsContext = struct {
             handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
         };
 
+        var ext_list: [2]handshake_mod.Extension = undefined;
+        var ext_count: usize = 0;
+
+        if (alpn_protocols.len > 0) {
+            const alpn_data = try encodeAlpnExtensionData(self.allocator, alpn_protocols);
+            errdefer self.allocator.free(alpn_data);
+
+            self.offered_alpn = try self.allocator.dupe(u8, alpn_data);
+
+            ext_list[ext_count] = .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+                .extension_data = alpn_data,
+            };
+            ext_count += 1;
+        }
+
+        if (quic_transport_params.len > 0) {
+            ext_list[ext_count] = .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+                .extension_data = quic_transport_params,
+            };
+            ext_count += 1;
+        }
+
         const client_hello = handshake_mod.ClientHello{
             .random = random,
             .cipher_suites = &cipher_suites,
-            .extensions = &[_]handshake_mod.Extension{},
+            .extensions = ext_list[0..ext_count],
         };
 
         const encoded = try client_hello.encode(self.allocator);
+
+        if (ext_count > 0 and alpn_protocols.len > 0) {
+            self.allocator.free(ext_list[0].extension_data);
+        }
 
         self.transcript.clearRetainingCapacity();
         try self.transcript.appendSlice(self.allocator, encoded);
 
         self.state = .client_hello_sent;
+
+        return encoded;
+    }
+
+    /// Build a ServerHello from a received ClientHello (server side).
+    ///
+    /// This selects ALPN using server preference order and includes QUIC
+    /// transport parameters in the returned ServerHello extensions.
+    pub fn buildServerHelloFromClientHello(
+        self: *TlsContext,
+        client_hello_data: []const u8,
+        server_supported_alpn: []const []const u8,
+        quic_transport_params: []const u8,
+    ) TlsError![]u8 {
+        if (self.is_client or self.state != .idle) {
+            return error.InvalidState;
+        }
+
+        _ = transport_params_mod.TransportParams.decode(self.allocator, quic_transport_params) catch {
+            return error.HandshakeFailed;
+        };
+
+        const parsed_client_hello = handshake_mod.parseClientHello(client_hello_data) catch {
+            return error.HandshakeFailed;
+        };
+
+        const selected_cipher = selectServerCipherSuite(parsed_client_hello.cipher_suites) orelse {
+            return error.UnsupportedCipherSuite;
+        };
+
+        const selected_alpn = try selectServerAlpnFromClientHello(client_hello_data, server_supported_alpn);
+        const selected_alpn_wire = try encodeSelectedAlpnExtensionData(self.allocator, selected_alpn);
+        errdefer self.allocator.free(selected_alpn_wire);
+
+        const client_tp = handshake_mod.findUniqueExtension(
+            parsed_client_hello.extensions,
+            @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        ) catch return error.HandshakeFailed;
+        const client_tp_payload = client_tp orelse return error.HandshakeFailed;
+        _ = transport_params_mod.TransportParams.decode(self.allocator, client_tp_payload) catch {
+            return error.HandshakeFailed;
+        };
+
+        const copied_client_tp = try self.allocator.dupe(u8, client_tp_payload);
+        errdefer self.allocator.free(copied_client_tp);
+
+        if (self.peer_transport_params) |old_tp| {
+            self.allocator.free(old_tp);
+        }
+        self.peer_transport_params = copied_client_tp;
+
+        if (self.selected_alpn) |old_alpn| {
+            self.allocator.free(old_alpn);
+        }
+        self.selected_alpn = try self.allocator.dupe(u8, selected_alpn);
+
+        var random: [32]u8 = undefined;
+        std.crypto.random.bytes(&random);
+
+        const ext = [_]handshake_mod.Extension{
+            .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+                .extension_data = selected_alpn_wire,
+            },
+            .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+                .extension_data = quic_transport_params,
+            },
+        };
+
+        const server_hello = handshake_mod.ServerHello{
+            .random = random,
+            .cipher_suite = selected_cipher,
+            .extensions = &ext,
+        };
+
+        const encoded = try server_hello.encode(self.allocator);
+        self.allocator.free(selected_alpn_wire);
+
+        self.transcript.clearRetainingCapacity();
+        try self.transcript.appendSlice(self.allocator, client_hello_data);
+        try self.transcript.appendSlice(self.allocator, encoded);
+
+        self.cipher_suite = selected_cipher;
+        self.state = .server_hello_received;
 
         return encoded;
     }
@@ -131,6 +284,10 @@ pub const TlsContext = struct {
             => self.cipher_suite = parsed.cipher_suite,
             else => return error.UnsupportedCipherSuite,
         }
+
+        try self.maybeStoreSelectedAlpn(parsed.extensions);
+        try self.verifySelectedAlpnAgainstOffer();
+        try self.maybeStorePeerTransportParams(parsed.extensions);
 
         try self.transcript.appendSlice(self.allocator, server_hello_data);
 
@@ -164,11 +321,12 @@ pub const TlsContext = struct {
         peer_certificate_chain_pem: ?[]const u8,
         peer_options: ?PeerVerificationOptions,
     ) TlsError!void {
-        if (!self.is_client or self.state != .server_hello_received) {
+        if (self.state != .server_hello_received) {
             return error.InvalidState;
         }
 
-        if (peer_options) |opts| {
+        if (self.is_client and peer_options != null) {
+            const opts = peer_options.?;
             try self.verifyPeerIdentity(peer_certificate_chain_pem, opts);
         }
 
@@ -239,6 +397,39 @@ pub const TlsContext = struct {
         self.key_schedule = ks_ptr;
 
         self.state = .handshake_complete;
+    }
+
+    fn encodeAlpnExtensionData(
+        allocator: std.mem.Allocator,
+        protocols: []const []const u8,
+    ) TlsError![]u8 {
+        var list_len: usize = 0;
+        for (protocols) |protocol| {
+            if (protocol.len == 0 or protocol.len > 255) {
+                return error.HandshakeFailed;
+            }
+            list_len += 1 + protocol.len;
+        }
+
+        if (list_len > std.math.maxInt(u16)) {
+            return error.HandshakeFailed;
+        }
+
+        var out = try allocator.alloc(u8, list_len + 2);
+        var pos: usize = 0;
+        out[pos] = @intCast((list_len >> 8) & 0xFF);
+        pos += 1;
+        out[pos] = @intCast(list_len & 0xFF);
+        pos += 1;
+
+        for (protocols) |protocol| {
+            out[pos] = @intCast(protocol.len);
+            pos += 1;
+            @memcpy(out[pos..][0..protocol.len], protocol);
+            pos += protocol.len;
+        }
+
+        return out;
     }
 
     fn verifyPeerIdentity(
@@ -361,6 +552,171 @@ pub const TlsContext = struct {
         return null;
     }
 
+    pub fn getSelectedAlpn(self: *const TlsContext) ?[]const u8 {
+        if (self.selected_alpn) |alpn| {
+            return alpn;
+        }
+        return null;
+    }
+
+    pub fn getPeerTransportParams(self: *const TlsContext) ?[]const u8 {
+        if (self.peer_transport_params) |tp| {
+            return tp;
+        }
+        return null;
+    }
+
+    /// Server-side ALPN selection policy.
+    ///
+    /// Selects the first protocol from `server_supported` that is present in
+    /// the client's offered ALPN wire payload.
+    pub fn selectServerAlpn(
+        offered_alpn_wire: []const u8,
+        server_supported: []const []const u8,
+    ) TlsError![]const u8 {
+        if (offered_alpn_wire.len < 2) return error.HandshakeFailed;
+
+        const list_len: usize = (@as(usize, offered_alpn_wire[0]) << 8) | offered_alpn_wire[1];
+        if (list_len + 2 != offered_alpn_wire.len) return error.HandshakeFailed;
+
+        for (server_supported) |candidate| {
+            if (candidate.len == 0) continue;
+            if (isAlpnInOffer(offered_alpn_wire, candidate)) {
+                return candidate;
+            }
+        }
+
+        return error.AlpnMismatch;
+    }
+
+    /// Select ALPN from a full encoded ClientHello.
+    pub fn selectServerAlpnFromClientHello(
+        client_hello_data: []const u8,
+        server_supported: []const []const u8,
+    ) TlsError![]const u8 {
+        const parsed = handshake_mod.parseClientHello(client_hello_data) catch {
+            return error.HandshakeFailed;
+        };
+
+        const offered_alpn = handshake_mod.findUniqueExtension(
+            parsed.extensions,
+            @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        ) catch return error.HandshakeFailed;
+
+        const offered_alpn_wire = offered_alpn orelse return error.HandshakeFailed;
+        return selectServerAlpn(offered_alpn_wire, server_supported);
+    }
+
+    /// Encode a selected ALPN into TLS ALPN extension payload format.
+    pub fn encodeSelectedAlpnExtensionData(
+        allocator: std.mem.Allocator,
+        selected: []const u8,
+    ) TlsError![]u8 {
+        if (selected.len == 0 or selected.len > 255) {
+            return error.HandshakeFailed;
+        }
+
+        const out = try allocator.alloc(u8, selected.len + 3);
+        out[0] = @intCast(((selected.len + 1) >> 8) & 0xFF);
+        out[1] = @intCast((selected.len + 1) & 0xFF);
+        out[2] = @intCast(selected.len);
+        @memcpy(out[3 .. 3 + selected.len], selected);
+        return out;
+    }
+
+    fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
+        const alpn_data_opt = handshake_mod.findUniqueExtension(
+            extensions,
+            @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        ) catch return error.HandshakeFailed;
+
+        const alpn_data = alpn_data_opt orelse return;
+        if (alpn_data.len < 3) return error.HandshakeFailed;
+
+        const list_len: usize = (@as(usize, alpn_data[0]) << 8) | alpn_data[1];
+        if (list_len + 2 != alpn_data.len) return error.HandshakeFailed;
+
+        const name_len: usize = alpn_data[2];
+        if (name_len == 0) return error.HandshakeFailed;
+        if (3 + name_len != alpn_data.len) return error.HandshakeFailed;
+
+        const selected = try self.allocator.dupe(u8, alpn_data[3 .. 3 + name_len]);
+        if (self.selected_alpn) |old| {
+            self.allocator.free(old);
+        }
+        self.selected_alpn = selected;
+    }
+
+    fn verifySelectedAlpnAgainstOffer(self: *TlsContext) TlsError!void {
+        const offered = self.offered_alpn orelse return;
+        const selected = self.selected_alpn orelse return error.HandshakeFailed;
+
+        if (!isAlpnInOffer(offered, selected)) {
+            return error.AlpnMismatch;
+        }
+    }
+
+    fn maybeStorePeerTransportParams(self: *TlsContext, extensions: []const u8) TlsError!void {
+        const tp_data_opt = handshake_mod.findUniqueExtension(
+            extensions,
+            @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+        ) catch return error.HandshakeFailed;
+
+        const tp_data = tp_data_opt orelse return;
+        _ = transport_params_mod.TransportParams.decode(self.allocator, tp_data) catch {
+            return error.HandshakeFailed;
+        };
+
+        const copied = try self.allocator.dupe(u8, tp_data);
+        if (self.peer_transport_params) |old| {
+            self.allocator.free(old);
+        }
+        self.peer_transport_params = copied;
+    }
+
+    fn isAlpnInOffer(offered_wire: []const u8, selected: []const u8) bool {
+        if (offered_wire.len < 2) return false;
+
+        const list_len: usize = (@as(usize, offered_wire[0]) << 8) | offered_wire[1];
+        if (list_len + 2 != offered_wire.len) return false;
+
+        var pos: usize = 2;
+        while (pos < offered_wire.len) {
+            const protocol_len = offered_wire[pos];
+            pos += 1;
+            if (protocol_len == 0) return false;
+            if (pos + protocol_len > offered_wire.len) return false;
+
+            if (std.mem.eql(u8, offered_wire[pos .. pos + protocol_len], selected)) {
+                return true;
+            }
+
+            pos += protocol_len;
+        }
+
+        return false;
+    }
+
+    fn selectServerCipherSuite(offered_cipher_suites: []const u8) ?u16 {
+        if ((offered_cipher_suites.len & 1) != 0) return null;
+
+        const preferred = [_]u16{
+            handshake_mod.TLS_AES_128_GCM_SHA256,
+            handshake_mod.TLS_AES_256_GCM_SHA384,
+            handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
+        };
+
+        for (preferred) |candidate| {
+            var i: usize = 0;
+            while (i + 1 < offered_cipher_suites.len) : (i += 2) {
+                const offered: u16 = (@as(u16, offered_cipher_suites[i]) << 8) | offered_cipher_suites[i + 1];
+                if (offered == candidate) return candidate;
+            }
+        }
+
+        return null;
+    }
+
     /// Clean up
     pub fn deinit(self: *TlsContext) void {
         if (self.handshake_client_secret) |secret| {
@@ -379,6 +735,16 @@ pub const TlsContext = struct {
         if (self.application_server_secret) |secret| {
             @memset(secret, 0);
             self.allocator.free(secret);
+        }
+
+        if (self.selected_alpn) |alpn| {
+            self.allocator.free(alpn);
+        }
+        if (self.offered_alpn) |offered| {
+            self.allocator.free(offered);
+        }
+        if (self.peer_transport_params) |tp| {
+            self.allocator.free(tp);
         }
 
         if (self.key_schedule) |ks| {
@@ -413,6 +779,375 @@ test "Client handshake start" {
 
     try std.testing.expect(client_hello.len > 0);
     try std.testing.expectEqual(HandshakeState.client_hello_sent, ctx.state);
+}
+
+test "Client handshake start with ALPN and transport params" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var params = transport_params_mod.TransportParams.defaultClient();
+    params.initial_max_data = 4096;
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const alpn = [_][]const u8{"h3"};
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_params);
+    defer allocator.free(client_hello);
+
+    try std.testing.expect(std.mem.indexOf(u8, client_hello, "h3") != null);
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, ctx.state);
+}
+
+test "Client handshake start rejects invalid transport params" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const alpn = [_][]const u8{"h3"};
+    const invalid_transport_params = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.startClientHandshakeWithParams("example.com", &alpn, &invalid_transport_params),
+    );
+}
+
+test "Process ServerHello captures selected ALPN when present" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const alpn = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_params);
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{42} ** 32;
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try ctx.processServerHello(server_hello);
+    try std.testing.expect(ctx.getSelectedAlpn() != null);
+    try std.testing.expectEqualStrings("h3", ctx.getSelectedAlpn().?);
+}
+
+test "Process ServerHello captures QUIC transport params extension" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const alpn = [_][]const u8{"h3"};
+    const client_params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_client_params = try client_params.encode(allocator);
+    defer allocator.free(encoded_client_params);
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_client_params);
+    defer allocator.free(client_hello);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.initial_max_data = 1234;
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{44} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try ctx.processServerHello(server_hello);
+    try std.testing.expect(ctx.getPeerTransportParams() != null);
+    try std.testing.expectEqualSlices(u8, encoded_server_params, ctx.getPeerTransportParams().?);
+}
+
+test "Process ServerHello rejects selected ALPN not offered by client" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const alpn = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_params);
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{21} ** 32;
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try std.testing.expectError(error.AlpnMismatch, ctx.processServerHello(server_hello));
+}
+
+test "selectServerAlpn picks first server-preferred overlap" {
+    const offered = [_]u8{
+        0x00, 0x06, // list len
+        0x02, 'h',
+        '2',  0x02,
+        'h',  '3',
+    };
+
+    const supported = [_][]const u8{ "h3", "h2" };
+    const selected = try TlsContext.selectServerAlpn(&offered, &supported);
+    try std.testing.expectEqualStrings("h3", selected);
+}
+
+test "selectServerAlpn fails when no overlap" {
+    const offered = [_]u8{
+        0x00, 0x03,
+        0x02, 'h',
+        '2',
+    };
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(error.AlpnMismatch, TlsContext.selectServerAlpn(&offered, &supported));
+}
+
+test "selectServerAlpnFromClientHello selects by server preference" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{13} ** 32;
+    const cipher_suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const alpn_wire = [_]u8{ 0x00, 0x06, 0x02, 'h', '2', 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_wire,
+        },
+    };
+
+    const client_hello = handshake_mod.ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+    const payload = try client_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    const supported = [_][]const u8{ "h3", "h2" };
+    const selected = try TlsContext.selectServerAlpnFromClientHello(payload, &supported);
+    try std.testing.expectEqualStrings("h3", selected);
+}
+
+test "selectServerAlpnFromClientHello rejects duplicate ALPN extension" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{14} ** 32;
+    const cipher_suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const alpn_h3 = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    const alpn_h2 = [_]u8{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h3 },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h2 },
+    };
+
+    const client_hello = handshake_mod.ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+    const payload = try client_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.selectServerAlpnFromClientHello(payload, &supported));
+}
+
+test "encodeSelectedAlpnExtensionData emits wire format" {
+    const allocator = std.testing.allocator;
+    const payload = try TlsContext.encodeSelectedAlpnExtensionData(allocator, "h3");
+    defer allocator.free(payload);
+
+    const expected = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    try std.testing.expectEqualSlices(u8, &expected, payload);
+}
+
+test "buildServerHelloFromClientHello selects ALPN and stores client TP" {
+    const allocator = std.testing.allocator;
+
+    var client_ctx = TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    client_tp.initial_max_data = 3333;
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{ "h2", "h3" };
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    var server_ctx = TlsContext.init(allocator, false);
+    defer server_ctx.deinit();
+
+    var server_tp = transport_params_mod.TransportParams.defaultServer();
+    server_tp.initial_max_data = 4444;
+    const server_tp_encoded = try server_tp.encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const supported = [_][]const u8{"h3"};
+    const server_hello = try server_ctx.buildServerHelloFromClientHello(client_hello, &supported, server_tp_encoded);
+    defer allocator.free(server_hello);
+
+    const parsed = try handshake_mod.parseServerHello(server_hello);
+    const alpn = try handshake_mod.findUniqueExtension(parsed.extensions, @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation));
+    try std.testing.expect(alpn != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x03, 0x02, 'h', '3' }, alpn.?);
+
+    const server_tp_ext = try handshake_mod.findUniqueExtension(parsed.extensions, @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters));
+    try std.testing.expect(server_tp_ext != null);
+    try std.testing.expectEqualSlices(u8, server_tp_encoded, server_tp_ext.?);
+
+    try std.testing.expect(server_ctx.getSelectedAlpn() != null);
+    try std.testing.expectEqualStrings("h3", server_ctx.getSelectedAlpn().?);
+    try std.testing.expect(server_ctx.getPeerTransportParams() != null);
+    try std.testing.expectEqualSlices(u8, client_tp_encoded, server_ctx.getPeerTransportParams().?);
+}
+
+test "buildServerHelloFromClientHello fails on ALPN no-overlap" {
+    const allocator = std.testing.allocator;
+
+    var client_ctx = TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+
+    const client_tp_encoded = try transport_params_mod.TransportParams.defaultClient().encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{"h2"};
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    var server_ctx = TlsContext.init(allocator, false);
+    defer server_ctx.deinit();
+
+    const server_tp_encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(server_tp_encoded);
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(
+        error.AlpnMismatch,
+        server_ctx.buildServerHelloFromClientHello(client_hello, &supported, server_tp_encoded),
+    );
+}
+
+test "Client handshake ALPN offer rejects zero-length protocol" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const alpn = [_][]const u8{""};
+    try std.testing.expectError(
+        error.HandshakeFailed,
+        ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_params),
+    );
+}
+
+test "Process ServerHello accepts max-length ALPN protocol id" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var max_proto: [255]u8 = undefined;
+    @memset(&max_proto, 'a');
+
+    const offered = [_][]const u8{max_proto[0..]};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &offered, encoded_params);
+    defer allocator.free(client_hello);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload = try allocator.alloc(u8, 258);
+    defer allocator.free(alpn_payload);
+    alpn_payload[0] = 0x01;
+    alpn_payload[1] = 0x00;
+    alpn_payload[2] = 0xFF;
+    @memcpy(alpn_payload[3..258], max_proto[0..]);
+
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{55} ** 32;
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try ctx.processServerHello(server_hello);
+    try std.testing.expect(ctx.getSelectedAlpn() != null);
+    try std.testing.expectEqual(@as(usize, 255), ctx.getSelectedAlpn().?.len);
 }
 
 test "Complete handshake flow" {

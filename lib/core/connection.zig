@@ -122,6 +122,13 @@ pub const Connection = struct {
             conn.streams.next_client_bidi = 4;
         }
 
+        conn.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+        conn.streams.setLocalReceiveStreamDataLimits(
+            params.initial_max_stream_data_bidi_local,
+            params.initial_max_stream_data_bidi_remote,
+            params.initial_max_stream_data_uni,
+        );
+
         return conn;
     }
 
@@ -166,6 +173,13 @@ pub const Connection = struct {
             conn.streams.next_server_bidi = 5;
         }
 
+        conn.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+        conn.streams.setLocalReceiveStreamDataLimits(
+            params.initial_max_stream_data_bidi_local,
+            params.initial_max_stream_data_bidi_remote,
+            params.initial_max_stream_data_uni,
+        );
+
         return conn;
     }
 
@@ -193,8 +207,11 @@ pub const Connection = struct {
             (if (self.is_server) types.StreamType.server_uni else types.StreamType.client_uni);
 
         return self.streams.createStream(stream_type) catch |err| {
-            std.log.err("Failed to create stream: {}", .{err});
-            return error.StreamError;
+            return switch (err) {
+                error.StreamLimitReached => error.StreamError,
+                error.InvalidStreamType => error.StreamError,
+                else => error.StreamError,
+            };
         };
     }
 
@@ -279,7 +296,13 @@ pub const Connection = struct {
 
     /// Check connection-level flow control
     pub fn checkFlowControl(self: *Connection, additional_data: u64) Error!void {
-        if (self.data_sent + additional_data > self.max_data_remote) {
+        if (self.data_sent >= self.max_data_remote) {
+            if (additional_data > 0) return error.FlowControlError;
+            return;
+        }
+
+        const remaining = self.max_data_remote - self.data_sent;
+        if (additional_data > remaining) {
             return error.FlowControlError;
         }
     }
@@ -331,6 +354,12 @@ pub const Connection = struct {
     pub fn setRemoteParams(self: *Connection, params: TransportParameters) void {
         self.remote_params = params;
         self.max_data_remote = params.initial_max_data;
+        self.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+        self.streams.setRemoteStreamDataLimits(
+            params.initial_max_stream_data_bidi_local,
+            params.initial_max_stream_data_bidi_remote,
+            params.initial_max_stream_data_uni,
+        );
     }
 
     /// Process received ACK
@@ -630,6 +659,108 @@ test "connection flow control" {
     try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(conn.max_data_remote + 1));
 }
 
+test "connection flow control exact boundary is allowed" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.data_sent = conn.max_data_remote - 10;
+    try conn.checkFlowControl(10);
+    try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(11));
+}
+
+test "connection flow control handles saturated sent counter safely" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.data_sent = conn.max_data_remote;
+    try conn.checkFlowControl(0);
+    try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(1));
+}
+
+test "connection send budget follows max_data updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    // Isolate flow-control budget from congestion budget.
+    conn.congestion_controller.congestion_window = std.math.maxInt(u64);
+
+    var remote = TransportParameters{};
+    remote.initial_max_data = 2000;
+    conn.setRemoteParams(remote);
+
+    try std.testing.expectEqual(@as(u64, 2000), conn.availableSendBudget());
+
+    conn.updateDataSent(1500);
+    try std.testing.expectEqual(@as(u64, 500), conn.availableSendBudget());
+
+    // Increasing max_data increases budget by the same delta.
+    remote.initial_max_data = 2600;
+    conn.setRemoteParams(remote);
+    try std.testing.expectEqual(@as(u64, 1100), conn.availableSendBudget());
+
+    // Reducing max_data clamps budget to zero when below data_sent.
+    remote.initial_max_data = 1200;
+    conn.setRemoteParams(remote);
+    try std.testing.expectEqual(@as(u64, 0), conn.availableSendBudget());
+}
+
+test "connection applies remote stream limits" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var remote = TransportParameters{};
+    remote.initial_max_streams_bidi = 1;
+    remote.initial_max_streams_uni = 0;
+    conn.setRemoteParams(remote);
+
+    _ = try conn.openStream(true);
+    try std.testing.expectError(error.StreamError, conn.openStream(true));
+    try std.testing.expectError(error.StreamError, conn.openStream(false));
+}
+
+test "connection applies remote per-stream data limits" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var remote = TransportParameters{};
+    remote.initial_max_stream_data_bidi_remote = 4;
+    conn.setRemoteParams(remote);
+
+    const stream_id = try conn.openStream(true);
+    const s = conn.getStream(stream_id).?;
+
+    try std.testing.expectEqual(@as(u64, 4), s.max_stream_data_remote);
+    try std.testing.expectEqual(@as(usize, 4), try s.write("abcdef"));
+}
+
 test "connection send budget tracks congestion window" {
     const allocator = std.testing.allocator;
 
@@ -737,6 +868,48 @@ test "connection schedules PTO probe" {
     try std.testing.expect(probe != null);
     try std.testing.expect(probe.?.is_probe);
     try std.testing.expect(conn.pto_count > 0);
+}
+
+test "pto counter resets when acked packet is in flight" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+
+    const original_deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(original_deadline.add(1));
+    try std.testing.expect(conn.pto_count > 0);
+
+    conn.processAckDetailed(1, 0);
+
+    try std.testing.expectEqual(@as(u32, 0), conn.pto_count);
+    try std.testing.expect(conn.next_pto_at != null);
+}
+
+test "non ack-eliciting packet does not arm PTO" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    try std.testing.expect(conn.next_pto_at == null);
+
+    conn.trackPacketSent(64, false);
+    try std.testing.expect(conn.next_pto_at == null);
+
+    conn.trackPacketSent(64, true);
+    try std.testing.expect(conn.next_pto_at != null);
 }
 
 test "recovery handles packet reordering without spurious retransmit" {

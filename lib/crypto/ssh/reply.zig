@@ -1,6 +1,7 @@
 const std = @import("std");
 const varint = @import("../../utils/varint.zig");
 const obfuscation = @import("obfuscation.zig");
+const transport_params = @import("../../core/transport_params.zig");
 
 /// SSH_QUIC_REPLY packet (Section 2.9)
 ///
@@ -26,7 +27,6 @@ const obfuscation = @import("obfuscation.zig");
 ///   uint32      0 (no version selected)
 ///   string      error-reason
 ///   byte[0..]   padding
-
 pub const SSH_QUIC_REPLY: u8 = 2;
 pub const SSH_QUIC_ERROR_REPLY: u8 = 254;
 
@@ -39,6 +39,7 @@ pub const ReplyError = error{
     EncodingFailed,
     DecodingFailed,
     AmplificationLimitExceeded,
+    InvalidTransportParameters,
     OutOfMemory,
 } || varint.VarintError || obfuscation.ObfuscationError;
 
@@ -71,6 +72,8 @@ pub const SshQuicReply = struct {
     /// Encode SSH_QUIC_REPLY into buffer (unencrypted payload)
     pub fn encode(self: SshQuicReply, buf: []u8, max_size: usize) ReplyError!usize {
         var pos: usize = 0;
+
+        self.validateTransportParams() catch return error.InvalidTransportParameters;
 
         // Packet type
         if (buf.len < 1) return error.BufferTooSmall;
@@ -173,6 +176,10 @@ pub const SshQuicReply = struct {
         }
 
         return pos;
+    }
+
+    fn validateTransportParams(self: SshQuicReply) transport_params.TransportParamsError!void {
+        _ = try transport_params.TransportParams.decode(std.heap.page_allocator, self.transport_params);
     }
 
     /// Encode and encrypt SSH_QUIC_REPLY into obfuscated envelope
@@ -393,4 +400,27 @@ test "SSH_QUIC_ERROR_REPLY encode and encrypt" {
 
     // Verify high bit of nonce is set
     try std.testing.expect((buf[0] & 0x80) != 0);
+}
+
+test "SSH_QUIC_REPLY rejects invalid transport params" {
+    const sig_algs = [_][]const u8{"ssh-ed25519"};
+    const kex_algs = [_]ServerKexAlgorithm{
+        .{ .name = "curve25519-sha256", .data = "" },
+    };
+
+    // active_connection_id_limit encoded as 1 is invalid (<2).
+    const invalid_transport_params = [_]u8{ 0x0e, 0x01, 0x01 };
+
+    const reply = SshQuicReply{
+        .server_connection_id = &[_]u8{ 9, 10, 11, 12 },
+        .server_quic_version = 0x00000001,
+        .transport_params = &invalid_transport_params,
+        .signature_algorithms = &sig_algs,
+        .kex_algorithms = &kex_algs,
+        .cipher_suite = "TLS_AES_256_GCM_SHA384",
+        .extensions = &[_]ExtensionPair{},
+    };
+
+    var buf: [2048]u8 = undefined;
+    try std.testing.expectError(error.InvalidTransportParameters, reply.encode(&buf, 2048));
 }

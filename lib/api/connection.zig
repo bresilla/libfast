@@ -8,11 +8,33 @@ const crypto_mod = @import("../crypto/crypto.zig");
 const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
+const transport_params_mod = @import("../core/transport_params.zig");
+const tls_context_mod = @import("../crypto/tls/tls_context.zig");
+const tls_handshake_mod = @import("../crypto/tls/handshake.zig");
 const varint = @import("../utils/varint.zig");
 const time_mod = @import("../utils/time.zig");
 
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 const CLOSE_REASON_MAX_LEN: usize = 256;
+
+const PacketSpace = enum {
+    initial,
+    handshake,
+    zero_rtt,
+    retry,
+    application,
+};
+
+const ParsedHeader = struct {
+    consumed: usize,
+    packet_space: PacketSpace,
+};
+
+const TlsFailureStage = enum {
+    server_hello,
+    client_hello,
+    complete,
+};
 
 /// Public QUIC connection handle
 pub const QuicConnection = struct {
@@ -29,6 +51,9 @@ pub const QuicConnection = struct {
     // Crypto context
     crypto_ctx: ?*crypto_mod.CryptoContext,
 
+    // TLS handshake context (TLS mode)
+    tls_ctx: ?*tls_context_mod.TlsContext,
+
     // Event queue
     events: std.ArrayList(types_mod.ConnectionEvent),
 
@@ -38,6 +63,12 @@ pub const QuicConnection = struct {
     // Basic packet visibility counters
     packets_received: u64,
     packets_invalid: u64,
+
+    // Negotiated protocol metadata
+    negotiated_alpn: ?[]const u8,
+
+    // TLS integrated handshake progression marker
+    tls_server_hello_applied: bool,
 
     // Connection close state tracking
     close_reason_buf: [CLOSE_REASON_MAX_LEN]u8,
@@ -68,10 +99,13 @@ pub const QuicConnection = struct {
             .internal_conn = null,
             .socket = null,
             .crypto_ctx = null,
+            .tls_ctx = null,
             .events = .{},
             .remote_addr = null,
             .packets_received = 0,
             .packets_invalid = 0,
+            .negotiated_alpn = null,
+            .tls_server_hello_applied = false,
             .close_reason_buf = [_]u8{0} ** CLOSE_REASON_MAX_LEN,
             .close_reason_len = 0,
             .close_error_code = 0,
@@ -115,7 +149,7 @@ pub const QuicConnection = struct {
         return DEFAULT_SHORT_HEADER_DCID_LEN;
     }
 
-    fn decodePacketHeader(self: *QuicConnection, packet: []const u8) types_mod.QuicError!usize {
+    fn decodePacketHeader(self: *QuicConnection, packet: []const u8) types_mod.QuicError!ParsedHeader {
         if (packet.len == 0) {
             return types_mod.QuicError.InvalidPacket;
         }
@@ -126,14 +160,23 @@ pub const QuicConnection = struct {
             const result = packet_mod.LongHeader.decode(packet) catch {
                 return types_mod.QuicError.InvalidPacket;
             };
-            return result.consumed;
+
+            const space: PacketSpace = switch (result.header.packet_type) {
+                .initial => .initial,
+                .handshake => .handshake,
+                .zero_rtt => .zero_rtt,
+                .retry => .retry,
+                else => .application,
+            };
+
+            return .{ .consumed = result.consumed, .packet_space = space };
         }
 
         const dcid_len = self.shortHeaderDcidLen();
         const result = packet_mod.ShortHeader.decode(packet, dcid_len) catch {
             return types_mod.QuicError.InvalidPacket;
         };
-        return result.consumed;
+        return .{ .consumed = result.consumed, .packet_space = .application };
     }
 
     fn queueProtocolViolation(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
@@ -141,10 +184,257 @@ pub const QuicConnection = struct {
             return;
         }
 
-        try self.enterDraining(1, reason);
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), reason);
     }
 
-    fn routeFrame(self: *QuicConnection, payload: []const u8) types_mod.QuicError!void {
+    fn queueTransportParameterError(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.transport_parameter_error), reason);
+    }
+
+    fn queueFlowControlError(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.flow_control_error), reason);
+    }
+
+    fn queueTlsFailure(self: *QuicConnection, stage: TlsFailureStage, err: anyerror) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        switch (err) {
+            tls_context_mod.TlsError.AlpnMismatch => {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.connection_refused), "alpn mismatch");
+            },
+            tls_context_mod.TlsError.UnsupportedCipherSuite => {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.connection_refused), "tls unsupported cipher suite");
+            },
+            tls_context_mod.TlsError.OutOfMemory => {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.internal_error), "tls internal allocation failure");
+            },
+            else => {
+                const reason = switch (stage) {
+                    .server_hello => "tls server hello rejected",
+                    .client_hello => "tls client hello rejected",
+                    .complete => "tls handshake completion failed",
+                };
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), reason);
+            },
+        }
+    }
+
+    fn transitionToEstablished(self: *QuicConnection) types_mod.QuicError!void {
+        if (self.state != .connecting) {
+            return;
+        }
+
+        const negotiation = self.buildNegotiationResult();
+        if (negotiation.mode == .tls and !negotiation.ready_for_establish) {
+            return;
+        }
+
+        const conn = self.internal_conn orelse return;
+        conn.markEstablished();
+
+        if (self.tls_ctx) |tls_ctx| {
+            self.negotiated_alpn = tls_ctx.getSelectedAlpn();
+        }
+
+        self.state = .established;
+        try self.events.append(self.allocator, .{ .connected = .{ .alpn = self.negotiated_alpn } });
+    }
+
+    fn isTlsNegotiatedForEstablish(self: *const QuicConnection) bool {
+        const negotiation = self.buildNegotiationResult();
+        return negotiation.mode == .tls and negotiation.ready_for_establish;
+    }
+
+    fn negotiationMode(self: *const QuicConnection) types_mod.NegotiationMode {
+        return switch (self.config.mode) {
+            .tls => .tls,
+            .ssh => .ssh,
+        };
+    }
+
+    fn buildNegotiationResult(self: *const QuicConnection) types_mod.NegotiationResult {
+        const mode = self.negotiationMode();
+
+        const has_peer_transport_params = blk: {
+            const conn = self.internal_conn orelse break :blk false;
+            break :blk conn.remote_params != null;
+        };
+
+        const tls_handshake_complete = blk: {
+            if (mode != .tls) break :blk false;
+            const tls_ctx = self.tls_ctx orelse break :blk false;
+            break :blk tls_ctx.state.isComplete();
+        };
+
+        const ready_for_establish = switch (mode) {
+            .tls => has_peer_transport_params and self.tls_server_hello_applied and tls_handshake_complete,
+            .ssh => has_peer_transport_params,
+        };
+
+        return .{
+            .mode = mode,
+            .has_peer_transport_params = has_peer_transport_params,
+            .tls_server_hello_applied = self.tls_server_hello_applied,
+            .tls_handshake_complete = tls_handshake_complete,
+            .selected_alpn = self.negotiated_alpn,
+            .ready_for_establish = ready_for_establish,
+        };
+    }
+
+    fn validateFrameAllowedInState(self: *QuicConnection, frame_type: u64) types_mod.QuicError!void {
+        if (self.state != .connecting) {
+            return;
+        }
+
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        switch (frame_type) {
+            0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 => {
+                return types_mod.QuicError.ProtocolViolation;
+            },
+            else => {},
+        }
+    }
+
+    fn validateFrameAllowedInPacketSpace(self: *QuicConnection, frame_type: u64, packet_space: PacketSpace) types_mod.QuicError!void {
+        _ = self;
+
+        if (isReservedFrameType(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (packet_space == .retry) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (packet_space == .application) {
+            if (frame_type == 0x06) {
+                return types_mod.QuicError.ProtocolViolation;
+            }
+            return;
+        }
+
+        if (packet_space == .initial or packet_space == .handshake) {
+            if (frame_type == 0x00 or frame_type == 0x01 or frame_type == 0x06 or frame_type == 0x1c or frame_type == 0x1d) {
+                return;
+            }
+            if (frame_type == 0x02 or frame_type == 0x03) {
+                return;
+            }
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (packet_space == .zero_rtt) {
+            if (frame_type == 0x00 or frame_type == 0x01 or frame_type == 0x1c or frame_type == 0x1d) {
+                return;
+            }
+
+            if (core_types.FrameType.isStreamFrame(frame_type)) {
+                return;
+            }
+
+            return switch (frame_type) {
+                0x04,
+                0x05, // RESET_STREAM, STOP_SENDING
+                0x10,
+                0x11, // MAX_DATA, MAX_STREAM_DATA
+                0x12,
+                0x13, // MAX_STREAMS
+                0x14,
+                0x15, // DATA_BLOCKED, STREAM_DATA_BLOCKED
+                0x16,
+                0x17, // STREAMS_BLOCKED
+                => {},
+                else => types_mod.QuicError.ProtocolViolation,
+            };
+        }
+
+        if (frame_type == 0x01 or frame_type == 0x1c or frame_type == 0x1d) {
+            return;
+        }
+
+        if (frame_type == 0x02 or frame_type == 0x03) {
+            if (packet_space == .zero_rtt) return types_mod.QuicError.ProtocolViolation;
+            return;
+        }
+
+        if (packet_space == .zero_rtt and frame_type == 0x06) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (packet_space != .application and (frame_type == 0x07 or frame_type == 0x18 or frame_type == 0x19 or frame_type == 0x1e)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (!isKnownFrameType(frame_type) and packet_space != .application) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        switch (frame_type) {
+            0x04, 0x05, 0x1a, 0x1b => return types_mod.QuicError.ProtocolViolation,
+            else => {},
+        }
+    }
+
+    fn isKnownFrameType(frame_type: u64) bool {
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            return true;
+        }
+
+        return switch (frame_type) {
+            0x00, // PADDING
+            0x01, // PING
+            0x02,
+            0x03, // ACK
+            0x04, // RESET_STREAM
+            0x05, // STOP_SENDING
+            0x06, // CRYPTO
+            0x07, // NEW_TOKEN
+            0x10, // MAX_DATA
+            0x11, // MAX_STREAM_DATA
+            0x12,
+            0x13, // MAX_STREAMS
+            0x14, // DATA_BLOCKED
+            0x15, // STREAM_DATA_BLOCKED
+            0x16,
+            0x17, // STREAMS_BLOCKED
+            0x18, // NEW_CONNECTION_ID
+            0x19, // RETIRE_CONNECTION_ID
+            0x1a, // PATH_CHALLENGE
+            0x1b, // PATH_RESPONSE
+            0x1c,
+            0x1d, // CONNECTION_CLOSE
+            0x1e, // HANDSHAKE_DONE
+            => true,
+            else => false,
+        };
+    }
+
+    fn isReservedFrameType(frame_type: u64) bool {
+        if (frame_type < 0x1f) {
+            return false;
+        }
+
+        return (frame_type & 0x1f) == 0x1f;
+    }
+
+    fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!void {
         if (payload.len == 0) return;
 
         const frame_type_result = varint.decode(payload) catch {
@@ -152,6 +442,9 @@ pub const QuicConnection = struct {
         };
 
         const frame_type = frame_type_result.value;
+
+        try self.validateFrameAllowedInState(frame_type);
+        try self.validateFrameAllowedInPacketSpace(frame_type, packet_space);
 
         if (core_types.FrameType.isStreamFrame(frame_type)) {
             const decoded = frame_mod.StreamFrame.decode(payload) catch {
@@ -162,8 +455,12 @@ pub const QuicConnection = struct {
                 return types_mod.QuicError.StreamError;
             };
 
-            stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch {
-                return types_mod.QuicError.InvalidPacket;
+            stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch |err| {
+                return switch (err) {
+                    error.FlowControlError => types_mod.QuicError.FlowControlError,
+                    error.OutOfOrderData, error.StreamClosed => types_mod.QuicError.ProtocolViolation,
+                    else => types_mod.QuicError.InvalidPacket,
+                };
             };
 
             try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
@@ -246,6 +543,21 @@ pub const QuicConnection = struct {
         }
     }
 
+    fn encodeLocalTransportParams(self: *QuicConnection) types_mod.QuicError![]u8 {
+        var params = transport_params_mod.TransportParams.init();
+        params.max_idle_timeout = self.config.max_idle_timeout;
+        params.initial_max_data = self.config.initial_max_data;
+        params.initial_max_stream_data_bidi_local = self.config.initial_max_stream_data_bidi_local;
+        params.initial_max_stream_data_bidi_remote = self.config.initial_max_stream_data_bidi_remote;
+        params.initial_max_stream_data_uni = self.config.initial_max_stream_data_uni;
+        params.initial_max_streams_bidi = self.config.max_bidi_streams;
+        params.initial_max_streams_uni = self.config.max_uni_streams;
+
+        return params.encode(self.allocator) catch {
+            return types_mod.QuicError.InvalidConfig;
+        };
+    }
+
     /// Start connecting (client only)
     pub fn connect(
         self: *QuicConnection,
@@ -323,6 +635,30 @@ pub const QuicConnection = struct {
         };
         self.internal_conn = internal_conn;
 
+        if (self.config.mode == .tls) {
+            const tls_cfg = self.config.tls_config orelse return types_mod.QuicError.MissingTlsConfig;
+
+            const encoded_tp = try self.encodeLocalTransportParams();
+            defer self.allocator.free(encoded_tp);
+
+            const tls_ctx = try self.allocator.create(tls_context_mod.TlsContext);
+            errdefer self.allocator.destroy(tls_ctx);
+            tls_ctx.* = tls_context_mod.TlsContext.init(self.allocator, true);
+
+            const client_hello = tls_ctx.startClientHandshakeWithParams(
+                tls_cfg.server_name,
+                tls_cfg.alpn_protocols,
+                encoded_tp,
+            ) catch {
+                tls_ctx.deinit();
+                return types_mod.QuicError.HandshakeFailed;
+            };
+            defer self.allocator.free(client_hello);
+
+            self.tls_ctx = tls_ctx;
+            self.tls_server_hello_applied = false;
+        }
+
         self.state = .connecting;
     }
 
@@ -378,8 +714,13 @@ pub const QuicConnection = struct {
         self: *QuicConnection,
         bidirectional: bool,
     ) types_mod.QuicError!types_mod.StreamId {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
+        }
+
+        const caps = self.getModeCapabilities();
+        if (!bidirectional and !caps.supports_unidirectional_streams) {
+            return types_mod.QuicError.StreamError;
         }
 
         if (self.internal_conn == null) {
@@ -409,7 +750,7 @@ pub const QuicConnection = struct {
         data: []const u8,
         finish: types_mod.StreamFinish,
     ) types_mod.QuicError!usize {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -448,7 +789,7 @@ pub const QuicConnection = struct {
         stream_id: types_mod.StreamId,
         buffer: []u8,
     ) types_mod.QuicError!usize {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -471,7 +812,7 @@ pub const QuicConnection = struct {
         stream_id: types_mod.StreamId,
         error_code: u64,
     ) types_mod.QuicError!void {
-        if (self.state != .established) {
+        if (!self.isHandshakeNegotiated()) {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
@@ -558,12 +899,6 @@ pub const QuicConnection = struct {
             conn.onPtoTimeout(time_mod.Instant.now());
         }
 
-        // Transition from connecting to established (simplified handshake)
-        if (self.state == .connecting) {
-            self.state = .established;
-            try self.events.append(self.allocator, .{ .connected = {} });
-        }
-
         // Process at most one received datagram
         if (self.socket) |socket| {
             var recv_buffer: [4096]u8 = undefined;
@@ -581,20 +916,153 @@ pub const QuicConnection = struct {
                 conn.updateDataReceived(packet.len);
             }
 
-            const header_len = self.decodePacketHeader(packet) catch {
+            const header = self.decodePacketHeader(packet) catch {
                 self.packets_invalid += 1;
                 try self.queueProtocolViolation("invalid packet header");
                 return;
             };
 
-            if (header_len >= packet.len) return;
+            if (header.consumed >= packet.len) return;
 
-            self.routeFrame(packet[header_len..]) catch {
+            try self.transitionToEstablished();
+
+            self.routeFrame(packet[header.consumed..], header.packet_space) catch |err| {
                 self.packets_invalid += 1;
+                if (err == types_mod.QuicError.ProtocolViolation) {
+                    try self.queueProtocolViolation("frame not allowed in current context");
+                    return;
+                }
+
+                if (err == types_mod.QuicError.FlowControlError) {
+                    try self.queueFlowControlError("stream flow control exceeded");
+                    return;
+                }
+
                 try self.queueProtocolViolation("invalid frame payload");
                 return;
             };
         }
+    }
+
+    /// Decode and apply peer transport parameters.
+    ///
+    /// Both TLS and SSH-like handshake code paths can call this once peer
+    /// transport parameters are available. Invalid transport parameters
+    /// transition the connection into draining with transport_parameter_error.
+    pub fn applyPeerTransportParams(self: *QuicConnection, encoded_params: []const u8) types_mod.QuicError!void {
+        const decoded = transport_params_mod.TransportParams.decode(self.allocator, encoded_params) catch {
+            try self.queueTransportParameterError("invalid peer transport params");
+            return types_mod.QuicError.ProtocolViolation;
+        };
+
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+
+        conn.setRemoteParams(.{
+            .max_idle_timeout = decoded.max_idle_timeout,
+            .max_udp_payload_size = decoded.max_udp_payload_size,
+            .initial_max_data = decoded.initial_max_data,
+            .initial_max_stream_data_bidi_local = decoded.initial_max_stream_data_bidi_local,
+            .initial_max_stream_data_bidi_remote = decoded.initial_max_stream_data_bidi_remote,
+            .initial_max_stream_data_uni = decoded.initial_max_stream_data_uni,
+            .initial_max_streams_bidi = decoded.initial_max_streams_bidi,
+            .initial_max_streams_uni = decoded.initial_max_streams_uni,
+            .ack_delay_exponent = decoded.ack_delay_exponent,
+            .max_ack_delay = decoded.max_ack_delay,
+            .disable_active_migration = decoded.disable_active_migration,
+            .active_connection_id_limit = decoded.active_connection_id_limit,
+        });
+    }
+
+    /// Processes TLS ServerHello, completes TLS handshake, and applies peer
+    /// QUIC transport parameters carried in TLS extensions.
+    pub fn processTlsServerHello(self: *QuicConnection, server_hello_data: []const u8, shared_secret: []const u8) types_mod.QuicError!void {
+        if (self.config.mode != .tls) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        const tls_ctx = self.tls_ctx orelse return types_mod.QuicError.InvalidState;
+
+        tls_ctx.processServerHello(server_hello_data) catch |err| {
+            try self.queueTlsFailure(.server_hello, err);
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        tls_ctx.completeHandshake(shared_secret) catch |err| {
+            try self.queueTlsFailure(.complete, err);
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        const peer_tp = tls_ctx.getPeerTransportParams() orelse {
+            try self.queueTransportParameterError("missing peer transport params in tls extensions");
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        try self.applyPeerTransportParams(peer_tp);
+        self.tls_server_hello_applied = true;
+    }
+
+    /// Processes a TLS ClientHello in server mode and returns an encoded
+    /// ServerHello response generated from server policy.
+    pub fn processTlsClientHello(
+        self: *QuicConnection,
+        client_hello_data: []const u8,
+        server_supported_alpn: []const []const u8,
+    ) types_mod.QuicError![]u8 {
+        if (self.config.mode != .tls) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        if (self.config.role != .server) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        const tls_cfg = self.config.tls_config orelse return types_mod.QuicError.MissingTlsConfig;
+
+        const tls_ctx = if (self.tls_ctx) |ctx|
+            ctx
+        else blk: {
+            const created = try self.allocator.create(tls_context_mod.TlsContext);
+            created.* = tls_context_mod.TlsContext.init(self.allocator, false);
+            self.tls_ctx = created;
+            break :blk created;
+        };
+
+        const server_tp = try self.encodeLocalTransportParams();
+        defer self.allocator.free(server_tp);
+
+        const server_hello = tls_ctx.buildServerHelloFromClientHello(
+            client_hello_data,
+            if (server_supported_alpn.len > 0) server_supported_alpn else tls_cfg.alpn_protocols,
+            server_tp,
+        ) catch |err| {
+            try self.queueTlsFailure(.client_hello, err);
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        const peer_tp = tls_ctx.getPeerTransportParams() orelse {
+            try self.queueTransportParameterError("missing peer transport params in tls client hello");
+            self.allocator.free(server_hello);
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        try self.applyPeerTransportParams(peer_tp);
+        self.tls_server_hello_applied = true;
+
+        return server_hello;
+    }
+
+    /// Completes TLS key schedule on either client or server side after
+    /// ServerHello processing is done.
+    pub fn completeTlsHandshake(self: *QuicConnection, shared_secret: []const u8) types_mod.QuicError!void {
+        if (self.config.mode != .tls) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        const tls_ctx = self.tls_ctx orelse return types_mod.QuicError.InvalidState;
+        tls_ctx.completeHandshake(shared_secret) catch |err| {
+            try self.queueTlsFailure(.complete, err);
+            return types_mod.QuicError.HandshakeFailed;
+        };
     }
 
     /// Get next connection event
@@ -622,6 +1090,66 @@ pub const QuicConnection = struct {
     /// Get connection state
     pub fn getState(self: *QuicConnection) types_mod.ConnectionState {
         return self.state;
+    }
+
+    /// Returns negotiated ALPN protocol when available.
+    pub fn getNegotiatedAlpn(self: *const QuicConnection) ?[]const u8 {
+        return self.negotiated_alpn;
+    }
+
+    /// Returns true when handshake negotiation is complete enough to gate app traffic.
+    ///
+    /// For TLS mode this requires:
+    /// - connection established state
+    /// - TLS handshake complete
+    /// - peer transport parameters applied
+    ///
+    /// For SSH mode this requires:
+    /// - connection established state
+    /// - peer transport parameters applied
+    pub fn isHandshakeNegotiated(self: *const QuicConnection) bool {
+        if (self.state != .established) {
+            return false;
+        }
+
+        const caps = self.getModeCapabilities();
+        const negotiation = self.buildNegotiationResult();
+        if (!negotiation.has_peer_transport_params and caps.requires_peer_transport_params) {
+            return false;
+        }
+
+        if (negotiation.mode == .tls and caps.requires_integrated_tls_server_hello and !negotiation.tls_server_hello_applied) {
+            return false;
+        }
+
+        return negotiation.ready_for_establish;
+    }
+
+    pub fn getModeCapabilities(self: *const QuicConnection) types_mod.ModeCapabilities {
+        return types_mod.ModeCapabilities.forMode(self.negotiationMode());
+    }
+
+    pub fn getNegotiationResult(self: *const QuicConnection) types_mod.NegotiationResult {
+        return self.buildNegotiationResult();
+    }
+
+    /// Returns a point-in-time negotiation snapshot.
+    pub fn getNegotiationSnapshot(self: *const QuicConnection) ?types_mod.NegotiationSnapshot {
+        const conn = self.internal_conn orelse return null;
+        const remote_params = conn.remote_params orelse core_types.TransportParameters{};
+
+        const mode = self.negotiationMode();
+
+        return .{
+            .mode = mode,
+            .is_established = self.state == .established,
+            .alpn = self.negotiated_alpn,
+            .peer_max_idle_timeout = remote_params.max_idle_timeout,
+            .peer_max_udp_payload_size = remote_params.max_udp_payload_size,
+            .peer_initial_max_data = remote_params.initial_max_data,
+            .peer_initial_max_streams_bidi = remote_params.initial_max_streams_bidi,
+            .peer_initial_max_streams_uni = remote_params.initial_max_streams_uni,
+        };
     }
 
     /// Close the connection gracefully
@@ -662,12 +1190,67 @@ pub const QuicConnection = struct {
             self.allocator.destroy(ctx);
         }
 
+        if (self.tls_ctx) |ctx| {
+            ctx.deinit();
+            self.allocator.destroy(ctx);
+        }
+
         self.events.deinit(self.allocator);
         self.state = .closed;
     }
 };
 
 // Tests
+
+fn applyDefaultPeerTransportParams(conn: *QuicConnection, allocator: std.mem.Allocator) !void {
+    const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+}
+
+fn applyPeerTransportParamsWithLimits(conn: *QuicConnection, allocator: std.mem.Allocator, max_bidi: u64, max_uni: u64) !void {
+    var params = transport_params_mod.TransportParams.defaultServer();
+    params.initial_max_streams_bidi = max_bidi;
+    params.initial_max_streams_uni = max_uni;
+
+    const encoded = try params.encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+}
+
+fn buildTlsServerHelloForTests(
+    allocator: std.mem.Allocator,
+    alpn: []const u8,
+    tp_payload: []const u8,
+) ![]u8 {
+    var alpn_wire: [8]u8 = undefined;
+    if (alpn.len == 0 or alpn.len > 5) return error.InvalidInput;
+
+    alpn_wire[0] = 0x00;
+    alpn_wire[1] = @intCast(alpn.len + 1);
+    alpn_wire[2] = @intCast(alpn.len);
+    @memcpy(alpn_wire[3 .. 3 + alpn.len], alpn);
+
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = alpn_wire[0 .. 3 + alpn.len],
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp_payload,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{61} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+
+    return server_hello.encode(allocator);
+}
 
 test "Create SSH client connection" {
     const allocator = std.testing.allocator;
@@ -689,6 +1272,917 @@ test "Create TLS client connection" {
 
     try std.testing.expectEqual(types_mod.ConnectionState.idle, conn.state);
     try std.testing.expectEqual(config_mod.QuicMode.tls, conn.config.mode);
+}
+
+test "TLS connect wires config ALPN into ClientHello" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    try std.testing.expect(conn.tls_ctx != null);
+    try std.testing.expect(conn.tls_ctx.?.state == .client_hello_sent);
+    try std.testing.expect(std.mem.indexOf(u8, conn.tls_ctx.?.transcript.items, "h3") != null);
+}
+
+test "connected event carries negotiated ALPN metadata" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.initial_max_data = 4096;
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{7} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+    try conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe");
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 9,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01;
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .connected);
+    try std.testing.expect(event.?.connected.alpn != null);
+    try std.testing.expectEqualStrings("h3", event.?.connected.alpn.?);
+    try std.testing.expect(conn.getNegotiatedAlpn() != null);
+    try std.testing.expectEqualStrings("h3", conn.getNegotiatedAlpn().?);
+}
+
+test "TLS connect remains connecting until TLS and transport params negotiated" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 10,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01;
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "processTlsServerHello applies peer transport params from tls extension" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.initial_max_streams_bidi = 1;
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{31} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe");
+    try std.testing.expect(conn.internal_conn.?.remote_params != null);
+    try std.testing.expectEqual(@as(u64, 1), conn.internal_conn.?.remote_params.?.initial_max_streams_bidi);
+}
+
+test "processTlsServerHello rejects missing peer transport params extension" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const random: [32]u8 = [_]u8{32} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "processTlsClientHello builds server hello and applies peer params" {
+    const allocator = std.testing.allocator;
+
+    var server_cfg = config_mod.QuicConfig.tlsServer("cert", "key");
+    var tls_server_cfg = server_cfg.tls_config.?;
+    tls_server_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    server_cfg.tls_config = tls_server_cfg;
+
+    var server_conn = try QuicConnection.init(allocator, server_cfg);
+    defer server_conn.deinit();
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const server_internal = try allocator.create(conn_internal.Connection);
+    server_internal.* = try conn_internal.Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    server_conn.internal_conn = server_internal;
+    server_conn.state = .connecting;
+
+    var client_ctx = tls_context_mod.TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+    var client_tp = transport_params_mod.TransportParams.defaultClient();
+    client_tp.initial_max_data = 7777;
+    const client_tp_encoded = try client_tp.encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{ "h2", "h3" };
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    const server_hello = try server_conn.processTlsClientHello(client_hello, &[_][]const u8{});
+    defer allocator.free(server_hello);
+
+    try std.testing.expect(server_conn.tls_ctx != null);
+    try std.testing.expect(server_conn.tls_ctx.?.getSelectedAlpn() != null);
+    try std.testing.expectEqualStrings("h3", server_conn.tls_ctx.?.getSelectedAlpn().?);
+    try std.testing.expect(server_conn.internal_conn.?.remote_params != null);
+    try std.testing.expectEqual(@as(u64, 7777), server_conn.internal_conn.?.remote_params.?.initial_max_data);
+}
+
+test "processTlsClientHello rejects ALPN no-overlap" {
+    const allocator = std.testing.allocator;
+
+    var server_cfg = config_mod.QuicConfig.tlsServer("cert", "key");
+    var tls_server_cfg = server_cfg.tls_config.?;
+    tls_server_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    server_cfg.tls_config = tls_server_cfg;
+
+    var server_conn = try QuicConnection.init(allocator, server_cfg);
+    defer server_conn.deinit();
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 3, 3, 3, 3 });
+    const server_internal = try allocator.create(conn_internal.Connection);
+    server_internal.* = try conn_internal.Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    server_conn.internal_conn = server_internal;
+    server_conn.state = .connecting;
+
+    var client_ctx = tls_context_mod.TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+    const client_tp_encoded = try transport_params_mod.TransportParams.defaultClient().encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{"h2"};
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        server_conn.processTlsClientHello(client_hello, &[_][]const u8{}),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, server_conn.getState());
+
+    const event = server_conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.connection_refused)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("alpn mismatch", event.?.closing.reason);
+}
+
+test "server-side completeTlsHandshake enables negotiated readiness" {
+    const allocator = std.testing.allocator;
+
+    var server_cfg = config_mod.QuicConfig.tlsServer("cert", "key");
+    var tls_server_cfg = server_cfg.tls_config.?;
+    tls_server_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    server_cfg.tls_config = tls_server_cfg;
+
+    var server_conn = try QuicConnection.init(allocator, server_cfg);
+    defer server_conn.deinit();
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 5, 5, 5 });
+    const server_internal = try allocator.create(conn_internal.Connection);
+    server_internal.* = try conn_internal.Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    server_conn.internal_conn = server_internal;
+    server_conn.state = .connecting;
+
+    var client_ctx = tls_context_mod.TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+    const client_tp_encoded = try transport_params_mod.TransportParams.defaultClient().encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{"h3"};
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    const server_hello = try server_conn.processTlsClientHello(client_hello, &[_][]const u8{});
+    defer allocator.free(server_hello);
+
+    try std.testing.expect(!server_conn.isHandshakeNegotiated());
+    try server_conn.completeTlsHandshake("test-shared-secret-from-ecdhe");
+
+    server_conn.internal_conn.?.markEstablished();
+    server_conn.state = .established;
+    try std.testing.expect(server_conn.isHandshakeNegotiated());
+}
+
+test "processTlsServerHello maps unsupported cipher to connection refused" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const tp = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp);
+
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{91} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = 0x9999,
+        .extensions = &ext,
+    };
+    const payload = try server_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.HandshakeFailed, conn.processTlsServerHello(payload, "test-shared-secret-from-ecdhe"));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.connection_refused)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("tls unsupported cipher suite", event.?.closing.reason);
+}
+
+test "processTlsServerHello rejects malformed ALPN extension payload" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    // Malformed ALPN: list length says 3, but payload has only 2 bytes after header.
+    var malformed_alpn: [4]u8 = .{ 0x00, 0x03, 0x02, 'h' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &malformed_alpn,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{33} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+}
+
+test "processTlsServerHello rejects zero-length selected ALPN protocol" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    const tp = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp);
+
+    // ALPN list length 1 with a zero-length protocol id.
+    var alpn_zero: [3]u8 = .{ 0x00, 0x01, 0x00 };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_zero,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp,
+        },
+    };
+    const random: [32]u8 = [_]u8{36} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "processTlsServerHello rejects invalid transport params extension payload" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    // Invalid transport params payload (truncated varint parameter).
+    const invalid_tp = [_]u8{ 0x03, 0x02, 0x44 };
+
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = &invalid_tp,
+        },
+    };
+    const random: [32]u8 = [_]u8{34} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+}
+
+test "processTlsServerHello surfaces ALPN mismatch reason" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    // Server selects h2 although client only offered h3.
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{35} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.connection_refused)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("alpn mismatch", event.?.closing.reason);
+}
+
+test "processTlsServerHello rejects duplicate ALPN extensions" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    const tp = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp);
+
+    var alpn_h3: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    var alpn_h2: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_h3,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_h2,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{41} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const payload = try server_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.HandshakeFailed, conn.processTlsServerHello(payload, "test-shared-secret-from-ecdhe"));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "processTlsServerHello rejects duplicate transport parameter extensions" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    const tp1 = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp1);
+    var tp_params2 = transport_params_mod.TransportParams.defaultServer();
+    tp_params2.initial_max_data = 12345;
+    const tp2 = try tp_params2.encode(allocator);
+    defer allocator.free(tp2);
+
+    var alpn_h3: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_h3,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp1,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp2,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{42} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const payload = try server_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.HandshakeFailed, conn.processTlsServerHello(payload, "test-shared-secret-from-ecdhe"));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "negotiation snapshot exposes mode ALPN and peer params" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    internal_conn.markEstablished();
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.max_idle_timeout = 12345;
+    encoded.initial_max_data = 45678;
+    encoded.initial_max_streams_bidi = 7;
+    encoded.initial_max_streams_uni = 3;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+    try conn.applyPeerTransportParams(payload);
+
+    conn.negotiated_alpn = "h3";
+
+    const snapshot = conn.getNegotiationSnapshot();
+    try std.testing.expect(snapshot != null);
+    try std.testing.expectEqual(types_mod.NegotiationMode.tls, snapshot.?.mode);
+    try std.testing.expect(snapshot.?.is_established);
+    try std.testing.expect(snapshot.?.alpn != null);
+    try std.testing.expectEqualStrings("h3", snapshot.?.alpn.?);
+    try std.testing.expectEqual(@as(u64, 12345), snapshot.?.peer_max_idle_timeout);
+    try std.testing.expectEqual(@as(u64, 45678), snapshot.?.peer_initial_max_data);
+    try std.testing.expectEqual(@as(u64, 7), snapshot.?.peer_initial_max_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.?.peer_initial_max_streams_uni);
+}
+
+test "isHandshakeNegotiated requires integrated TLS server hello processing" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    const tls_ctx = conn.tls_ctx.?;
+    const random: [32]u8 = [_]u8{11} ** 32;
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try tls_ctx.processServerHello(server_hello_bytes);
+    try tls_ctx.completeHandshake("test-shared-secret-from-ecdhe");
+    const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+
+    // Manual steps are not enough; integrated processing marks completion.
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    var conn2 = try QuicConnection.init(allocator, config);
+    defer conn2.deinit();
+    try conn2.connect("127.0.0.1", 4433);
+    conn2.internal_conn.?.markEstablished();
+    conn2.state = .established;
+
+    var tp_ext = transport_params_mod.TransportParams.defaultServer();
+    const encoded_tp_ext = try tp_ext.encode(allocator);
+    defer allocator.free(encoded_tp_ext);
+    const ext_with_tp = [_]tls_handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_payload },
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = encoded_tp_ext },
+    };
+    const integrated_server_hello = tls_handshake_mod.ServerHello{ .random = random, .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256, .extensions = &ext_with_tp };
+    const integrated_server_hello_bytes = try integrated_server_hello.encode(allocator);
+    defer allocator.free(integrated_server_hello_bytes);
+
+    try conn2.processTlsServerHello(integrated_server_hello_bytes, "test-shared-secret-from-ecdhe");
+    try std.testing.expect(conn2.isHandshakeNegotiated());
+}
+
+test "isHandshakeNegotiated requires peer transport params in SSH mode" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try std.testing.expect(!conn.isHandshakeNegotiated());
+
+    const encoded = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(encoded);
+    try conn.applyPeerTransportParams(encoded);
+
+    try std.testing.expect(conn.isHandshakeNegotiated());
+}
+
+test "mode capabilities reflect tls and ssh modes" {
+    const allocator = std.testing.allocator;
+
+    var tls_conn = try QuicConnection.init(allocator, config_mod.QuicConfig.tlsClient("example.com"));
+    defer tls_conn.deinit();
+
+    const tls_caps = tls_conn.getModeCapabilities();
+    try std.testing.expect(tls_caps.supports_unidirectional_streams);
+    try std.testing.expect(tls_caps.supports_alpn);
+    try std.testing.expect(tls_caps.requires_integrated_tls_server_hello);
+
+    var ssh_conn = try QuicConnection.init(allocator, config_mod.QuicConfig.sshClient("example.com", "secret"));
+    defer ssh_conn.deinit();
+
+    const ssh_caps = ssh_conn.getModeCapabilities();
+    try std.testing.expect(!ssh_caps.supports_unidirectional_streams);
+    try std.testing.expect(!ssh_caps.supports_alpn);
+    try std.testing.expect(!ssh_caps.requires_integrated_tls_server_hello);
+}
+
+test "dual-mode regression stream policy tls vs ssh" {
+    const allocator = std.testing.allocator;
+
+    var tls_cfg = config_mod.QuicConfig.tlsClient("example.com");
+    tls_cfg.tls_config.?.alpn_protocols = &[_][]const u8{"h3"};
+    var tls_conn = try QuicConnection.init(allocator, tls_cfg);
+    defer tls_conn.deinit();
+    try tls_conn.connect("127.0.0.1", 4433);
+
+    var tls_tp = transport_params_mod.TransportParams.defaultServer();
+    tls_tp.initial_max_streams_bidi = 2;
+    tls_tp.initial_max_streams_uni = 1;
+    const tls_tp_encoded = try tls_tp.encode(allocator);
+    defer allocator.free(tls_tp_encoded);
+
+    const server_hello = try buildTlsServerHelloForTests(allocator, "h3", tls_tp_encoded);
+    defer allocator.free(server_hello);
+    try tls_conn.processTlsServerHello(server_hello, "test-shared-secret-from-ecdhe");
+    tls_conn.internal_conn.?.markEstablished();
+    tls_conn.state = .established;
+
+    _ = try tls_conn.openStream(false);
+
+    const ssh_cfg = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var ssh_conn = try QuicConnection.init(allocator, ssh_cfg);
+    defer ssh_conn.deinit();
+    try ssh_conn.connect("127.0.0.1", 4433);
+    ssh_conn.internal_conn.?.markEstablished();
+    ssh_conn.state = .established;
+    try applyPeerTransportParamsWithLimits(&ssh_conn, allocator, 2, 1);
+
+    try std.testing.expectError(types_mod.QuicError.StreamError, ssh_conn.openStream(false));
+}
+
+test "dual-mode regression negotiated stream limits enforced" {
+    const allocator = std.testing.allocator;
+
+    var tls_cfg = config_mod.QuicConfig.tlsClient("example.com");
+    tls_cfg.tls_config.?.alpn_protocols = &[_][]const u8{"h3"};
+    var tls_conn = try QuicConnection.init(allocator, tls_cfg);
+    defer tls_conn.deinit();
+    try tls_conn.connect("127.0.0.1", 4433);
+
+    var tls_tp = transport_params_mod.TransportParams.defaultServer();
+    tls_tp.initial_max_streams_bidi = 1;
+    const tls_tp_encoded = try tls_tp.encode(allocator);
+    defer allocator.free(tls_tp_encoded);
+
+    const server_hello = try buildTlsServerHelloForTests(allocator, "h3", tls_tp_encoded);
+    defer allocator.free(server_hello);
+    try tls_conn.processTlsServerHello(server_hello, "test-shared-secret-from-ecdhe");
+    tls_conn.internal_conn.?.markEstablished();
+    tls_conn.state = .established;
+
+    _ = try tls_conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, tls_conn.openStream(true));
+
+    const ssh_cfg = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var ssh_conn = try QuicConnection.init(allocator, ssh_cfg);
+    defer ssh_conn.deinit();
+    try ssh_conn.connect("127.0.0.1", 4433);
+    ssh_conn.internal_conn.?.markEstablished();
+    ssh_conn.state = .established;
+    try applyPeerTransportParamsWithLimits(&ssh_conn, allocator, 1, 0);
+
+    _ = try ssh_conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, ssh_conn.openStream(true));
+}
+
+test "negotiation result is normalized across modes" {
+    const allocator = std.testing.allocator;
+
+    var tls_config = config_mod.QuicConfig.tlsClient("example.com");
+    tls_config.tls_config.?.alpn_protocols = &[_][]const u8{"h3"};
+
+    var tls_conn = try QuicConnection.init(allocator, tls_config);
+    defer tls_conn.deinit();
+    try tls_conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const tls_ext = [_]tls_handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_payload },
+        .{ .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters), .extension_data = encoded_server_params },
+    };
+    const random: [32]u8 = [_]u8{51} ** 32;
+    const tls_server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &tls_ext,
+    };
+    const tls_server_hello_bytes = try tls_server_hello.encode(allocator);
+    defer allocator.free(tls_server_hello_bytes);
+    try tls_conn.processTlsServerHello(tls_server_hello_bytes, "test-shared-secret-from-ecdhe");
+
+    const tls_result = tls_conn.getNegotiationResult();
+    try std.testing.expectEqual(types_mod.NegotiationMode.tls, tls_result.mode);
+    try std.testing.expect(tls_result.has_peer_transport_params);
+    try std.testing.expect(tls_result.tls_server_hello_applied);
+    try std.testing.expect(tls_result.tls_handshake_complete);
+    try std.testing.expect(tls_result.ready_for_establish);
+
+    const ssh_config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var ssh_conn = try QuicConnection.init(allocator, ssh_config);
+    defer ssh_conn.deinit();
+    try ssh_conn.connect("127.0.0.1", 4433);
+    try applyDefaultPeerTransportParams(&ssh_conn, allocator);
+
+    const ssh_result = ssh_conn.getNegotiationResult();
+    try std.testing.expectEqual(types_mod.NegotiationMode.ssh, ssh_result.mode);
+    try std.testing.expect(ssh_result.has_peer_transport_params);
+    try std.testing.expect(!ssh_result.tls_server_hello_applied);
+    try std.testing.expect(!ssh_result.tls_handshake_complete);
+    try std.testing.expect(ssh_result.ready_for_establish);
 }
 
 test "Connection state transitions" {
@@ -726,7 +2220,7 @@ test "Event queue" {
     var conn = try QuicConnection.init(allocator, config);
     defer conn.deinit();
 
-    try conn.events.append(allocator, .{ .connected = {} });
+    try conn.events.append(allocator, .{ .connected = .{} });
 
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
@@ -735,7 +2229,7 @@ test "Event queue" {
     try std.testing.expect(event2 == null);
 }
 
-test "connect emits connected event on poll" {
+test "connect stays connecting without handshake progress" {
     const allocator = std.testing.allocator;
 
     const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
@@ -747,6 +2241,42 @@ test "connect emits connected event on poll" {
     try std.testing.expect(conn.nextEvent() == null);
 
     try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "connect emits connected event when first packet is processed" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 1,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01;
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .connected);
@@ -768,6 +2298,7 @@ test "closeStream is FIN-based half close" {
 
     conn.internal_conn = internal_conn;
     conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     const stream_id = try conn.openStream(true);
     _ = conn.nextEvent(); // drain stream_opened
@@ -816,6 +2347,7 @@ test "streamWrite respects congestion send budget" {
 
     conn.internal_conn = internal_conn;
     conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     const stream_id = try conn.openStream(true);
     _ = conn.nextEvent();
@@ -843,8 +2375,6 @@ test "poll parses received long-header packet and updates visibility stats" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent(); // drain connected
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -870,6 +2400,10 @@ test "poll parses received long-header packet and updates visibility stats" {
 
     try conn.poll();
 
+    const connected_event = conn.nextEvent();
+    try std.testing.expect(connected_event != null);
+    try std.testing.expect(connected_event.? == .connected);
+
     const stats = conn.getStats();
     try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
     try std.testing.expectEqual(@as(u64, packet_len), stats.bytes_received);
@@ -884,8 +2418,6 @@ test "poll maps invalid packet header to closing event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent(); // drain connected
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -900,7 +2432,10 @@ test "poll maps invalid packet header to closing event" {
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
-    try std.testing.expectEqual(@as(u64, 1), event.?.closing.error_code);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
 
@@ -912,8 +2447,6 @@ test "poll routes ACK frame into connection ack tracking" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -944,6 +2477,10 @@ test "poll routes ACK frame into connection ack tracking" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    const connected_event = conn.nextEvent();
+    try std.testing.expect(connected_event != null);
+    try std.testing.expect(connected_event.? == .connected);
+
     try std.testing.expectEqual(@as(u64, 7), conn.internal_conn.?.largest_acked);
 }
 
@@ -955,8 +2492,6 @@ test "poll routes connection close frame to closing event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -985,6 +2520,7 @@ test "poll routes connection close frame to closing event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
@@ -1037,8 +2573,6 @@ test "poll routes STREAM frame into stream data and readable event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1046,14 +2580,10 @@ test "poll routes STREAM frame into stream data and readable event" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [512]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 24,
         .packet_number = 4,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1068,10 +2598,13 @@ test "poll routes STREAM frame into stream data and readable event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_readable);
     try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var read_buf: [64]u8 = undefined;
     const n = try conn.streamRead(4, &read_buf);
@@ -1087,8 +2620,6 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1096,14 +2627,10 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [512]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 20,
         .packet_number = 5,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1117,6 +2644,7 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_closed);
@@ -1132,8 +2660,6 @@ test "poll routes PATH_CHALLENGE frame and queues response token" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1141,14 +2667,10 @@ test "poll routes PATH_CHALLENGE frame and queues response token" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [256]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 16,
         .packet_number = 6,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1157,6 +2679,8 @@ test "poll routes PATH_CHALLENGE frame and queues response token" {
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
+
+    _ = conn.nextEvent(); // connected
 
     const pending = conn.internal_conn.?.popPathResponse();
     try std.testing.expect(pending != null);
@@ -1171,8 +2695,6 @@ test "poll routes PATH_RESPONSE frame and validates peer path" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     const token = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
     conn.internal_conn.?.beginPathValidation(token);
@@ -1184,14 +2706,10 @@ test "poll routes PATH_RESPONSE frame and validates peer path" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [256]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 16,
         .packet_number = 7,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1200,6 +2718,8 @@ test "poll routes PATH_RESPONSE frame and validates peer path" {
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
+
+    _ = conn.nextEvent(); // connected
 
     try std.testing.expect(conn.internal_conn.?.peer_validated);
 }
@@ -1219,6 +2739,770 @@ test "ssh mode rejects unidirectional stream open" {
 
     conn.internal_conn = internal_conn;
     conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     try std.testing.expectError(types_mod.QuicError.StreamError, conn.openStream(false));
+}
+
+test "openStream requires negotiated handshake readiness" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try std.testing.expectError(types_mod.QuicError.ConnectionNotEstablished, conn.openStream(true));
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    _ = try conn.openStream(true);
+}
+
+test "closeStream requires negotiated handshake readiness" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    const stream_id = try conn.internal_conn.?.openStream(true);
+    try std.testing.expectError(
+        types_mod.QuicError.ConnectionNotEstablished,
+        conn.closeStream(stream_id, 0),
+    );
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    try conn.closeStream(stream_id, 0);
+}
+
+test "applyPeerTransportParams rejects invalid peer parameters" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.max_udp_payload_size = 1199;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.applyPeerTransportParams(payload));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.transport_parameter_error)),
+        event.?.closing.error_code,
+    );
+}
+
+test "applyPeerTransportParams updates stream open limits" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.initial_max_streams_bidi = 1;
+    encoded.initial_max_streams_uni = 0;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try conn.applyPeerTransportParams(payload);
+
+    _ = try conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(true));
+    try std.testing.expectError(types_mod.QuicError.StreamError, conn.openStream(false));
+}
+
+test "poll maps stream receive flow control violation to closing event" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.streams.setLocalReceiveStreamDataLimits(4, 4, 4);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 21,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 1,
+        .offset = 0,
+        .data = "12345",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    _ = conn.nextEvent(); // connected
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.flow_control_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "poll rejects stream frame in Initial packet space even when established" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 22,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 1,
+        .offset = 0,
+        .data = "abc",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    const event = if (first.? == .connected) conn.nextEvent() else first;
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "poll rejects reserved frame type in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 23,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1f; // reserved frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const first_is_closing = first != null and first.? == .closing;
+    const second_is_closing = second != null and second.? == .closing;
+    try std.testing.expect(first_is_closing or second_is_closing);
+
+    const event = if (first_is_closing) first.? else second.?;
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.closing.error_code,
+    );
+}
+
+test "poll ignores unknown frame type in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 24,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x2b; // unknown frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects reserved frame type in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 32,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1f; // reserved frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 25,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const closing = if (first != null and first.? == .closing)
+        first
+    else if (second != null and second.? == .closing)
+        second
+    else
+        null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll allows HANDSHAKE_DONE frame in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 26,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects CRYPTO frame in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 27,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const crypto_frame = frame_mod.CryptoFrame{ .offset = 0, .data = "abc" };
+    packet_len += try crypto_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll allows CRYPTO frame in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 28,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const crypto_frame = frame_mod.CryptoFrame{ .offset = 0, .data = "abc" };
+    packet_len += try crypto_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    try std.testing.expect(first.? == .connected);
+    try std.testing.expect(conn.nextEvent() == null);
+
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects MAX_DATA frame in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 6,
+        .packet_number = 29,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x10; // MAX_DATA
+    packet_len += 1;
+    packet_buf[packet_len] = 0x00; // max_data = 0
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const closing = if (first != null and first.? == .closing)
+        first
+    else if (second != null and second.? == .closing)
+        second
+    else
+        null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll rejects PATH_CHALLENGE frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 16,
+        .packet_number = 30,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const challenge = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try challenge.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll allows STREAM frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 31,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 4,
+        .offset = 0,
+        .data = "zrtt-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_readable);
+    try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
+}
+
+test "poll rejects NEW_TOKEN frame in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 33,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x07; // NEW_TOKEN
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const closing = if (first != null and first.? == .closing)
+        first
+    else if (second != null and second.? == .closing)
+        second
+    else
+        null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll rejects RETIRE_CONNECTION_ID frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 34,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x19; // RETIRE_CONNECTION_ID
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll allows NEW_CONNECTION_ID frame type in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 35,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x18; // NEW_CONNECTION_ID (payload parsing not implemented in route)
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "packet-space frame legality matrix baseline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const initial_allowed = [_]u64{ 0x00, 0x01, 0x02, 0x03, 0x06, 0x1c, 0x1d };
+    for (initial_allowed) |ft| {
+        try conn.validateFrameAllowedInPacketSpace(ft, .initial);
+        try conn.validateFrameAllowedInPacketSpace(ft, .handshake);
+    }
+
+    const initial_disallowed = [_]u64{ 0x04, 0x07, 0x10, 0x18, 0x1e, 0x08 };
+    for (initial_disallowed) |ft| {
+        try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(ft, .initial));
+    }
+
+    const zero_rtt_allowed = [_]u64{ 0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1c, 0x1d, 0x08 };
+    for (zero_rtt_allowed) |ft| {
+        try conn.validateFrameAllowedInPacketSpace(ft, .zero_rtt);
+    }
+
+    const zero_rtt_disallowed = [_]u64{ 0x02, 0x03, 0x06, 0x07, 0x18, 0x19, 0x1a, 0x1b, 0x1e };
+    for (zero_rtt_disallowed) |ft| {
+        try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(ft, .zero_rtt));
+    }
+
+    try conn.validateFrameAllowedInPacketSpace(0x2b, .application); // unknown, non-reserved
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x06, .application));
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x1f, .application));
 }

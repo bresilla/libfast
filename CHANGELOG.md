@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.0.11] - 2026-02-28
+
+### <!-- 0 -->⛰️  Features
+
+- Support server-side tls handshake completion path
+- Add server-side tls clienthello processing API
+- Add serverhello builder from clienthello
+- Integrate server alpn selection from clienthello
+- Enforce zero-rtt frame allowlist with regressions
+- Enforce strict initial handshake frame allowlist
+- Enforce crypto frame legality by packet space
+- Tighten handshake_done legality across packet spaces
+- Tighten unknown reserved frame handling by packet space
+- Propagate alpn mismatch as deterministic handshake close
+- Add server-side alpn selection policy helper
+- Normalize negotiation result across tls and ssh
+- Add explicit mode capability matrix
+- Enforce packet-space frame legality matrix
+- Require integrated tls server hello for readiness
+- Consume tls transport params from server hello
+- Enforce tls alpn verification and establish gating
+- Gate stream read and close on negotiation readiness
+- Gate app stream traffic on negotiated handshake
+- Add handshake negotiated readiness check
+- Add negotiation snapshot API
+- Expose negotiated alpn in connected metadata
+- Wire tls config alpn into connect handshake
+- Parse tls extensions and capture alpn
+- Encode tls extensions and client params
+- Refine connection state transitions and frame validation
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Reject reserved frame types in application space
+- Unify tls handshake failure taxonomy and close mapping
+- Validate ssh handshake transport params
+- Close on stream receive flow control violations
+- Enforce local receive stream data limits
+- Enforce negotiated per-stream data limits
+- Apply peer transport params via API
+- Enforce transport parameter validation and stream limits
+
+### <!-- 6 -->🧪 Testing
+
+- Add targeted loss detection and ack safety regressions
+- Add targeted pto and ack-eliciting recovery regressions
+- Harden connection-level flow-control edge conformance
+- Add packet-space frame legality matrix baseline
+- Extend packet-space legality regressions for token and cid frames
+- Add ALPN boundary validation in integrated tls path
+- Reject duplicate tls extensions in integrated handshake path
+- Expand tls handshake failure matrix coverage
+- Add paired tls ssh regression scenarios
+- Enforce closeStream readiness semantics
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Add dedicated dual-mode regression ci target
+
 ## [0.0.10] - 2026-02-27
 
 ### <!-- 1 -->🐛 Bug Fixes

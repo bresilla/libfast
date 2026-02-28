@@ -113,9 +113,7 @@ pub const ClientHello = struct {
         try data.append(allocator, 1);
         try data.append(allocator, 0);
 
-        // Extensions (simplified for now)
-        try data.append(allocator, 0);
-        try data.append(allocator, 0);
+        try encodeExtensions(&data, allocator, self.extensions);
 
         // Fill in message length
         const content_len = data.items.len - content_start;
@@ -126,6 +124,67 @@ pub const ClientHello = struct {
         return data.toOwnedSlice(allocator);
     }
 };
+
+pub const ParsedClientHello = struct {
+    random: [32]u8,
+    cipher_suites: []const u8,
+    extensions: []const u8,
+};
+
+pub fn parseClientHello(data: []const u8) HandshakeError!ParsedClientHello {
+    if (data.len < 4) return error.InvalidMessage;
+
+    if (data[0] != @intFromEnum(HandshakeType.client_hello)) {
+        return error.InvalidMessage;
+    }
+
+    const msg_len: usize = (@as(usize, data[1]) << 16) | (@as(usize, data[2]) << 8) | data[3];
+    if (data.len < 4 + msg_len) return error.InvalidMessage;
+
+    var pos: usize = 4;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const legacy_version: u16 = (@as(u16, data[pos]) << 8) | data[pos + 1];
+    if (legacy_version != 0x0303) return error.UnsupportedVersion;
+    pos += 2;
+
+    if (pos + 32 > data.len) return error.InvalidMessage;
+    var random: [32]u8 = undefined;
+    @memcpy(&random, data[pos .. pos + 32]);
+    pos += 32;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    const session_id_len = data[pos];
+    pos += 1;
+    if (pos + session_id_len > data.len) return error.InvalidMessage;
+    pos += session_id_len;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const cipher_suites_len: usize = (@as(usize, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+    if (cipher_suites_len == 0 or (cipher_suites_len & 1) != 0) return error.InvalidMessage;
+    if (pos + cipher_suites_len > data.len) return error.InvalidMessage;
+    const cipher_suites = data[pos .. pos + cipher_suites_len];
+    pos += cipher_suites_len;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    const compression_methods_len = data[pos];
+    pos += 1;
+    if (compression_methods_len == 0) return error.InvalidMessage;
+    if (pos + compression_methods_len > data.len) return error.InvalidMessage;
+    pos += compression_methods_len;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const ext_len: usize = (@as(usize, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+    if (pos + ext_len > data.len) return error.InvalidMessage;
+
+    return .{
+        .random = random,
+        .cipher_suites = cipher_suites,
+        .extensions = data[pos .. pos + ext_len],
+    };
+}
 
 /// ServerHello message
 pub const ServerHello = struct {
@@ -169,9 +228,7 @@ pub const ServerHello = struct {
         // Legacy compression method
         try data.append(allocator, 0);
 
-        // Extensions (simplified)
-        try data.append(allocator, 0);
-        try data.append(allocator, 0);
+        try encodeExtensions(&data, allocator, self.extensions);
 
         // Fill in length
         const content_len = data.items.len - content_start;
@@ -186,6 +243,7 @@ pub const ServerHello = struct {
 pub const ParsedServerHello = struct {
     random: [32]u8,
     cipher_suite: u16,
+    extensions: []const u8,
 };
 
 /// Parse a TLS ServerHello message and extract key fields.
@@ -220,11 +278,71 @@ pub fn parseServerHello(data: []const u8) HandshakeError!ParsedServerHello {
 
     if (pos + 2 > data.len) return error.InvalidMessage;
     const cipher_suite: u16 = (@as(u16, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    pos += 1; // legacy compression method
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const ext_len: usize = (@as(usize, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+    if (pos + ext_len > data.len) return error.InvalidMessage;
 
     return ParsedServerHello{
         .random = random,
         .cipher_suite = cipher_suite,
+        .extensions = data[pos .. pos + ext_len],
     };
+}
+
+/// Find a specific extension payload inside encoded extension bytes.
+///
+/// `extensions` must be the raw extensions vector as returned by
+/// `parseServerHello(...).extensions`.
+pub fn findExtension(extensions: []const u8, extension_type: u16) HandshakeError!?[]const u8 {
+    var pos: usize = 0;
+    while (pos < extensions.len) {
+        if (pos + 4 > extensions.len) return error.InvalidMessage;
+        const ext_type: u16 = (@as(u16, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        const ext_len: usize = (@as(usize, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        if (pos + ext_len > extensions.len) return error.InvalidMessage;
+        const ext_data = extensions[pos .. pos + ext_len];
+        pos += ext_len;
+
+        if (ext_type == extension_type) return ext_data;
+    }
+
+    return null;
+}
+
+/// Find a specific extension payload and reject duplicates.
+pub fn findUniqueExtension(extensions: []const u8, extension_type: u16) HandshakeError!?[]const u8 {
+    var pos: usize = 0;
+    var found: ?[]const u8 = null;
+
+    while (pos < extensions.len) {
+        if (pos + 4 > extensions.len) return error.InvalidMessage;
+        const ext_type: u16 = (@as(u16, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        const ext_len: usize = (@as(usize, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        if (pos + ext_len > extensions.len) return error.InvalidMessage;
+        const ext_data = extensions[pos .. pos + ext_len];
+        pos += ext_len;
+
+        if (ext_type == extension_type) {
+            if (found != null) return error.InvalidMessage;
+            found = ext_data;
+        }
+    }
+
+    return found;
 }
 
 /// TLS extension
@@ -288,7 +406,6 @@ pub const EncryptedExtensions = struct {
 
     /// Encode EncryptedExtensions message
     pub fn encode(self: EncryptedExtensions, allocator: std.mem.Allocator) HandshakeError![]u8 {
-        _ = self;
         var data: std.ArrayList(u8) = .{};
         errdefer data.deinit(allocator);
 
@@ -301,9 +418,7 @@ pub const EncryptedExtensions = struct {
 
         const content_start = data.items.len;
 
-        // Extensions length (empty for now)
-        try data.append(allocator, 0);
-        try data.append(allocator, 0);
+        try encodeExtensions(&data, allocator, self.extensions);
 
         // Fill in length
         const content_len = data.items.len - content_start;
@@ -314,6 +429,34 @@ pub const EncryptedExtensions = struct {
         return data.toOwnedSlice(allocator);
     }
 };
+
+fn encodeExtensions(data: *std.ArrayList(u8), allocator: std.mem.Allocator, extensions: []const Extension) HandshakeError!void {
+    const len_pos = data.items.len;
+    try data.appendNTimes(allocator, 0, 2);
+
+    const start = data.items.len;
+    for (extensions) |ext| {
+        if (ext.extension_data.len > std.math.maxInt(u16)) {
+            return error.InvalidMessage;
+        }
+
+        try data.append(allocator, @intCast((ext.extension_type >> 8) & 0xFF));
+        try data.append(allocator, @intCast(ext.extension_type & 0xFF));
+
+        const ext_len: u16 = @intCast(ext.extension_data.len);
+        try data.append(allocator, @intCast((ext_len >> 8) & 0xFF));
+        try data.append(allocator, @intCast(ext_len & 0xFF));
+        try data.appendSlice(allocator, ext.extension_data);
+    }
+
+    const total_len = data.items.len - start;
+    if (total_len > std.math.maxInt(u16)) {
+        return error.InvalidMessage;
+    }
+
+    data.items[len_pos] = @intCast((total_len >> 8) & 0xFF);
+    data.items[len_pos + 1] = @intCast(total_len & 0xFF);
+}
 
 /// Cipher suite constants
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -427,6 +570,90 @@ test "Parse ServerHello" {
     const parsed = try parseServerHello(encoded);
     try std.testing.expectEqual(TLS_AES_128_GCM_SHA256, parsed.cipher_suite);
     try std.testing.expectEqualSlices(u8, &random, &parsed.random);
+    try std.testing.expectEqual(@as(usize, 0), parsed.extensions.len);
+}
+
+test "ClientHello encodes extensions" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{0} ** 32;
+    const cipher_suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ext = [_]Extension{
+        .{ .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation), .extension_data = "h3" },
+    };
+
+    const client_hello = ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+
+    const encoded = try client_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "h3") != null);
+}
+
+test "Parse ClientHello extracts extensions" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{9} ** 32;
+    const cipher_suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ext = [_]Extension{
+        .{ .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation), .extension_data = "h3" },
+    };
+
+    const client_hello = ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+
+    const encoded = try client_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    const parsed = try parseClientHello(encoded);
+    try std.testing.expectEqualSlices(u8, &random, &parsed.random);
+    try std.testing.expect(parsed.cipher_suites.len == 2);
+    const alpn = try findExtension(parsed.extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    try std.testing.expect(alpn != null);
+    try std.testing.expectEqualStrings("h3", alpn.?);
+}
+
+test "Find extension in parsed ServerHello" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{4} ** 32;
+    const ext = [_]Extension{
+        .{ .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation), .extension_data = "h3" },
+    };
+
+    const server_hello = ServerHello{
+        .random = random,
+        .cipher_suite = TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+
+    const encoded = try server_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    const parsed = try parseServerHello(encoded);
+    const alpn = try findExtension(parsed.extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    try std.testing.expect(alpn != null);
+    try std.testing.expectEqualStrings("h3", alpn.?);
+}
+
+test "findUniqueExtension rejects duplicate extension" {
+    const extensions = [_]u8{
+        0x00, 0x10, // type
+        0x00, 0x01, // len
+        0x01,
+        0x00, 0x10, // duplicate type
+        0x00, 0x01, // len
+        0x02,
+    };
+
+    try std.testing.expectError(error.InvalidMessage, findUniqueExtension(&extensions, 0x0010));
 }
 
 test "Parse ServerHello invalid version" {
