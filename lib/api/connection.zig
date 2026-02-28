@@ -1051,6 +1051,20 @@ pub const QuicConnection = struct {
         return server_hello;
     }
 
+    /// Completes TLS key schedule on either client or server side after
+    /// ServerHello processing is done.
+    pub fn completeTlsHandshake(self: *QuicConnection, shared_secret: []const u8) types_mod.QuicError!void {
+        if (self.config.mode != .tls) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        const tls_ctx = self.tls_ctx orelse return types_mod.QuicError.InvalidState;
+        tls_ctx.completeHandshake(shared_secret) catch |err| {
+            try self.queueTlsFailure(.complete, err);
+            return types_mod.QuicError.HandshakeFailed;
+        };
+    }
+
     /// Get next connection event
     pub fn nextEvent(self: *QuicConnection) ?types_mod.ConnectionEvent {
         if (self.events.items.len == 0) {
@@ -1540,6 +1554,44 @@ test "processTlsClientHello rejects ALPN no-overlap" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqualStrings("alpn mismatch", event.?.closing.reason);
+}
+
+test "server-side completeTlsHandshake enables negotiated readiness" {
+    const allocator = std.testing.allocator;
+
+    var server_cfg = config_mod.QuicConfig.tlsServer("cert", "key");
+    var tls_server_cfg = server_cfg.tls_config.?;
+    tls_server_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    server_cfg.tls_config = tls_server_cfg;
+
+    var server_conn = try QuicConnection.init(allocator, server_cfg);
+    defer server_conn.deinit();
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 5, 5, 5 });
+    const server_internal = try allocator.create(conn_internal.Connection);
+    server_internal.* = try conn_internal.Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    server_conn.internal_conn = server_internal;
+    server_conn.state = .connecting;
+
+    var client_ctx = tls_context_mod.TlsContext.init(allocator, true);
+    defer client_ctx.deinit();
+    const client_tp_encoded = try transport_params_mod.TransportParams.defaultClient().encode(allocator);
+    defer allocator.free(client_tp_encoded);
+
+    const offered = [_][]const u8{"h3"};
+    const client_hello = try client_ctx.startClientHandshakeWithParams("example.com", &offered, client_tp_encoded);
+    defer allocator.free(client_hello);
+
+    const server_hello = try server_conn.processTlsClientHello(client_hello, &[_][]const u8{});
+    defer allocator.free(server_hello);
+
+    try std.testing.expect(!server_conn.isHandshakeNegotiated());
+    try server_conn.completeTlsHandshake("test-shared-secret-from-ecdhe");
+
+    server_conn.internal_conn.?.markEstablished();
+    server_conn.state = .established;
+    try std.testing.expect(server_conn.isHandshakeNegotiated());
 }
 
 test "processTlsServerHello maps unsupported cipher to connection refused" {

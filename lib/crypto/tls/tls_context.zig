@@ -321,11 +321,12 @@ pub const TlsContext = struct {
         peer_certificate_chain_pem: ?[]const u8,
         peer_options: ?PeerVerificationOptions,
     ) TlsError!void {
-        if (!self.is_client or self.state != .server_hello_received) {
+        if (self.state != .server_hello_received) {
             return error.InvalidState;
         }
 
-        if (peer_options) |opts| {
+        if (self.is_client and peer_options != null) {
+            const opts = peer_options.?;
             try self.verifyPeerIdentity(peer_certificate_chain_pem, opts);
         }
 
