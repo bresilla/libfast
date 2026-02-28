@@ -870,6 +870,48 @@ test "connection schedules PTO probe" {
     try std.testing.expect(conn.pto_count > 0);
 }
 
+test "pto counter resets when acked packet is in flight" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+
+    const original_deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(original_deadline.add(1));
+    try std.testing.expect(conn.pto_count > 0);
+
+    conn.processAckDetailed(1, 0);
+
+    try std.testing.expectEqual(@as(u32, 0), conn.pto_count);
+    try std.testing.expect(conn.next_pto_at != null);
+}
+
+test "non ack-eliciting packet does not arm PTO" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    try std.testing.expect(conn.next_pto_at == null);
+
+    conn.trackPacketSent(64, false);
+    try std.testing.expect(conn.next_pto_at == null);
+
+    conn.trackPacketSent(64, true);
+    try std.testing.expect(conn.next_pto_at != null);
+}
+
 test "recovery handles packet reordering without spurious retransmit" {
     const allocator = std.testing.allocator;
 
