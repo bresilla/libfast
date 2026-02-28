@@ -202,8 +202,10 @@ pub const StreamManager = struct {
     next_client_uni: StreamId,
     next_server_bidi: StreamId,
     next_server_uni: StreamId,
-    max_streams_bidi: u64,
-    max_streams_uni: u64,
+    max_local_streams_bidi: u64,
+    max_local_streams_uni: u64,
+    local_opened_bidi: u64,
+    local_opened_uni: u64,
     max_stream_data: u64,
     allocator: std.mem.Allocator,
     is_server: bool,
@@ -215,12 +217,19 @@ pub const StreamManager = struct {
             .next_client_uni = 2,
             .next_server_bidi = 1,
             .next_server_uni = 3,
-            .max_streams_bidi = 100,
-            .max_streams_uni = 100,
+            .max_local_streams_bidi = 100,
+            .max_local_streams_uni = 100,
+            .local_opened_bidi = 0,
+            .local_opened_uni = 0,
             .max_stream_data = max_stream_data,
             .allocator = allocator,
             .is_server = is_server,
         };
+    }
+
+    pub fn setLocalOpenLimits(self: *StreamManager, max_streams_bidi: u64, max_streams_uni: u64) void {
+        self.max_local_streams_bidi = max_streams_bidi;
+        self.max_local_streams_uni = max_streams_uni;
     }
 
     pub fn deinit(self: *StreamManager) void {
@@ -233,6 +242,16 @@ pub const StreamManager = struct {
 
     /// Create a new stream
     pub fn createStream(self: *StreamManager, stream_type: StreamType) !StreamId {
+        if (stream_type.isBidirectional()) {
+            if (self.local_opened_bidi >= self.max_local_streams_bidi) {
+                return error.StreamLimitReached;
+            }
+        } else {
+            if (self.local_opened_uni >= self.max_local_streams_uni) {
+                return error.StreamLimitReached;
+            }
+        }
+
         const stream_id = switch (stream_type) {
             .client_bidi => blk: {
                 if (self.is_server) return error.InvalidStreamType;
@@ -262,6 +281,12 @@ pub const StreamManager = struct {
 
         const stream = Stream.init(self.allocator, stream_id, self.max_stream_data);
         try self.streams.put(stream_id, stream);
+
+        if (stream_type.isBidirectional()) {
+            self.local_opened_bidi += 1;
+        } else {
+            self.local_opened_uni += 1;
+        }
 
         return stream_id;
     }
@@ -347,6 +372,19 @@ test "stream manager" {
 
     const stream = manager.getStream(stream_id).?;
     try std.testing.expectEqual(stream_id, stream.id);
+}
+
+test "stream manager enforces local stream limits" {
+    const allocator = std.testing.allocator;
+
+    var manager = StreamManager.init(allocator, false, 1024);
+    defer manager.deinit();
+
+    manager.setLocalOpenLimits(1, 0);
+
+    _ = try manager.createStream(.client_bidi);
+    try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_bidi));
+    try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_uni));
 }
 
 test "stream flow control" {

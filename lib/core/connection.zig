@@ -122,6 +122,8 @@ pub const Connection = struct {
             conn.streams.next_client_bidi = 4;
         }
 
+        conn.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+
         return conn;
     }
 
@@ -166,6 +168,8 @@ pub const Connection = struct {
             conn.streams.next_server_bidi = 5;
         }
 
+        conn.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+
         return conn;
     }
 
@@ -193,8 +197,11 @@ pub const Connection = struct {
             (if (self.is_server) types.StreamType.server_uni else types.StreamType.client_uni);
 
         return self.streams.createStream(stream_type) catch |err| {
-            std.log.err("Failed to create stream: {}", .{err});
-            return error.StreamError;
+            return switch (err) {
+                error.StreamLimitReached => error.StreamError,
+                error.InvalidStreamType => error.StreamError,
+                else => error.StreamError,
+            };
         };
     }
 
@@ -331,6 +338,7 @@ pub const Connection = struct {
     pub fn setRemoteParams(self: *Connection, params: TransportParameters) void {
         self.remote_params = params;
         self.max_data_remote = params.initial_max_data;
+        self.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
     }
 
     /// Process received ACK
@@ -628,6 +636,26 @@ test "connection flow control" {
 
     // Should fail if exceeding limit
     try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(conn.max_data_remote + 1));
+}
+
+test "connection applies remote stream limits" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var remote = TransportParameters{};
+    remote.initial_max_streams_bidi = 1;
+    remote.initial_max_streams_uni = 0;
+    conn.setRemoteParams(remote);
+
+    _ = try conn.openStream(true);
+    try std.testing.expectError(error.StreamError, conn.openStream(true));
+    try std.testing.expectError(error.StreamError, conn.openStream(false));
 }
 
 test "connection send budget tracks congestion window" {
