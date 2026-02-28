@@ -234,6 +234,30 @@ pub fn parseServerHello(data: []const u8) HandshakeError!ParsedServerHello {
     };
 }
 
+/// Find a specific extension payload inside encoded extension bytes.
+///
+/// `extensions` must be the raw extensions vector as returned by
+/// `parseServerHello(...).extensions`.
+pub fn findExtension(extensions: []const u8, extension_type: u16) HandshakeError!?[]const u8 {
+    var pos: usize = 0;
+    while (pos < extensions.len) {
+        if (pos + 4 > extensions.len) return error.InvalidMessage;
+        const ext_type: u16 = (@as(u16, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        const ext_len: usize = (@as(usize, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        if (pos + ext_len > extensions.len) return error.InvalidMessage;
+        const ext_data = extensions[pos .. pos + ext_len];
+        pos += ext_len;
+
+        if (ext_type == extension_type) return ext_data;
+    }
+
+    return null;
+}
+
 /// TLS extension
 pub const Extension = struct {
     extension_type: u16,
@@ -481,6 +505,29 @@ test "ClientHello encodes extensions" {
     defer allocator.free(encoded);
 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "h3") != null);
+}
+
+test "Find extension in parsed ServerHello" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{4} ** 32;
+    const ext = [_]Extension{
+        .{ .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation), .extension_data = "h3" },
+    };
+
+    const server_hello = ServerHello{
+        .random = random,
+        .cipher_suite = TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+
+    const encoded = try server_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    const parsed = try parseServerHello(encoded);
+    const alpn = try findExtension(parsed.extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    try std.testing.expect(alpn != null);
+    try std.testing.expectEqualStrings("h3", alpn.?);
 }
 
 test "Parse ServerHello invalid version" {
