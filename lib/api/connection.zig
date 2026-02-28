@@ -296,6 +296,10 @@ pub const QuicConnection = struct {
             return;
         }
 
+        if (packet_space != .application and (frame_type == 0x07 or frame_type == 0x18 or frame_type == 0x19 or frame_type == 0x1e)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
         if (isReservedFrameType(frame_type)) {
             return types_mod.QuicError.ProtocolViolation;
         }
@@ -2713,6 +2717,84 @@ test "poll ignores unknown frame type in application packet space" {
     };
     var packet_len = try header.encode(&packet_buf);
     packet_buf[packet_len] = 0x2b; // unknown frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 25,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const closing = if (first != null and first.? == .closing)
+        first
+    else if (second != null and second.? == .closing)
+        second
+    else
+        null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll allows HANDSHAKE_DONE frame in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 26,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
     packet_len += 1;
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
