@@ -748,6 +748,31 @@ pub const QuicConnection = struct {
         });
     }
 
+    /// Processes TLS ServerHello, completes TLS handshake, and applies peer
+    /// QUIC transport parameters carried in TLS extensions.
+    pub fn processTlsServerHello(self: *QuicConnection, server_hello_data: []const u8, shared_secret: []const u8) types_mod.QuicError!void {
+        if (self.config.mode != .tls) {
+            return types_mod.QuicError.InvalidState;
+        }
+
+        const tls_ctx = self.tls_ctx orelse return types_mod.QuicError.InvalidState;
+
+        tls_ctx.processServerHello(server_hello_data) catch {
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        tls_ctx.completeHandshake(shared_secret) catch {
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        const peer_tp = tls_ctx.getPeerTransportParams() orelse {
+            try self.queueTransportParameterError("missing peer transport params in tls extensions");
+            return types_mod.QuicError.HandshakeFailed;
+        };
+
+        try self.applyPeerTransportParams(peer_tp);
+    }
+
     /// Get next connection event
     pub fn nextEvent(self: *QuicConnection) ?types_mod.ConnectionEvent {
         if (self.events.items.len == 0) {
@@ -1025,6 +1050,83 @@ test "TLS connect remains connecting until TLS and transport params negotiated" 
     try conn.poll();
     try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
     try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "processTlsServerHello applies peer transport params from tls extension" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.initial_max_streams_bidi = 1;
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{31} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe");
+    try std.testing.expect(conn.internal_conn.?.remote_params != null);
+    try std.testing.expectEqual(@as(u64, 1), conn.internal_conn.?.remote_params.?.initial_max_streams_bidi);
+}
+
+test "processTlsServerHello rejects missing peer transport params extension" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const random: [32]u8 = [_]u8{32} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
 
 test "negotiation snapshot exposes mode ALPN and peer params" {
