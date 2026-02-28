@@ -144,6 +144,34 @@ pub const QuicConnection = struct {
         try self.enterDraining(1, reason);
     }
 
+    fn transitionToEstablished(self: *QuicConnection) types_mod.QuicError!void {
+        if (self.state != .connecting) {
+            return;
+        }
+
+        const conn = self.internal_conn orelse return;
+        conn.markEstablished();
+        self.state = .established;
+        try self.events.append(self.allocator, .{ .connected = {} });
+    }
+
+    fn validateFrameAllowedInState(self: *QuicConnection, frame_type: u64) types_mod.QuicError!void {
+        if (self.state != .connecting) {
+            return;
+        }
+
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        switch (frame_type) {
+            0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17 => {
+                return types_mod.QuicError.ProtocolViolation;
+            },
+            else => {},
+        }
+    }
+
     fn routeFrame(self: *QuicConnection, payload: []const u8) types_mod.QuicError!void {
         if (payload.len == 0) return;
 
@@ -152,6 +180,8 @@ pub const QuicConnection = struct {
         };
 
         const frame_type = frame_type_result.value;
+
+        try self.validateFrameAllowedInState(frame_type);
 
         if (core_types.FrameType.isStreamFrame(frame_type)) {
             const decoded = frame_mod.StreamFrame.decode(payload) catch {
@@ -558,12 +588,6 @@ pub const QuicConnection = struct {
             conn.onPtoTimeout(time_mod.Instant.now());
         }
 
-        // Transition from connecting to established (simplified handshake)
-        if (self.state == .connecting) {
-            self.state = .established;
-            try self.events.append(self.allocator, .{ .connected = {} });
-        }
-
         // Process at most one received datagram
         if (self.socket) |socket| {
             var recv_buffer: [4096]u8 = undefined;
@@ -589,8 +613,15 @@ pub const QuicConnection = struct {
 
             if (header_len >= packet.len) return;
 
-            self.routeFrame(packet[header_len..]) catch {
+            try self.transitionToEstablished();
+
+            self.routeFrame(packet[header_len..]) catch |err| {
                 self.packets_invalid += 1;
+                if (err == types_mod.QuicError.ProtocolViolation) {
+                    try self.queueProtocolViolation("frame not allowed during handshake");
+                    return;
+                }
+
                 try self.queueProtocolViolation("invalid frame payload");
                 return;
             };
@@ -735,7 +766,7 @@ test "Event queue" {
     try std.testing.expect(event2 == null);
 }
 
-test "connect emits connected event on poll" {
+test "connect stays connecting without handshake progress" {
     const allocator = std.testing.allocator;
 
     const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
@@ -747,6 +778,42 @@ test "connect emits connected event on poll" {
     try std.testing.expect(conn.nextEvent() == null);
 
     try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "connect emits connected event when first packet is processed" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 1,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01;
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .connected);
@@ -843,8 +910,6 @@ test "poll parses received long-header packet and updates visibility stats" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent(); // drain connected
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -870,6 +935,10 @@ test "poll parses received long-header packet and updates visibility stats" {
 
     try conn.poll();
 
+    const connected_event = conn.nextEvent();
+    try std.testing.expect(connected_event != null);
+    try std.testing.expect(connected_event.? == .connected);
+
     const stats = conn.getStats();
     try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
     try std.testing.expectEqual(@as(u64, packet_len), stats.bytes_received);
@@ -884,8 +953,6 @@ test "poll maps invalid packet header to closing event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent(); // drain connected
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -912,8 +979,6 @@ test "poll routes ACK frame into connection ack tracking" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -944,6 +1009,10 @@ test "poll routes ACK frame into connection ack tracking" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    const connected_event = conn.nextEvent();
+    try std.testing.expect(connected_event != null);
+    try std.testing.expect(connected_event.? == .connected);
+
     try std.testing.expectEqual(@as(u64, 7), conn.internal_conn.?.largest_acked);
 }
 
@@ -955,8 +1024,6 @@ test "poll routes connection close frame to closing event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -985,6 +1052,7 @@ test "poll routes connection close frame to closing event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
@@ -1037,8 +1105,6 @@ test "poll routes STREAM frame into stream data and readable event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1068,6 +1134,7 @@ test "poll routes STREAM frame into stream data and readable event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_readable);
@@ -1087,8 +1154,6 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1117,6 +1182,7 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_closed);
@@ -1132,8 +1198,6 @@ test "poll routes PATH_CHALLENGE frame and queues response token" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -1158,6 +1222,8 @@ test "poll routes PATH_CHALLENGE frame and queues response token" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
+    _ = conn.nextEvent(); // connected
+
     const pending = conn.internal_conn.?.popPathResponse();
     try std.testing.expect(pending != null);
     try std.testing.expectEqualSlices(u8, &challenge.data, &pending.?);
@@ -1171,8 +1237,6 @@ test "poll routes PATH_RESPONSE frame and validates peer path" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
-    try conn.poll();
-    _ = conn.nextEvent();
 
     const token = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
     conn.internal_conn.?.beginPathValidation(token);
@@ -1200,6 +1264,8 @@ test "poll routes PATH_RESPONSE frame and validates peer path" {
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
+
+    _ = conn.nextEvent(); // connected
 
     try std.testing.expect(conn.internal_conn.?.peer_validated);
 }
