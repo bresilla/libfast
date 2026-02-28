@@ -123,6 +123,11 @@ pub const Connection = struct {
         }
 
         conn.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+        conn.streams.setLocalReceiveStreamDataLimits(
+            params.initial_max_stream_data_bidi_local,
+            params.initial_max_stream_data_bidi_remote,
+            params.initial_max_stream_data_uni,
+        );
 
         return conn;
     }
@@ -169,6 +174,11 @@ pub const Connection = struct {
         }
 
         conn.streams.setLocalOpenLimits(params.initial_max_streams_bidi, params.initial_max_streams_uni);
+        conn.streams.setLocalReceiveStreamDataLimits(
+            params.initial_max_stream_data_bidi_local,
+            params.initial_max_stream_data_bidi_remote,
+            params.initial_max_stream_data_uni,
+        );
 
         return conn;
     }
