@@ -1677,6 +1677,32 @@ test "openStream requires negotiated handshake readiness" {
     _ = try conn.openStream(true);
 }
 
+test "closeStream requires negotiated handshake readiness" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    const stream_id = try conn.internal_conn.?.openStream(true);
+    try std.testing.expectError(
+        types_mod.QuicError.ConnectionNotEstablished,
+        conn.closeStream(stream_id, 0),
+    );
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    try conn.closeStream(stream_id, 0);
+}
+
 test "applyPeerTransportParams rejects invalid peer parameters" {
     const allocator = std.testing.allocator;
 
