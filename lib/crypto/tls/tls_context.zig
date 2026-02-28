@@ -10,6 +10,7 @@ const transport_params_mod = @import("../../core/transport_params.zig");
 /// Manages the TLS handshake state and key derivation
 pub const TlsError = error{
     HandshakeFailed,
+    AlpnMismatch,
     InvalidState,
     UnsupportedCipherSuite,
     OutOfMemory,
@@ -530,7 +531,7 @@ pub const TlsContext = struct {
         const selected = self.selected_alpn orelse return error.HandshakeFailed;
 
         if (!isAlpnInOffer(offered, selected)) {
-            return error.HandshakeFailed;
+            return error.AlpnMismatch;
         }
     }
 
@@ -784,7 +785,7 @@ test "Process ServerHello rejects selected ALPN not offered by client" {
     const server_hello = try server_hello_msg.encode(allocator);
     defer allocator.free(server_hello);
 
-    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(server_hello));
+    try std.testing.expectError(error.AlpnMismatch, ctx.processServerHello(server_hello));
 }
 
 test "selectServerAlpn picks first server-preferred overlap" {

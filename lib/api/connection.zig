@@ -854,11 +854,18 @@ pub const QuicConnection = struct {
 
         const tls_ctx = self.tls_ctx orelse return types_mod.QuicError.InvalidState;
 
-        tls_ctx.processServerHello(server_hello_data) catch {
+        tls_ctx.processServerHello(server_hello_data) catch |err| {
+            if (err == tls_context_mod.TlsError.AlpnMismatch) {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.connection_refused), "alpn mismatch");
+                return types_mod.QuicError.HandshakeFailed;
+            }
+
+            try self.queueProtocolViolation("tls server hello rejected");
             return types_mod.QuicError.HandshakeFailed;
         };
 
         tls_ctx.completeHandshake(shared_secret) catch {
+            try self.queueProtocolViolation("tls handshake completion failed");
             return types_mod.QuicError.HandshakeFailed;
         };
 
@@ -1362,6 +1369,59 @@ test "processTlsServerHello rejects invalid transport params extension payload" 
         types_mod.QuicError.HandshakeFailed,
         conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
     );
+}
+
+test "processTlsServerHello surfaces ALPN mismatch reason" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    // Server selects h2 although client only offered h3.
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{35} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.connection_refused)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("alpn mismatch", event.?.closing.reason);
 }
 
 test "negotiation snapshot exposes mode ALPN and peer params" {
