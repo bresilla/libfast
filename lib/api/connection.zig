@@ -176,6 +176,10 @@ pub const QuicConnection = struct {
             return;
         }
 
+        if (self.config.mode == .tls and !self.isTlsNegotiatedForEstablish()) {
+            return;
+        }
+
         const conn = self.internal_conn orelse return;
         conn.markEstablished();
 
@@ -185,6 +189,14 @@ pub const QuicConnection = struct {
 
         self.state = .established;
         try self.events.append(self.allocator, .{ .connected = .{ .alpn = self.negotiated_alpn } });
+    }
+
+    fn isTlsNegotiatedForEstablish(self: *const QuicConnection) bool {
+        const conn = self.internal_conn orelse return false;
+        if (conn.remote_params == null) return false;
+
+        const tls_ctx = self.tls_ctx orelse return false;
+        return tls_ctx.state.isComplete();
     }
 
     fn validateFrameAllowedInState(self: *QuicConnection, frame_type: u64) types_mod.QuicError!void {
@@ -944,6 +956,9 @@ test "connected event carries negotiated ALPN metadata" {
     const server_hello_bytes = try server_hello.encode(allocator);
     defer allocator.free(server_hello_bytes);
     try tls_ctx.processServerHello(server_hello_bytes);
+    try tls_ctx.completeHandshake("test-shared-secret-from-ecdhe");
+
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -973,6 +988,43 @@ test "connected event carries negotiated ALPN metadata" {
     try std.testing.expectEqualStrings("h3", event.?.connected.alpn.?);
     try std.testing.expect(conn.getNegotiatedAlpn() != null);
     try std.testing.expectEqualStrings("h3", conn.getNegotiatedAlpn().?);
+}
+
+test "TLS connect remains connecting until TLS and transport params negotiated" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 10,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01;
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    try std.testing.expect(conn.nextEvent() == null);
 }
 
 test "negotiation snapshot exposes mode ALPN and peer params" {
@@ -1036,10 +1088,17 @@ test "isHandshakeNegotiated requires TLS completion and peer transport params" {
 
     const tls_ctx = conn.tls_ctx.?;
     const random: [32]u8 = [_]u8{11} ** 32;
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
     const server_hello = tls_handshake_mod.ServerHello{
         .random = random,
         .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
-        .extensions = &[_]tls_handshake_mod.Extension{},
+        .extensions = &ext,
     };
     const server_hello_bytes = try server_hello.encode(allocator);
     defer allocator.free(server_hello_bytes);

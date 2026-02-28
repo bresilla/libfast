@@ -59,7 +59,10 @@ pub const TlsContext = struct {
     application_server_secret: ?[]u8 = null,
 
     /// Negotiated ALPN (when available)
-    selected_alpn: ?[]const u8 = null,
+    selected_alpn: ?[]u8 = null,
+
+    /// Encoded ALPN protocols offered by the client (wire format payload)
+    offered_alpn: ?[]u8 = null,
 
     /// Initialize TLS context
     pub fn init(allocator: std.mem.Allocator, is_client: bool) TlsContext {
@@ -69,6 +72,7 @@ pub const TlsContext = struct {
             .state = .idle,
             .transcript = .{},
             .selected_alpn = null,
+            .offered_alpn = null,
         };
     }
 
@@ -99,6 +103,15 @@ pub const TlsContext = struct {
             return error.HandshakeFailed;
         };
 
+        if (self.selected_alpn) |alpn| {
+            self.allocator.free(alpn);
+            self.selected_alpn = null;
+        }
+        if (self.offered_alpn) |offered| {
+            self.allocator.free(offered);
+            self.offered_alpn = null;
+        }
+
         // Generate random
         var random: [32]u8 = undefined;
         std.crypto.random.bytes(&random);
@@ -116,6 +129,8 @@ pub const TlsContext = struct {
         if (alpn_protocols.len > 0) {
             const alpn_data = try encodeAlpnExtensionData(self.allocator, alpn_protocols);
             errdefer self.allocator.free(alpn_data);
+
+            self.offered_alpn = try self.allocator.dupe(u8, alpn_data);
 
             ext_list[ext_count] = .{
                 .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
@@ -177,6 +192,7 @@ pub const TlsContext = struct {
         }
 
         try self.maybeStoreSelectedAlpn(parsed.extensions);
+        try self.verifySelectedAlpnAgainstOffer();
 
         try self.transcript.appendSlice(self.allocator, server_hello_data);
 
@@ -441,7 +457,10 @@ pub const TlsContext = struct {
     }
 
     pub fn getSelectedAlpn(self: *const TlsContext) ?[]const u8 {
-        return self.selected_alpn;
+        if (self.selected_alpn) |alpn| {
+            return alpn;
+        }
+        return null;
     }
 
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
@@ -460,7 +479,43 @@ pub const TlsContext = struct {
         if (name_len == 0) return error.HandshakeFailed;
         if (3 + name_len != alpn_data.len) return error.HandshakeFailed;
 
-        self.selected_alpn = alpn_data[3 .. 3 + name_len];
+        const selected = try self.allocator.dupe(u8, alpn_data[3 .. 3 + name_len]);
+        if (self.selected_alpn) |old| {
+            self.allocator.free(old);
+        }
+        self.selected_alpn = selected;
+    }
+
+    fn verifySelectedAlpnAgainstOffer(self: *TlsContext) TlsError!void {
+        const offered = self.offered_alpn orelse return;
+        const selected = self.selected_alpn orelse return error.HandshakeFailed;
+
+        if (!isAlpnInOffer(offered, selected)) {
+            return error.HandshakeFailed;
+        }
+    }
+
+    fn isAlpnInOffer(offered_wire: []const u8, selected: []const u8) bool {
+        if (offered_wire.len < 2) return false;
+
+        const list_len: usize = (@as(usize, offered_wire[0]) << 8) | offered_wire[1];
+        if (list_len + 2 != offered_wire.len) return false;
+
+        var pos: usize = 2;
+        while (pos < offered_wire.len) {
+            const protocol_len = offered_wire[pos];
+            pos += 1;
+            if (protocol_len == 0) return false;
+            if (pos + protocol_len > offered_wire.len) return false;
+
+            if (std.mem.eql(u8, offered_wire[pos .. pos + protocol_len], selected)) {
+                return true;
+            }
+
+            pos += protocol_len;
+        }
+
+        return false;
     }
 
     /// Clean up
@@ -481,6 +536,13 @@ pub const TlsContext = struct {
         if (self.application_server_secret) |secret| {
             @memset(secret, 0);
             self.allocator.free(secret);
+        }
+
+        if (self.selected_alpn) |alpn| {
+            self.allocator.free(alpn);
+        }
+        if (self.offered_alpn) |offered| {
+            self.allocator.free(offered);
         }
 
         if (self.key_schedule) |ks| {
@@ -585,6 +647,39 @@ test "Process ServerHello captures selected ALPN when present" {
     try ctx.processServerHello(server_hello);
     try std.testing.expect(ctx.getSelectedAlpn() != null);
     try std.testing.expectEqualStrings("h3", ctx.getSelectedAlpn().?);
+}
+
+test "Process ServerHello rejects selected ALPN not offered by client" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    const alpn = [_][]const u8{"h3"};
+    const params = transport_params_mod.TransportParams.defaultClient();
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_params);
+    defer allocator.free(client_hello);
+
+    const random: [32]u8 = [_]u8{21} ** 32;
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+    };
+    const server_hello_msg = handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello = try server_hello_msg.encode(allocator);
+    defer allocator.free(server_hello);
+
+    try std.testing.expectError(error.HandshakeFailed, ctx.processServerHello(server_hello));
 }
 
 test "Complete handshake flow" {
