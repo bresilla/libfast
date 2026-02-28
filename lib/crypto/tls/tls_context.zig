@@ -503,6 +503,41 @@ pub const TlsContext = struct {
         return error.HandshakeFailed;
     }
 
+    /// Select ALPN from a full encoded ClientHello.
+    pub fn selectServerAlpnFromClientHello(
+        client_hello_data: []const u8,
+        server_supported: []const []const u8,
+    ) TlsError![]const u8 {
+        const parsed = handshake_mod.parseClientHello(client_hello_data) catch {
+            return error.HandshakeFailed;
+        };
+
+        const offered_alpn = handshake_mod.findUniqueExtension(
+            parsed.extensions,
+            @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+        ) catch return error.HandshakeFailed;
+
+        const offered_alpn_wire = offered_alpn orelse return error.HandshakeFailed;
+        return selectServerAlpn(offered_alpn_wire, server_supported);
+    }
+
+    /// Encode a selected ALPN into TLS ALPN extension payload format.
+    pub fn encodeSelectedAlpnExtensionData(
+        allocator: std.mem.Allocator,
+        selected: []const u8,
+    ) TlsError![]u8 {
+        if (selected.len == 0 or selected.len > 255) {
+            return error.HandshakeFailed;
+        }
+
+        const out = try allocator.alloc(u8, selected.len + 3);
+        out[0] = @intCast(((selected.len + 1) >> 8) & 0xFF);
+        out[1] = @intCast((selected.len + 1) & 0xFF);
+        out[2] = @intCast(selected.len);
+        @memcpy(out[3 .. 3 + selected.len], selected);
+        return out;
+    }
+
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
         const alpn_data_opt = handshake_mod.findUniqueExtension(
             extensions,
@@ -810,6 +845,65 @@ test "selectServerAlpn fails when no overlap" {
 
     const supported = [_][]const u8{"h3"};
     try std.testing.expectError(error.HandshakeFailed, TlsContext.selectServerAlpn(&offered, &supported));
+}
+
+test "selectServerAlpnFromClientHello selects by server preference" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{13} ** 32;
+    const cipher_suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const alpn_wire = [_]u8{ 0x00, 0x06, 0x02, 'h', '2', 0x02, 'h', '3' };
+    const ext = [_]handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_wire,
+        },
+    };
+
+    const client_hello = handshake_mod.ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+    const payload = try client_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    const supported = [_][]const u8{ "h3", "h2" };
+    const selected = try TlsContext.selectServerAlpnFromClientHello(payload, &supported);
+    try std.testing.expectEqualStrings("h3", selected);
+}
+
+test "selectServerAlpnFromClientHello rejects duplicate ALPN extension" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{14} ** 32;
+    const cipher_suites = [_]u16{handshake_mod.TLS_AES_128_GCM_SHA256};
+    const alpn_h3 = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    const alpn_h2 = [_]u8{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]handshake_mod.Extension{
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h3 },
+        .{ .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation), .extension_data = &alpn_h2 },
+    };
+
+    const client_hello = handshake_mod.ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+    const payload = try client_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    const supported = [_][]const u8{"h3"};
+    try std.testing.expectError(error.HandshakeFailed, TlsContext.selectServerAlpnFromClientHello(payload, &supported));
+}
+
+test "encodeSelectedAlpnExtensionData emits wire format" {
+    const allocator = std.testing.allocator;
+    const payload = try TlsContext.encodeSelectedAlpnExtensionData(allocator, "h3");
+    defer allocator.free(payload);
+
+    const expected = [_]u8{ 0x00, 0x03, 0x02, 'h', '3' };
+    try std.testing.expectEqualSlices(u8, &expected, payload);
 }
 
 test "Client handshake ALPN offer rejects zero-length protocol" {

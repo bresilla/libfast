@@ -125,6 +125,67 @@ pub const ClientHello = struct {
     }
 };
 
+pub const ParsedClientHello = struct {
+    random: [32]u8,
+    cipher_suites: []const u8,
+    extensions: []const u8,
+};
+
+pub fn parseClientHello(data: []const u8) HandshakeError!ParsedClientHello {
+    if (data.len < 4) return error.InvalidMessage;
+
+    if (data[0] != @intFromEnum(HandshakeType.client_hello)) {
+        return error.InvalidMessage;
+    }
+
+    const msg_len: usize = (@as(usize, data[1]) << 16) | (@as(usize, data[2]) << 8) | data[3];
+    if (data.len < 4 + msg_len) return error.InvalidMessage;
+
+    var pos: usize = 4;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const legacy_version: u16 = (@as(u16, data[pos]) << 8) | data[pos + 1];
+    if (legacy_version != 0x0303) return error.UnsupportedVersion;
+    pos += 2;
+
+    if (pos + 32 > data.len) return error.InvalidMessage;
+    var random: [32]u8 = undefined;
+    @memcpy(&random, data[pos .. pos + 32]);
+    pos += 32;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    const session_id_len = data[pos];
+    pos += 1;
+    if (pos + session_id_len > data.len) return error.InvalidMessage;
+    pos += session_id_len;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const cipher_suites_len: usize = (@as(usize, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+    if (cipher_suites_len == 0 or (cipher_suites_len & 1) != 0) return error.InvalidMessage;
+    if (pos + cipher_suites_len > data.len) return error.InvalidMessage;
+    const cipher_suites = data[pos .. pos + cipher_suites_len];
+    pos += cipher_suites_len;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    const compression_methods_len = data[pos];
+    pos += 1;
+    if (compression_methods_len == 0) return error.InvalidMessage;
+    if (pos + compression_methods_len > data.len) return error.InvalidMessage;
+    pos += compression_methods_len;
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const ext_len: usize = (@as(usize, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+    if (pos + ext_len > data.len) return error.InvalidMessage;
+
+    return .{
+        .random = random,
+        .cipher_suites = cipher_suites,
+        .extensions = data[pos .. pos + ext_len],
+    };
+}
+
 /// ServerHello message
 pub const ServerHello = struct {
     /// Random bytes (32 bytes)
@@ -531,6 +592,32 @@ test "ClientHello encodes extensions" {
     defer allocator.free(encoded);
 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "h3") != null);
+}
+
+test "Parse ClientHello extracts extensions" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{9} ** 32;
+    const cipher_suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ext = [_]Extension{
+        .{ .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation), .extension_data = "h3" },
+    };
+
+    const client_hello = ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+
+    const encoded = try client_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    const parsed = try parseClientHello(encoded);
+    try std.testing.expectEqualSlices(u8, &random, &parsed.random);
+    try std.testing.expect(parsed.cipher_suites.len == 2);
+    const alpn = try findExtension(parsed.extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
+    try std.testing.expect(alpn != null);
+    try std.testing.expectEqualStrings("h3", alpn.?);
 }
 
 test "Find extension in parsed ServerHello" {
