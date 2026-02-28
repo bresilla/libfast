@@ -30,6 +30,12 @@ const ParsedHeader = struct {
     packet_space: PacketSpace,
 };
 
+const TlsFailureStage = enum {
+    server_hello,
+    client_hello,
+    complete,
+};
+
 /// Public QUIC connection handle
 pub const QuicConnection = struct {
     allocator: std.mem.Allocator,
@@ -195,6 +201,32 @@ pub const QuicConnection = struct {
         }
 
         try self.enterDraining(@intFromEnum(core_types.ErrorCode.flow_control_error), reason);
+    }
+
+    fn queueTlsFailure(self: *QuicConnection, stage: TlsFailureStage, err: anyerror) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        switch (err) {
+            tls_context_mod.TlsError.AlpnMismatch => {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.connection_refused), "alpn mismatch");
+            },
+            tls_context_mod.TlsError.UnsupportedCipherSuite => {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.connection_refused), "tls unsupported cipher suite");
+            },
+            tls_context_mod.TlsError.OutOfMemory => {
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.internal_error), "tls internal allocation failure");
+            },
+            else => {
+                const reason = switch (stage) {
+                    .server_hello => "tls server hello rejected",
+                    .client_hello => "tls client hello rejected",
+                    .complete => "tls handshake completion failed",
+                };
+                try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), reason);
+            },
+        }
     }
 
     fn transitionToEstablished(self: *QuicConnection) types_mod.QuicError!void {
@@ -951,17 +983,12 @@ pub const QuicConnection = struct {
         const tls_ctx = self.tls_ctx orelse return types_mod.QuicError.InvalidState;
 
         tls_ctx.processServerHello(server_hello_data) catch |err| {
-            if (err == tls_context_mod.TlsError.AlpnMismatch) {
-                try self.enterDraining(@intFromEnum(core_types.ErrorCode.connection_refused), "alpn mismatch");
-                return types_mod.QuicError.HandshakeFailed;
-            }
-
-            try self.queueProtocolViolation("tls server hello rejected");
+            try self.queueTlsFailure(.server_hello, err);
             return types_mod.QuicError.HandshakeFailed;
         };
 
-        tls_ctx.completeHandshake(shared_secret) catch {
-            try self.queueProtocolViolation("tls handshake completion failed");
+        tls_ctx.completeHandshake(shared_secret) catch |err| {
+            try self.queueTlsFailure(.complete, err);
             return types_mod.QuicError.HandshakeFailed;
         };
 
@@ -1007,8 +1034,8 @@ pub const QuicConnection = struct {
             client_hello_data,
             if (server_supported_alpn.len > 0) server_supported_alpn else tls_cfg.alpn_protocols,
             server_tp,
-        ) catch {
-            try self.queueProtocolViolation("tls client hello rejected");
+        ) catch |err| {
+            try self.queueTlsFailure(.client_hello, err);
             return types_mod.QuicError.HandshakeFailed;
         };
 
@@ -1504,6 +1531,64 @@ test "processTlsClientHello rejects ALPN no-overlap" {
         server_conn.processTlsClientHello(client_hello, &[_][]const u8{}),
     );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, server_conn.getState());
+
+    const event = server_conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.connection_refused)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("alpn mismatch", event.?.closing.reason);
+}
+
+test "processTlsServerHello maps unsupported cipher to connection refused" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const tp = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp);
+
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{91} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = 0x9999,
+        .extensions = &ext,
+    };
+    const payload = try server_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.HandshakeFailed, conn.processTlsServerHello(payload, "test-shared-secret-from-ecdhe"));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.connection_refused)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("tls unsupported cipher suite", event.?.closing.reason);
 }
 
 test "processTlsServerHello rejects malformed ALPN extension payload" {

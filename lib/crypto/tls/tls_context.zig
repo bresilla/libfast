@@ -585,7 +585,7 @@ pub const TlsContext = struct {
             }
         }
 
-        return error.HandshakeFailed;
+        return error.AlpnMismatch;
     }
 
     /// Select ALPN from a full encoded ClientHello.
@@ -949,7 +949,7 @@ test "selectServerAlpn fails when no overlap" {
     };
 
     const supported = [_][]const u8{"h3"};
-    try std.testing.expectError(error.HandshakeFailed, TlsContext.selectServerAlpn(&offered, &supported));
+    try std.testing.expectError(error.AlpnMismatch, TlsContext.selectServerAlpn(&offered, &supported));
 }
 
 test "selectServerAlpnFromClientHello selects by server preference" {
@@ -1074,7 +1074,7 @@ test "buildServerHelloFromClientHello fails on ALPN no-overlap" {
 
     const supported = [_][]const u8{"h3"};
     try std.testing.expectError(
-        error.HandshakeFailed,
+        error.AlpnMismatch,
         server_ctx.buildServerHelloFromClientHello(client_hello, &supported, server_tp_encoded),
     );
 }
