@@ -227,6 +227,13 @@ pub const QuicConnection = struct {
         return tls_ctx.state.isComplete();
     }
 
+    fn negotiationMode(self: *const QuicConnection) types_mod.NegotiationMode {
+        return switch (self.config.mode) {
+            .tls => .tls,
+            .ssh => .ssh,
+        };
+    }
+
     fn validateFrameAllowedInState(self: *QuicConnection, frame_type: u64) types_mod.QuicError!void {
         if (self.state != .connecting) {
             return;
@@ -558,6 +565,11 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.ConnectionNotEstablished;
         }
 
+        const caps = self.getModeCapabilities();
+        if (!bidirectional and !caps.supports_unidirectional_streams) {
+            return types_mod.QuicError.StreamError;
+        }
+
         if (self.internal_conn == null) {
             return types_mod.QuicError.InvalidState;
         }
@@ -886,13 +898,21 @@ pub const QuicConnection = struct {
             return false;
         }
 
+        const caps = self.getModeCapabilities();
         return switch (self.config.mode) {
             .tls => blk: {
                 const tls_ctx = self.tls_ctx orelse break :blk false;
-                break :blk self.tls_server_hello_applied and tls_ctx.state.isComplete();
+                if (caps.requires_integrated_tls_server_hello and !self.tls_server_hello_applied) {
+                    break :blk false;
+                }
+                break :blk tls_ctx.state.isComplete();
             },
             .ssh => true,
         };
+    }
+
+    pub fn getModeCapabilities(self: *const QuicConnection) types_mod.ModeCapabilities {
+        return types_mod.ModeCapabilities.forMode(self.negotiationMode());
     }
 
     /// Returns a point-in-time negotiation snapshot.
@@ -900,10 +920,7 @@ pub const QuicConnection = struct {
         const conn = self.internal_conn orelse return null;
         const remote_params = conn.remote_params orelse core_types.TransportParameters{};
 
-        const mode: types_mod.NegotiationMode = switch (self.config.mode) {
-            .tls => .tls,
-            .ssh => .ssh,
-        };
+        const mode = self.negotiationMode();
 
         return .{
             .mode = mode,
@@ -1323,6 +1340,26 @@ test "isHandshakeNegotiated requires peer transport params in SSH mode" {
     try conn.applyPeerTransportParams(encoded);
 
     try std.testing.expect(conn.isHandshakeNegotiated());
+}
+
+test "mode capabilities reflect tls and ssh modes" {
+    const allocator = std.testing.allocator;
+
+    var tls_conn = try QuicConnection.init(allocator, config_mod.QuicConfig.tlsClient("example.com"));
+    defer tls_conn.deinit();
+
+    const tls_caps = tls_conn.getModeCapabilities();
+    try std.testing.expect(tls_caps.supports_unidirectional_streams);
+    try std.testing.expect(tls_caps.supports_alpn);
+    try std.testing.expect(tls_caps.requires_integrated_tls_server_hello);
+
+    var ssh_conn = try QuicConnection.init(allocator, config_mod.QuicConfig.sshClient("example.com", "secret"));
+    defer ssh_conn.deinit();
+
+    const ssh_caps = ssh_conn.getModeCapabilities();
+    try std.testing.expect(!ssh_caps.supports_unidirectional_streams);
+    try std.testing.expect(!ssh_caps.supports_alpn);
+    try std.testing.expect(!ssh_caps.requires_integrated_tls_server_hello);
 }
 
 test "Connection state transitions" {

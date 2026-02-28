@@ -196,6 +196,31 @@ pub const NegotiationMode = enum {
     ssh,
 };
 
+/// Explicit connection capability matrix by mode.
+pub const ModeCapabilities = struct {
+    supports_unidirectional_streams: bool,
+    supports_alpn: bool,
+    requires_integrated_tls_server_hello: bool,
+    requires_peer_transport_params: bool,
+
+    pub fn forMode(mode: NegotiationMode) ModeCapabilities {
+        return switch (mode) {
+            .tls => .{
+                .supports_unidirectional_streams = true,
+                .supports_alpn = true,
+                .requires_integrated_tls_server_hello = true,
+                .requires_peer_transport_params = true,
+            },
+            .ssh => .{
+                .supports_unidirectional_streams = false,
+                .supports_alpn = false,
+                .requires_integrated_tls_server_hello = false,
+                .requires_peer_transport_params = true,
+            },
+        };
+    }
+};
+
 /// Snapshot of negotiated connection metadata.
 pub const NegotiationSnapshot = struct {
     mode: NegotiationMode,
@@ -261,4 +286,18 @@ test "ConnectionEvent variants" {
     _ = event2;
     _ = event3;
     _ = event4;
+}
+
+test "ModeCapabilities matrix" {
+    const tls_caps = ModeCapabilities.forMode(.tls);
+    try std.testing.expect(tls_caps.supports_unidirectional_streams);
+    try std.testing.expect(tls_caps.supports_alpn);
+    try std.testing.expect(tls_caps.requires_integrated_tls_server_hello);
+    try std.testing.expect(tls_caps.requires_peer_transport_params);
+
+    const ssh_caps = ModeCapabilities.forMode(.ssh);
+    try std.testing.expect(!ssh_caps.supports_unidirectional_streams);
+    try std.testing.expect(!ssh_caps.supports_alpn);
+    try std.testing.expect(!ssh_caps.requires_integrated_tls_server_hello);
+    try std.testing.expect(ssh_caps.requires_peer_transport_params);
 }
