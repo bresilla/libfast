@@ -311,6 +311,10 @@ pub const QuicConnection = struct {
     fn validateFrameAllowedInPacketSpace(self: *QuicConnection, frame_type: u64, packet_space: PacketSpace) types_mod.QuicError!void {
         _ = self;
 
+        if (isReservedFrameType(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
         if (packet_space == .retry) {
             return types_mod.QuicError.ProtocolViolation;
         }
@@ -371,10 +375,6 @@ pub const QuicConnection = struct {
         }
 
         if (packet_space != .application and (frame_type == 0x07 or frame_type == 0x18 or frame_type == 0x19 or frame_type == 0x1e)) {
-            return types_mod.QuicError.ProtocolViolation;
-        }
-
-        if (isReservedFrameType(frame_type)) {
             return types_mod.QuicError.ProtocolViolation;
         }
 
@@ -2974,6 +2974,44 @@ test "poll ignores unknown frame type in application packet space" {
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects reserved frame type in application packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 32,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1f; // reserved frame type
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
