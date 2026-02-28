@@ -3473,3 +3473,36 @@ test "poll allows NEW_CONNECTION_ID frame type in application packet space" {
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
 }
+
+test "packet-space frame legality matrix baseline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const initial_allowed = [_]u64{ 0x00, 0x01, 0x02, 0x03, 0x06, 0x1c, 0x1d };
+    for (initial_allowed) |ft| {
+        try conn.validateFrameAllowedInPacketSpace(ft, .initial);
+        try conn.validateFrameAllowedInPacketSpace(ft, .handshake);
+    }
+
+    const initial_disallowed = [_]u64{ 0x04, 0x07, 0x10, 0x18, 0x1e, 0x08 };
+    for (initial_disallowed) |ft| {
+        try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(ft, .initial));
+    }
+
+    const zero_rtt_allowed = [_]u64{ 0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1c, 0x1d, 0x08 };
+    for (zero_rtt_allowed) |ft| {
+        try conn.validateFrameAllowedInPacketSpace(ft, .zero_rtt);
+    }
+
+    const zero_rtt_disallowed = [_]u64{ 0x02, 0x03, 0x06, 0x07, 0x18, 0x19, 0x1a, 0x1b, 0x1e };
+    for (zero_rtt_disallowed) |ft| {
+        try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(ft, .zero_rtt));
+    }
+
+    try conn.validateFrameAllowedInPacketSpace(0x2b, .application); // unknown, non-reserved
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x06, .application));
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x1f, .application));
+}
