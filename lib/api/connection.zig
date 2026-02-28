@@ -1380,6 +1380,49 @@ test "processTlsServerHello rejects malformed ALPN extension payload" {
     );
 }
 
+test "processTlsServerHello rejects zero-length selected ALPN protocol" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    const tp = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp);
+
+    // ALPN list length 1 with a zero-length protocol id.
+    var alpn_zero: [3]u8 = .{ 0x00, 0x01, 0x00 };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_zero,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp,
+        },
+    };
+    const random: [32]u8 = [_]u8{36} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
 test "processTlsServerHello rejects invalid transport params extension payload" {
     const allocator = std.testing.allocator;
 
