@@ -290,6 +290,16 @@ pub const QuicConnection = struct {
             return;
         }
 
+        if (packet_space == .initial or packet_space == .handshake) {
+            if (frame_type == 0x00 or frame_type == 0x01 or frame_type == 0x06 or frame_type == 0x1c or frame_type == 0x1d) {
+                return;
+            }
+            if (frame_type == 0x02 or frame_type == 0x03) {
+                return;
+            }
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
         if (frame_type == 0x01 or frame_type == 0x1c or frame_type == 0x1d) {
             return;
         }
@@ -2885,4 +2895,51 @@ test "poll allows CRYPTO frame in Initial packet space" {
     try std.testing.expect(conn.nextEvent() == null);
 
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects MAX_DATA frame in Initial packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 6,
+        .packet_number = 29,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x10; // MAX_DATA
+    packet_len += 1;
+    packet_buf[packet_len] = 0x00; // max_data = 0
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    const second = conn.nextEvent();
+    const closing = if (first != null and first.? == .closing)
+        first
+    else if (second != null and second.? == .closing)
+        second
+    else
+        null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
 }
