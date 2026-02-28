@@ -1,6 +1,7 @@
 const std = @import("std");
 const varint = @import("../../utils/varint.zig");
 const obfuscation = @import("obfuscation.zig");
+const transport_params = @import("../../core/transport_params.zig");
 
 /// SSH_QUIC_INIT packet (Section 2.8)
 ///
@@ -21,7 +22,6 @@ const obfuscation = @import("obfuscation.zig");
 ///   byte        e = nr-ext-pairs
 ///   [repeated]  extension pairs
 ///   byte[0..]   padding (all 0xFF to minimum 1200 bytes)
-
 pub const SSH_QUIC_INIT: u8 = 1;
 pub const MIN_PAYLOAD_SIZE: usize = 1200;
 
@@ -31,6 +31,7 @@ pub const InitError = error{
     EncodingFailed,
     DecodingFailed,
     PayloadTooSmall,
+    InvalidTransportParameters,
     OutOfMemory,
 } || varint.VarintError || obfuscation.ObfuscationError;
 
@@ -65,6 +66,8 @@ pub const SshQuicInit = struct {
     /// Encode SSH_QUIC_INIT into buffer (unencrypted payload)
     pub fn encode(self: SshQuicInit, buf: []u8) InitError!usize {
         var pos: usize = 0;
+
+        self.validateTransportParams() catch return error.InvalidTransportParameters;
 
         // Packet type
         if (buf.len < 1) return error.BufferTooSmall;
@@ -188,6 +191,10 @@ pub const SshQuicInit = struct {
         return pos;
     }
 
+    fn validateTransportParams(self: SshQuicInit) transport_params.TransportParamsError!void {
+        _ = try transport_params.TransportParams.decode(std.heap.page_allocator, self.transport_params);
+    }
+
     /// Encode and encrypt SSH_QUIC_INIT into obfuscated envelope
     pub fn encodeEncrypted(
         self: SshQuicInit,
@@ -296,4 +303,30 @@ test "SSH_QUIC_INIT minimum padding" {
 
     // Should be padded to exactly MIN_PAYLOAD_SIZE
     try std.testing.expectEqual(MIN_PAYLOAD_SIZE, len);
+}
+
+test "SSH_QUIC_INIT rejects invalid transport params" {
+    const versions = [_]u32{0x00000001};
+    const kex_algs = [_]KexAlgorithm{
+        .{ .name = "curve25519-sha256", .data = "" },
+    };
+    const cipher_suites = [_][]const u8{"TLS_AES_256_GCM_SHA384"};
+
+    // max_udp_payload_size encoded as 1199 is below RFC minimum 1200.
+    const invalid_transport_params = [_]u8{ 0x03, 0x02, 0x44, 0xAF };
+
+    const init_packet = SshQuicInit{
+        .client_connection_id = &[_]u8{},
+        .server_name_indication = "",
+        .quic_versions = &versions,
+        .transport_params = &invalid_transport_params,
+        .signature_algorithms = "ssh-ed25519",
+        .trusted_fingerprints = &[_][]const u8{},
+        .kex_algorithms = &kex_algs,
+        .cipher_suites = &cipher_suites,
+        .extensions = &[_]ExtensionPair{},
+    };
+
+    var buf: [2048]u8 = undefined;
+    try std.testing.expectError(error.InvalidTransportParameters, init_packet.encode(&buf));
 }
