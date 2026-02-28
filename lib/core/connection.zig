@@ -296,7 +296,13 @@ pub const Connection = struct {
 
     /// Check connection-level flow control
     pub fn checkFlowControl(self: *Connection, additional_data: u64) Error!void {
-        if (self.data_sent + additional_data > self.max_data_remote) {
+        if (self.data_sent >= self.max_data_remote) {
+            if (additional_data > 0) return error.FlowControlError;
+            return;
+        }
+
+        const remaining = self.max_data_remote - self.data_sent;
+        if (additional_data > remaining) {
             return error.FlowControlError;
         }
     }
@@ -651,6 +657,67 @@ test "connection flow control" {
 
     // Should fail if exceeding limit
     try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(conn.max_data_remote + 1));
+}
+
+test "connection flow control exact boundary is allowed" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.data_sent = conn.max_data_remote - 10;
+    try conn.checkFlowControl(10);
+    try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(11));
+}
+
+test "connection flow control handles saturated sent counter safely" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.data_sent = conn.max_data_remote;
+    try conn.checkFlowControl(0);
+    try std.testing.expectError(error.FlowControlError, conn.checkFlowControl(1));
+}
+
+test "connection send budget follows max_data updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    // Isolate flow-control budget from congestion budget.
+    conn.congestion_controller.congestion_window = std.math.maxInt(u64);
+
+    var remote = TransportParameters{};
+    remote.initial_max_data = 2000;
+    conn.setRemoteParams(remote);
+
+    try std.testing.expectEqual(@as(u64, 2000), conn.availableSendBudget());
+
+    conn.updateDataSent(1500);
+    try std.testing.expectEqual(@as(u64, 500), conn.availableSendBudget());
+
+    // Increasing max_data increases budget by the same delta.
+    remote.initial_max_data = 2600;
+    conn.setRemoteParams(remote);
+    try std.testing.expectEqual(@as(u64, 1100), conn.availableSendBudget());
+
+    // Reducing max_data clamps budget to zero when below data_sent.
+    remote.initial_max_data = 1200;
+    conn.setRemoteParams(remote);
+    try std.testing.expectEqual(@as(u64, 0), conn.availableSendBudget());
 }
 
 test "connection applies remote stream limits" {
