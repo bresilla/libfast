@@ -17,6 +17,19 @@ const time_mod = @import("../utils/time.zig");
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 const CLOSE_REASON_MAX_LEN: usize = 256;
 
+const PacketSpace = enum {
+    initial,
+    handshake,
+    zero_rtt,
+    retry,
+    application,
+};
+
+const ParsedHeader = struct {
+    consumed: usize,
+    packet_space: PacketSpace,
+};
+
 /// Public QUIC connection handle
 pub const QuicConnection = struct {
     allocator: std.mem.Allocator,
@@ -130,7 +143,7 @@ pub const QuicConnection = struct {
         return DEFAULT_SHORT_HEADER_DCID_LEN;
     }
 
-    fn decodePacketHeader(self: *QuicConnection, packet: []const u8) types_mod.QuicError!usize {
+    fn decodePacketHeader(self: *QuicConnection, packet: []const u8) types_mod.QuicError!ParsedHeader {
         if (packet.len == 0) {
             return types_mod.QuicError.InvalidPacket;
         }
@@ -141,14 +154,23 @@ pub const QuicConnection = struct {
             const result = packet_mod.LongHeader.decode(packet) catch {
                 return types_mod.QuicError.InvalidPacket;
             };
-            return result.consumed;
+
+            const space: PacketSpace = switch (result.header.packet_type) {
+                .initial => .initial,
+                .handshake => .handshake,
+                .zero_rtt => .zero_rtt,
+                .retry => .retry,
+                else => .application,
+            };
+
+            return .{ .consumed = result.consumed, .packet_space = space };
         }
 
         const dcid_len = self.shortHeaderDcidLen();
         const result = packet_mod.ShortHeader.decode(packet, dcid_len) catch {
             return types_mod.QuicError.InvalidPacket;
         };
-        return result.consumed;
+        return .{ .consumed = result.consumed, .packet_space = .application };
     }
 
     fn queueProtocolViolation(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
@@ -222,7 +244,37 @@ pub const QuicConnection = struct {
         }
     }
 
-    fn routeFrame(self: *QuicConnection, payload: []const u8) types_mod.QuicError!void {
+    fn validateFrameAllowedInPacketSpace(self: *QuicConnection, frame_type: u64, packet_space: PacketSpace) types_mod.QuicError!void {
+        _ = self;
+
+        if (packet_space == .application) {
+            return;
+        }
+
+        if (packet_space == .retry) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        if (frame_type == 0x01 or frame_type == 0x1c or frame_type == 0x1d) {
+            return;
+        }
+
+        if (frame_type == 0x02 or frame_type == 0x03) {
+            if (packet_space == .zero_rtt) return types_mod.QuicError.ProtocolViolation;
+            return;
+        }
+
+        if (core_types.FrameType.isStreamFrame(frame_type)) {
+            return types_mod.QuicError.ProtocolViolation;
+        }
+
+        switch (frame_type) {
+            0x04, 0x05, 0x1a, 0x1b => return types_mod.QuicError.ProtocolViolation,
+            else => {},
+        }
+    }
+
+    fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!void {
         if (payload.len == 0) return;
 
         const frame_type_result = varint.decode(payload) catch {
@@ -232,6 +284,7 @@ pub const QuicConnection = struct {
         const frame_type = frame_type_result.value;
 
         try self.validateFrameAllowedInState(frame_type);
+        try self.validateFrameAllowedInPacketSpace(frame_type, packet_space);
 
         if (core_types.FrameType.isStreamFrame(frame_type)) {
             const decoded = frame_mod.StreamFrame.decode(payload) catch {
@@ -698,20 +751,20 @@ pub const QuicConnection = struct {
                 conn.updateDataReceived(packet.len);
             }
 
-            const header_len = self.decodePacketHeader(packet) catch {
+            const header = self.decodePacketHeader(packet) catch {
                 self.packets_invalid += 1;
                 try self.queueProtocolViolation("invalid packet header");
                 return;
             };
 
-            if (header_len >= packet.len) return;
+            if (header.consumed >= packet.len) return;
 
             try self.transitionToEstablished();
 
-            self.routeFrame(packet[header_len..]) catch |err| {
+            self.routeFrame(packet[header.consumed..], header.packet_space) catch |err| {
                 self.packets_invalid += 1;
                 if (err == types_mod.QuicError.ProtocolViolation) {
-                    try self.queueProtocolViolation("frame not allowed during handshake");
+                    try self.queueProtocolViolation("frame not allowed in current context");
                     return;
                 }
 
@@ -1667,14 +1720,10 @@ test "poll routes STREAM frame into stream data and readable event" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [512]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 24,
         .packet_number = 4,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1718,14 +1767,10 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [512]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 20,
         .packet_number = 5,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1762,14 +1807,10 @@ test "poll routes PATH_CHALLENGE frame and queues response token" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [256]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 16,
         .packet_number = 6,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1805,14 +1846,10 @@ test "poll routes PATH_RESPONSE frame and validates peer path" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [256]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 16,
         .packet_number = 7,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -1973,14 +2010,10 @@ test "poll maps stream receive flow control violation to closing event" {
     const local_addr = try conn.socket.?.getLocalAddress();
 
     var packet_buf: [512]u8 = undefined;
-    const header = packet_mod.LongHeader{
-        .packet_type = .initial,
-        .version = core_types.QUIC_VERSION_1,
+    const header = packet_mod.ShortHeader{
         .dest_conn_id = conn.internal_conn.?.local_conn_id,
-        .src_conn_id = conn.internal_conn.?.remote_conn_id,
-        .token = &.{},
-        .payload_len = 24,
         .packet_number = 21,
+        .key_phase = false,
     };
 
     var packet_len = try header.encode(&packet_buf);
@@ -2001,6 +2034,57 @@ test "poll maps stream receive flow control violation to closing event" {
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(
         @as(u64, @intFromEnum(core_types.ErrorCode.flow_control_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "poll rejects stream frame in Initial packet space even when established" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 22,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 1,
+        .offset = 0,
+        .data = "abc",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
