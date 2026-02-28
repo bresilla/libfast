@@ -113,9 +113,7 @@ pub const ClientHello = struct {
         try data.append(allocator, 1);
         try data.append(allocator, 0);
 
-        // Extensions (simplified for now)
-        try data.append(allocator, 0);
-        try data.append(allocator, 0);
+        try encodeExtensions(&data, allocator, self.extensions);
 
         // Fill in message length
         const content_len = data.items.len - content_start;
@@ -169,9 +167,7 @@ pub const ServerHello = struct {
         // Legacy compression method
         try data.append(allocator, 0);
 
-        // Extensions (simplified)
-        try data.append(allocator, 0);
-        try data.append(allocator, 0);
+        try encodeExtensions(&data, allocator, self.extensions);
 
         // Fill in length
         const content_len = data.items.len - content_start;
@@ -186,6 +182,7 @@ pub const ServerHello = struct {
 pub const ParsedServerHello = struct {
     random: [32]u8,
     cipher_suite: u16,
+    extensions: []const u8,
 };
 
 /// Parse a TLS ServerHello message and extract key fields.
@@ -220,10 +217,20 @@ pub fn parseServerHello(data: []const u8) HandshakeError!ParsedServerHello {
 
     if (pos + 2 > data.len) return error.InvalidMessage;
     const cipher_suite: u16 = (@as(u16, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+
+    if (pos + 1 > data.len) return error.InvalidMessage;
+    pos += 1; // legacy compression method
+
+    if (pos + 2 > data.len) return error.InvalidMessage;
+    const ext_len: usize = (@as(usize, data[pos]) << 8) | data[pos + 1];
+    pos += 2;
+    if (pos + ext_len > data.len) return error.InvalidMessage;
 
     return ParsedServerHello{
         .random = random,
         .cipher_suite = cipher_suite,
+        .extensions = data[pos .. pos + ext_len],
     };
 }
 
@@ -288,7 +295,6 @@ pub const EncryptedExtensions = struct {
 
     /// Encode EncryptedExtensions message
     pub fn encode(self: EncryptedExtensions, allocator: std.mem.Allocator) HandshakeError![]u8 {
-        _ = self;
         var data: std.ArrayList(u8) = .{};
         errdefer data.deinit(allocator);
 
@@ -301,9 +307,7 @@ pub const EncryptedExtensions = struct {
 
         const content_start = data.items.len;
 
-        // Extensions length (empty for now)
-        try data.append(allocator, 0);
-        try data.append(allocator, 0);
+        try encodeExtensions(&data, allocator, self.extensions);
 
         // Fill in length
         const content_len = data.items.len - content_start;
@@ -314,6 +318,34 @@ pub const EncryptedExtensions = struct {
         return data.toOwnedSlice(allocator);
     }
 };
+
+fn encodeExtensions(data: *std.ArrayList(u8), allocator: std.mem.Allocator, extensions: []const Extension) HandshakeError!void {
+    const len_pos = data.items.len;
+    try data.appendNTimes(allocator, 0, 2);
+
+    const start = data.items.len;
+    for (extensions) |ext| {
+        if (ext.extension_data.len > std.math.maxInt(u16)) {
+            return error.InvalidMessage;
+        }
+
+        try data.append(allocator, @intCast((ext.extension_type >> 8) & 0xFF));
+        try data.append(allocator, @intCast(ext.extension_type & 0xFF));
+
+        const ext_len: u16 = @intCast(ext.extension_data.len);
+        try data.append(allocator, @intCast((ext_len >> 8) & 0xFF));
+        try data.append(allocator, @intCast(ext_len & 0xFF));
+        try data.appendSlice(allocator, ext.extension_data);
+    }
+
+    const total_len = data.items.len - start;
+    if (total_len > std.math.maxInt(u16)) {
+        return error.InvalidMessage;
+    }
+
+    data.items[len_pos] = @intCast((total_len >> 8) & 0xFF);
+    data.items[len_pos + 1] = @intCast(total_len & 0xFF);
+}
 
 /// Cipher suite constants
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -427,6 +459,28 @@ test "Parse ServerHello" {
     const parsed = try parseServerHello(encoded);
     try std.testing.expectEqual(TLS_AES_128_GCM_SHA256, parsed.cipher_suite);
     try std.testing.expectEqualSlices(u8, &random, &parsed.random);
+    try std.testing.expectEqual(@as(usize, 0), parsed.extensions.len);
+}
+
+test "ClientHello encodes extensions" {
+    const allocator = std.testing.allocator;
+
+    const random: [32]u8 = [_]u8{0} ** 32;
+    const cipher_suites = [_]u16{TLS_AES_128_GCM_SHA256};
+    const ext = [_]Extension{
+        .{ .extension_type = @intFromEnum(ExtensionType.application_layer_protocol_negotiation), .extension_data = "h3" },
+    };
+
+    const client_hello = ClientHello{
+        .random = random,
+        .cipher_suites = &cipher_suites,
+        .extensions = &ext,
+    };
+
+    const encoded = try client_hello.encode(allocator);
+    defer allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "h3") != null);
 }
 
 test "Parse ServerHello invalid version" {

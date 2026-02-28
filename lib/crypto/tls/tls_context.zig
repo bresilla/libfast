@@ -3,6 +3,7 @@ const handshake_mod = @import("handshake.zig");
 const key_schedule_mod = @import("key_schedule.zig");
 const keys_mod = @import("../keys.zig");
 const crypto_mod = @import("../crypto.zig");
+const transport_params_mod = @import("../../core/transport_params.zig");
 
 /// TLS 1.3 context for QUIC connections
 ///
@@ -57,6 +58,9 @@ pub const TlsContext = struct {
     application_client_secret: ?[]u8 = null,
     application_server_secret: ?[]u8 = null,
 
+    /// Negotiated ALPN (when available)
+    selected_alpn: ?[]u8 = null,
+
     /// Initialize TLS context
     pub fn init(allocator: std.mem.Allocator, is_client: bool) TlsContext {
         return TlsContext{
@@ -64,6 +68,7 @@ pub const TlsContext = struct {
             .is_client = is_client,
             .state = .idle,
             .transcript = .{},
+            .selected_alpn = null,
         };
     }
 
@@ -71,6 +76,16 @@ pub const TlsContext = struct {
     pub fn startClientHandshake(
         self: *TlsContext,
         server_name: []const u8,
+    ) TlsError![]u8 {
+        return self.startClientHandshakeWithParams(server_name, &[_][]const u8{}, &[_]u8{});
+    }
+
+    /// Start TLS handshake (client) with ALPN and QUIC transport parameters.
+    pub fn startClientHandshakeWithParams(
+        self: *TlsContext,
+        server_name: []const u8,
+        alpn_protocols: []const []const u8,
+        quic_transport_params: []const u8,
     ) TlsError![]u8 {
         if (!self.is_client) {
             return error.InvalidState;
@@ -80,6 +95,9 @@ pub const TlsContext = struct {
         }
 
         _ = server_name;
+        _ = transport_params_mod.TransportParams.decode(self.allocator, quic_transport_params) catch {
+            return error.HandshakeFailed;
+        };
 
         // Generate random
         var random: [32]u8 = undefined;
@@ -92,13 +110,39 @@ pub const TlsContext = struct {
             handshake_mod.TLS_CHACHA20_POLY1305_SHA256,
         };
 
+        var ext_list: [2]handshake_mod.Extension = undefined;
+        var ext_count: usize = 0;
+
+        if (alpn_protocols.len > 0) {
+            const alpn_data = try encodeAlpnExtensionData(self.allocator, alpn_protocols);
+            errdefer self.allocator.free(alpn_data);
+
+            ext_list[ext_count] = .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+                .extension_data = alpn_data,
+            };
+            ext_count += 1;
+        }
+
+        if (quic_transport_params.len > 0) {
+            ext_list[ext_count] = .{
+                .extension_type = @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
+                .extension_data = quic_transport_params,
+            };
+            ext_count += 1;
+        }
+
         const client_hello = handshake_mod.ClientHello{
             .random = random,
             .cipher_suites = &cipher_suites,
-            .extensions = &[_]handshake_mod.Extension{},
+            .extensions = ext_list[0..ext_count],
         };
 
         const encoded = try client_hello.encode(self.allocator);
+
+        if (ext_count > 0 and alpn_protocols.len > 0) {
+            self.allocator.free(ext_list[0].extension_data);
+        }
 
         self.transcript.clearRetainingCapacity();
         try self.transcript.appendSlice(self.allocator, encoded);
@@ -239,6 +283,39 @@ pub const TlsContext = struct {
         self.key_schedule = ks_ptr;
 
         self.state = .handshake_complete;
+    }
+
+    fn encodeAlpnExtensionData(
+        allocator: std.mem.Allocator,
+        protocols: []const []const u8,
+    ) TlsError![]u8 {
+        var list_len: usize = 0;
+        for (protocols) |protocol| {
+            if (protocol.len == 0 or protocol.len > 255) {
+                return error.HandshakeFailed;
+            }
+            list_len += 1 + protocol.len;
+        }
+
+        if (list_len > std.math.maxInt(u16)) {
+            return error.HandshakeFailed;
+        }
+
+        var out = try allocator.alloc(u8, list_len + 2);
+        var pos: usize = 0;
+        out[pos] = @intCast((list_len >> 8) & 0xFF);
+        pos += 1;
+        out[pos] = @intCast(list_len & 0xFF);
+        pos += 1;
+
+        for (protocols) |protocol| {
+            out[pos] = @intCast(protocol.len);
+            pos += 1;
+            @memcpy(out[pos..][0..protocol.len], protocol);
+            pos += protocol.len;
+        }
+
+        return out;
     }
 
     fn verifyPeerIdentity(
@@ -412,6 +489,26 @@ test "Client handshake start" {
     defer allocator.free(client_hello);
 
     try std.testing.expect(client_hello.len > 0);
+    try std.testing.expectEqual(HandshakeState.client_hello_sent, ctx.state);
+}
+
+test "Client handshake start with ALPN and transport params" {
+    const allocator = std.testing.allocator;
+
+    var ctx = TlsContext.init(allocator, true);
+    defer ctx.deinit();
+
+    var params = transport_params_mod.TransportParams.defaultClient();
+    params.initial_max_data = 4096;
+    const encoded_params = try params.encode(allocator);
+    defer allocator.free(encoded_params);
+
+    const alpn = [_][]const u8{"h3"};
+
+    const client_hello = try ctx.startClientHandshakeWithParams("example.com", &alpn, encoded_params);
+    defer allocator.free(client_hello);
+
+    try std.testing.expect(std.mem.indexOf(u8, client_hello, "h3") != null);
     try std.testing.expectEqual(HandshakeState.client_hello_sent, ctx.state);
 }
 
