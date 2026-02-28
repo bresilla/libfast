@@ -8,6 +8,7 @@ const crypto_mod = @import("../crypto/crypto.zig");
 const packet_mod = @import("../core/packet.zig");
 const frame_mod = @import("../core/frame.zig");
 const core_types = @import("../core/types.zig");
+const transport_params_mod = @import("../core/transport_params.zig");
 const varint = @import("../utils/varint.zig");
 const time_mod = @import("../utils/time.zig");
 
@@ -141,7 +142,15 @@ pub const QuicConnection = struct {
             return;
         }
 
-        try self.enterDraining(1, reason);
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), reason);
+    }
+
+    fn queueTransportParameterError(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.transport_parameter_error), reason);
     }
 
     fn transitionToEstablished(self: *QuicConnection) types_mod.QuicError!void {
@@ -628,6 +637,35 @@ pub const QuicConnection = struct {
         }
     }
 
+    /// Decode and apply peer transport parameters.
+    ///
+    /// Both TLS and SSH-like handshake code paths can call this once peer
+    /// transport parameters are available. Invalid transport parameters
+    /// transition the connection into draining with transport_parameter_error.
+    pub fn applyPeerTransportParams(self: *QuicConnection, encoded_params: []const u8) types_mod.QuicError!void {
+        const decoded = transport_params_mod.TransportParams.decode(self.allocator, encoded_params) catch {
+            try self.queueTransportParameterError("invalid peer transport params");
+            return types_mod.QuicError.ProtocolViolation;
+        };
+
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+
+        conn.setRemoteParams(.{
+            .max_idle_timeout = decoded.max_idle_timeout,
+            .max_udp_payload_size = decoded.max_udp_payload_size,
+            .initial_max_data = decoded.initial_max_data,
+            .initial_max_stream_data_bidi_local = decoded.initial_max_stream_data_bidi_local,
+            .initial_max_stream_data_bidi_remote = decoded.initial_max_stream_data_bidi_remote,
+            .initial_max_stream_data_uni = decoded.initial_max_stream_data_uni,
+            .initial_max_streams_bidi = decoded.initial_max_streams_bidi,
+            .initial_max_streams_uni = decoded.initial_max_streams_uni,
+            .ack_delay_exponent = decoded.ack_delay_exponent,
+            .max_ack_delay = decoded.max_ack_delay,
+            .disable_active_migration = decoded.disable_active_migration,
+            .active_connection_id_limit = decoded.active_connection_id_limit,
+        });
+    }
+
     /// Get next connection event
     pub fn nextEvent(self: *QuicConnection) ?types_mod.ConnectionEvent {
         if (self.events.items.len == 0) {
@@ -967,7 +1005,10 @@ test "poll maps invalid packet header to closing event" {
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
-    try std.testing.expectEqual(@as(u64, 1), event.?.closing.error_code);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
 
@@ -1287,4 +1328,66 @@ test "ssh mode rejects unidirectional stream open" {
     conn.state = .established;
 
     try std.testing.expectError(types_mod.QuicError.StreamError, conn.openStream(false));
+}
+
+test "applyPeerTransportParams rejects invalid peer parameters" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.max_udp_payload_size = 1199;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.applyPeerTransportParams(payload));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.transport_parameter_error)),
+        event.?.closing.error_code,
+    );
+}
+
+test "applyPeerTransportParams updates stream open limits" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.tlsClient("example.com");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.initial_max_streams_bidi = 1;
+    encoded.initial_max_streams_uni = 0;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try conn.applyPeerTransportParams(payload);
+
+    _ = try conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(true));
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(false));
 }
