@@ -1280,6 +1280,90 @@ test "processTlsServerHello rejects missing peer transport params extension" {
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 }
 
+test "processTlsServerHello rejects malformed ALPN extension payload" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    // Malformed ALPN: list length says 3, but payload has only 2 bytes after header.
+    var malformed_alpn: [4]u8 = .{ 0x00, 0x03, 0x02, 'h' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &malformed_alpn,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = encoded_server_params,
+        },
+    };
+    const random: [32]u8 = [_]u8{33} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+}
+
+test "processTlsServerHello rejects invalid transport params extension payload" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var alpn_payload: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    // Invalid transport params payload (truncated varint parameter).
+    const invalid_tp = [_]u8{ 0x03, 0x02, 0x44 };
+
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_payload,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = &invalid_tp,
+        },
+    };
+    const random: [32]u8 = [_]u8{34} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const server_hello_bytes = try server_hello.encode(allocator);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+}
+
 test "negotiation snapshot exposes mode ALPN and peer params" {
     const allocator = std.testing.allocator;
 
