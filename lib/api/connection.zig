@@ -1474,6 +1474,99 @@ test "processTlsServerHello surfaces ALPN mismatch reason" {
     try std.testing.expectEqualStrings("alpn mismatch", event.?.closing.reason);
 }
 
+test "processTlsServerHello rejects duplicate ALPN extensions" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    const tp = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp);
+
+    var alpn_h3: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    var alpn_h2: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '2' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_h3,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_h2,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{41} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const payload = try server_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.HandshakeFailed, conn.processTlsServerHello(payload, "test-shared-secret-from-ecdhe"));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "processTlsServerHello rejects duplicate transport parameter extensions" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    const tp1 = try transport_params_mod.TransportParams.defaultServer().encode(allocator);
+    defer allocator.free(tp1);
+    var tp_params2 = transport_params_mod.TransportParams.defaultServer();
+    tp_params2.initial_max_data = 12345;
+    const tp2 = try tp_params2.encode(allocator);
+    defer allocator.free(tp2);
+
+    var alpn_h3: [5]u8 = .{ 0x00, 0x03, 0x02, 'h', '3' };
+    const ext = [_]tls_handshake_mod.Extension{
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.application_layer_protocol_negotiation),
+            .extension_data = &alpn_h3,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp1,
+        },
+        .{
+            .extension_type = @intFromEnum(tls_handshake_mod.ExtensionType.quic_transport_parameters),
+            .extension_data = tp2,
+        },
+    };
+
+    const random: [32]u8 = [_]u8{42} ** 32;
+    const server_hello = tls_handshake_mod.ServerHello{
+        .random = random,
+        .cipher_suite = tls_handshake_mod.TLS_AES_128_GCM_SHA256,
+        .extensions = &ext,
+    };
+    const payload = try server_hello.encode(allocator);
+    defer allocator.free(payload);
+
+    try std.testing.expectError(types_mod.QuicError.HandshakeFailed, conn.processTlsServerHello(payload, "test-shared-secret-from-ecdhe"));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
 test "negotiation snapshot exposes mode ALPN and peer params" {
     const allocator = std.testing.allocator;
 

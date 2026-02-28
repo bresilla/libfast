@@ -258,6 +258,32 @@ pub fn findExtension(extensions: []const u8, extension_type: u16) HandshakeError
     return null;
 }
 
+/// Find a specific extension payload and reject duplicates.
+pub fn findUniqueExtension(extensions: []const u8, extension_type: u16) HandshakeError!?[]const u8 {
+    var pos: usize = 0;
+    var found: ?[]const u8 = null;
+
+    while (pos < extensions.len) {
+        if (pos + 4 > extensions.len) return error.InvalidMessage;
+        const ext_type: u16 = (@as(u16, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        const ext_len: usize = (@as(usize, extensions[pos]) << 8) | extensions[pos + 1];
+        pos += 2;
+
+        if (pos + ext_len > extensions.len) return error.InvalidMessage;
+        const ext_data = extensions[pos .. pos + ext_len];
+        pos += ext_len;
+
+        if (ext_type == extension_type) {
+            if (found != null) return error.InvalidMessage;
+            found = ext_data;
+        }
+    }
+
+    return found;
+}
+
 /// TLS extension
 pub const Extension = struct {
     extension_type: u16,
@@ -528,6 +554,19 @@ test "Find extension in parsed ServerHello" {
     const alpn = try findExtension(parsed.extensions, @intFromEnum(ExtensionType.application_layer_protocol_negotiation));
     try std.testing.expect(alpn != null);
     try std.testing.expectEqualStrings("h3", alpn.?);
+}
+
+test "findUniqueExtension rejects duplicate extension" {
+    const extensions = [_]u8{
+        0x00, 0x10, // type
+        0x00, 0x01, // len
+        0x01,
+        0x00, 0x10, // duplicate type
+        0x00, 0x01, // len
+        0x02,
+    };
+
+    try std.testing.expectError(error.InvalidMessage, findUniqueExtension(&extensions, 0x0010));
 }
 
 test "Parse ServerHello invalid version" {

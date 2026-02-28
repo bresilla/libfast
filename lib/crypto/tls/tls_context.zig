@@ -504,7 +504,7 @@ pub const TlsContext = struct {
     }
 
     fn maybeStoreSelectedAlpn(self: *TlsContext, extensions: []const u8) TlsError!void {
-        const alpn_data_opt = handshake_mod.findExtension(
+        const alpn_data_opt = handshake_mod.findUniqueExtension(
             extensions,
             @intFromEnum(handshake_mod.ExtensionType.application_layer_protocol_negotiation),
         ) catch return error.HandshakeFailed;
@@ -536,7 +536,7 @@ pub const TlsContext = struct {
     }
 
     fn maybeStorePeerTransportParams(self: *TlsContext, extensions: []const u8) TlsError!void {
-        const tp_data_opt = handshake_mod.findExtension(
+        const tp_data_opt = handshake_mod.findUniqueExtension(
             extensions,
             @intFromEnum(handshake_mod.ExtensionType.quic_transport_parameters),
         ) catch return error.HandshakeFailed;
