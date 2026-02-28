@@ -37,6 +37,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
 
+    // Dual-mode regression subset
+    const dual_mode_module = b.createModule(.{
+        .root_source_file = b.path("lib/dual_mode_regression_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dual_mode_module.addImport("libfast", libfast_module);
+
+    const dual_mode_tests = b.addTest(.{
+        .root_module = dual_mode_module,
+    });
+    const run_dual_mode_tests = b.addRunArtifact(dual_mode_tests);
+
+    const dual_mode_step = b.step("test-dual-mode-regression", "Run paired TLS/SSH regression tests");
+    dual_mode_step.dependOn(&run_dual_mode_tests.step);
+
     // Examples
 
     // SSH echo server

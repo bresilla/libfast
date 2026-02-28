@@ -1,4 +1,4 @@
-.PHONY: build test ci install
+.PHONY: build test test-dual-mode ci install
 
 build:
 	zig build -Doptimize=ReleaseFast
@@ -6,7 +6,11 @@ build:
 test:
 	zig build test --summary all
 
+test-dual-mode:
+	zig build test-dual-mode-regression --summary all
+
 ci:
+	zig build test-dual-mode-regression --summary all
 	zig build test --summary all
 	zig build -Doptimize=ReleaseFast
 
