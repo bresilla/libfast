@@ -499,7 +499,7 @@ pub const Connection = struct {
             while (i < self.peer_connection_ids.items.len) {
                 const cid = self.peer_connection_ids.items[i];
                 if (cid.sequence_number < retire_prior_to) {
-                    try self.pending_retire_connection_ids.append(self.allocator, cid.sequence_number);
+                    try self.enqueuePendingRetireConnectionId(cid.sequence_number);
                     _ = self.peer_connection_ids.orderedRemove(i);
                     continue;
                 }
@@ -508,7 +508,7 @@ pub const Connection = struct {
         }
 
         if (sequence_number < self.peer_retire_prior_to) {
-            try self.pending_retire_connection_ids.append(self.allocator, sequence_number);
+            try self.enqueuePendingRetireConnectionId(sequence_number);
             return true;
         }
 
@@ -538,6 +538,16 @@ pub const Connection = struct {
         }
 
         return true;
+    }
+
+    fn enqueuePendingRetireConnectionId(self: *Connection, sequence_number: u64) Error!void {
+        for (self.pending_retire_connection_ids.items) |existing| {
+            if (existing == sequence_number) {
+                return;
+            }
+        }
+
+        try self.pending_retire_connection_ids.append(self.allocator, sequence_number);
     }
 
     pub fn onRetireConnectionId(self: *Connection, sequence_number: u64) bool {
@@ -1351,6 +1361,60 @@ test "connection rejects duplicate stateless reset token across peer CIDs" {
     try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, token));
     try std.testing.expect(!(try conn.onNewConnectionId(2, 0, cid2, token)));
     try std.testing.expectEqual(@as(usize, 1), conn.peer_connection_ids.items.len);
+}
+
+test "connection deduplicates pending retire IDs from repeated retire_prior_to" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.setRemoteParams(remote);
+
+    const cid0 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 0 });
+    const cid1 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 1 });
+    const cid2 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 2 });
+    const cid3 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 3 });
+
+    try std.testing.expect(try conn.onNewConnectionId(0, 0, cid0, [_]u8{1} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, [_]u8{2} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(2, 2, cid2, [_]u8{3} ** 16));
+
+    // Repeating retire_prior_to boundary should not duplicate retire queue entries.
+    try std.testing.expect(try conn.onNewConnectionId(3, 2, cid3, [_]u8{4} ** 16));
+
+    try std.testing.expectEqual(@as(?u64, 0), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, 1), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, null), conn.popRetireConnectionId());
+}
+
+test "connection deduplicates retire queue for sequence below retire_prior_to" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.setRemoteParams(remote);
+
+    const cid3 = try ConnectionId.init(&[_]u8{ 8, 8, 8, 3 });
+    try std.testing.expect(try conn.onNewConnectionId(3, 3, cid3, [_]u8{5} ** 16));
+
+    const stale_cid = try ConnectionId.init(&[_]u8{ 8, 8, 8, 1 });
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, stale_cid, [_]u8{6} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, stale_cid, [_]u8{6} ** 16));
+
+    try std.testing.expectEqual(@as(?u64, 1), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, null), conn.popRetireConnectionId());
 }
 
 test "connection queues local NEW_CONNECTION_ID entries" {

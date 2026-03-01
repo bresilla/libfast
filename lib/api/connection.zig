@@ -5625,6 +5625,183 @@ test "poll rejects invalid NEW_CONNECTION_ID retire_prior_to ordering" {
     );
 }
 
+test "poll rejects NEW_CONNECTION_ID frames exceeding active_connection_id_limit" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var remote = conn.internal_conn.?.remote_params orelse core_types.TransportParameters{};
+    remote.active_connection_id_limit = 1;
+    conn.internal_conn.?.setRemoteParams(remote);
+
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 1 });
+    const cid2 = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 2 });
+
+    var payload: [192]u8 = undefined;
+    var payload_len: usize = 0;
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = cid1,
+        .stateless_reset_token = [_]u8{1} ** 16,
+    };
+    payload_len += try frame1.encode(payload[payload_len..]);
+
+    const frame2 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = cid2,
+        .stateless_reset_token = [_]u8{2} ** 16,
+    };
+    payload_len += try frame2.encode(payload[payload_len..]);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 52);
+}
+
+test "poll rejects NEW_CONNECTION_ID with duplicate stateless reset token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var remote = conn.internal_conn.?.remote_params orelse core_types.TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.internal_conn.?.setRemoteParams(remote);
+
+    const token = [_]u8{9} ** 16;
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 8, 8, 8, 1 });
+    const cid2 = try core_types.ConnectionId.init(&[_]u8{ 8, 8, 8, 2 });
+
+    // First packet installs seq=1 with token.
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 53,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = cid1,
+        .stateless_reset_token = token,
+    };
+    packet_len += try frame1.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    // Second packet conflicts on reset token. Append trailing byte so trailing
+    // 16 bytes are not equal to token and won't be interpreted as stateless reset.
+    var payload: [192]u8 = undefined;
+    var payload_len: usize = 0;
+    const frame2 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = cid2,
+        .stateless_reset_token = token,
+    };
+    payload_len += try frame2.encode(payload[payload_len..]);
+    payload[payload_len] = 0x00;
+    payload_len += 1;
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 53);
+}
+
+test "poll rejects RETIRE_CONNECTION_ID sequence beyond observed range" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var payload: [32]u8 = undefined;
+    const frame = frame_mod.RetireConnectionIdFrame{ .sequence_number = 42 };
+    const payload_len = try frame.encode(&payload);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 54);
+}
+
+test "poll deduplicates retire queue for repeated stale NEW_CONNECTION_ID" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 55,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const fresh_cid = try core_types.ConnectionId.init(&[_]u8{ 6, 6, 6, 3 });
+    const fresh = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 3,
+        .retire_prior_to = 3,
+        .connection_id = fresh_cid,
+        .stateless_reset_token = [_]u8{3} ** 16,
+    };
+    packet_len += try fresh.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    packet_len = try header.encode(&packet_buf);
+    const stale_cid = try core_types.ConnectionId.init(&[_]u8{ 6, 6, 6, 1 });
+    const stale = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 1,
+        .connection_id = stale_cid,
+        .stateless_reset_token = [_]u8{4} ** 16,
+    };
+    packet_len += try stale.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    try std.testing.expectEqual(@as(?u64, 1), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, null), conn.popRetireConnectionId());
+}
+
 test "getPeerConnectionIdInfo returns null for out-of-range index" {
     const allocator = std.testing.allocator;
 
