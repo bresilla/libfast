@@ -1243,6 +1243,12 @@ pub const QuicConnection = struct {
         return self.buildNegotiationResult();
     }
 
+    /// Pop next pending RETIRE_CONNECTION_ID sequence requested by peer CID updates.
+    pub fn popRetireConnectionId(self: *QuicConnection) ?u64 {
+        const conn = self.internal_conn orelse return null;
+        return conn.popRetireConnectionId();
+    }
+
     /// Returns a point-in-time negotiation snapshot.
     pub fn getNegotiationSnapshot(self: *const QuicConnection) ?types_mod.NegotiationSnapshot {
         const conn = self.internal_conn orelse return null;
@@ -3855,6 +3861,68 @@ test "poll rejects invalid NEW_CONNECTION_ID retire_prior_to ordering" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+}
+
+test "poll queues RETIRE_CONNECTION_ID sequence and API can pop it" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    // First advertise seq=0.
+    var packet_buf_a: [256]u8 = undefined;
+    const header_a = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 42,
+        .key_phase = false,
+    };
+    var packet_len_a = try header_a.encode(&packet_buf_a);
+    const cid0 = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const frame0 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = cid0,
+        .stateless_reset_token = [_]u8{2} ** 16,
+    };
+    packet_len_a += try frame0.encode(packet_buf_a[packet_len_a..]);
+    _ = try sender.sendTo(packet_buf_a[0..packet_len_a], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    // Then advertise seq=1 with retire_prior_to=1 to retire seq=0.
+    var packet_buf_b: [256]u8 = undefined;
+    const header_b = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 43,
+        .key_phase = false,
+    };
+    var packet_len_b = try header_b.encode(&packet_buf_b);
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 1,
+        .connection_id = cid1,
+        .stateless_reset_token = [_]u8{3} ** 16,
+    };
+    packet_len_b += try frame1.encode(packet_buf_b[packet_len_b..]);
+    _ = try sender.sendTo(packet_buf_b[0..packet_len_b], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    const retire_seq = conn.popRetireConnectionId();
+    try std.testing.expect(retire_seq != null);
+    try std.testing.expectEqual(@as(u64, 0), retire_seq.?);
+    try std.testing.expect(conn.popRetireConnectionId() == null);
 }
 
 test "packet-space frame legality matrix baseline" {
