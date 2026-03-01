@@ -5503,6 +5503,157 @@ test "poll rejects unsupported long header version" {
     try std.testing.expectEqualStrings("unsupported version", event.?.closing.reason);
 }
 
+test "poll rejects unsupported long header version in server role" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 3, 5, 7 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 2, 4, 6, 8 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = 0x00000002,
+        .dest_conn_id = local_cid,
+        .src_conn_id = remote_cid,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 93,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("unsupported version", event.?.closing.reason);
+}
+
+test "poll rejects malformed version negotiation with fixed bit cleared" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{0x00000002},
+    };
+    const packet_len = try vn.encode(&packet_buf);
+    packet_buf[0] &= 0xBF; // clear fixed bit
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "unsupported version in later packet preserves earlier side effects" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    // First packet: valid stream side effect.
+    var short_buf: [256]u8 = undefined;
+    const short_header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 94,
+        .key_phase = false,
+    };
+    var short_len = try short_header.encode(&short_buf);
+    const stream = frame_mod.StreamFrame{
+        .stream_id = 31,
+        .offset = 0,
+        .data = "ok",
+        .fin = false,
+    };
+    short_len += try stream.encode(short_buf[short_len..]);
+
+    _ = try sender.sendTo(short_buf[0..short_len], local_addr);
+
+    // Second packet: unsupported version.
+    var long_buf: [256]u8 = undefined;
+    const bad_header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = 0x00000002,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 95,
+    };
+    var long_len = try bad_header.encode(&long_buf);
+    long_buf[long_len] = 0x01;
+    long_len += 1;
+
+    _ = try sender.sendTo(long_buf[0..long_len], local_addr);
+
+    try conn.poll();
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 31) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(saw_closing);
+}
+
 test "poll rejects truncated ACK frame payload" {
     const allocator = std.testing.allocator;
 
