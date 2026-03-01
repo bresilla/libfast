@@ -1249,6 +1249,19 @@ pub const QuicConnection = struct {
         return conn.popRetireConnectionId();
     }
 
+    /// Pop and encode next pending RETIRE_CONNECTION_ID frame.
+    ///
+    /// Returns the encoded frame length, or null if no pending retire request
+    /// exists.
+    pub fn popRetireConnectionIdFrame(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        const seq = self.popRetireConnectionId() orelse return null;
+        const frame = frame_mod.RetireConnectionIdFrame{ .sequence_number = seq };
+        const len = frame.encode(out) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return len;
+    }
+
     /// Returns a point-in-time negotiation snapshot.
     pub fn getNegotiationSnapshot(self: *const QuicConnection) ?types_mod.NegotiationSnapshot {
         const conn = self.internal_conn orelse return null;
@@ -3923,6 +3936,72 @@ test "poll queues RETIRE_CONNECTION_ID sequence and API can pop it" {
     try std.testing.expect(retire_seq != null);
     try std.testing.expectEqual(@as(u64, 0), retire_seq.?);
     try std.testing.expect(conn.popRetireConnectionId() == null);
+}
+
+test "popRetireConnectionIdFrame encodes pending retire request" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf_a: [256]u8 = undefined;
+    const header_a = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 44,
+        .key_phase = false,
+    };
+    var packet_len_a = try header_a.encode(&packet_buf_a);
+
+    const cid0 = try core_types.ConnectionId.init(&[_]u8{ 3, 3, 3, 3 });
+    const frame0 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = cid0,
+        .stateless_reset_token = [_]u8{5} ** 16,
+    };
+    packet_len_a += try frame0.encode(packet_buf_a[packet_len_a..]);
+    _ = try sender.sendTo(packet_buf_a[0..packet_len_a], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    var packet_buf_b: [256]u8 = undefined;
+    const header_b = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 45,
+        .key_phase = false,
+    };
+    var packet_len_b = try header_b.encode(&packet_buf_b);
+
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 1,
+        .connection_id = cid1,
+        .stateless_reset_token = [_]u8{6} ** 16,
+    };
+    packet_len_b += try frame1.encode(packet_buf_b[packet_len_b..]);
+
+    _ = try sender.sendTo(packet_buf_b[0..packet_len_b], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    var out: [32]u8 = undefined;
+    const encoded_len = try conn.popRetireConnectionIdFrame(&out);
+    try std.testing.expect(encoded_len != null);
+
+    const decoded = try frame_mod.RetireConnectionIdFrame.decode(out[0..encoded_len.?]);
+    try std.testing.expectEqual(@as(u64, 0), decoded.frame.sequence_number);
+    try std.testing.expect((try conn.popRetireConnectionIdFrame(&out)) == null);
 }
 
 test "packet-space frame legality matrix baseline" {
