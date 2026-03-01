@@ -105,14 +105,22 @@ pub const Stream = struct {
 
     /// Read data from receive buffer
     pub fn read(self: *Stream, buf: []u8) !usize {
-        if (self.recv_state != .recv and self.recv_state != .size_known) {
+        if (self.recv_state == .reset_recvd) {
+            self.recv_state = .reset_read;
+            return error.StreamNotReadable;
+        }
+
+        if (self.recv_state != .recv and
+            self.recv_state != .size_known and
+            self.recv_state != .data_recvd)
+        {
             return error.StreamNotReadable;
         }
 
         const available = @min(buf.len, self.recv_buffer.items.len);
         if (available == 0) {
-            if (self.fin_received and self.recv_state == .size_known) {
-                self.recv_state = .data_recvd;
+            if (self.fin_received and (self.recv_state == .size_known or self.recv_state == .data_recvd)) {
+                self.recv_state = .data_read;
                 return 0; // EOF
             }
             return error.WouldBlock;
@@ -126,8 +134,8 @@ pub const Stream = struct {
 
         self.read_offset += available;
 
-        if (self.recv_buffer.items.len == 0 and self.fin_received) {
-            self.recv_state = .data_read;
+        if (self.recv_buffer.items.len == 0 and self.fin_received and self.recv_state == .size_known) {
+            self.recv_state = .data_recvd;
         }
 
         return available;
@@ -833,6 +841,39 @@ test "stream reset enforces final size consistency" {
     try std.testing.expectEqual(types.StreamRecvState.reset_recvd, stream.recv_state);
 
     try std.testing.expectError(error.FinalSizeError, stream.onResetReceived(3));
+}
+
+test "stream read transitions from data_recvd to data_read" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("done", 0, true);
+
+    var read_buf: [16]u8 = undefined;
+    const n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(types.StreamRecvState.data_recvd, stream.recv_state);
+
+    const eof_n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 0), eof_n);
+    try std.testing.expectEqual(types.StreamRecvState.data_read, stream.recv_state);
+
+    try std.testing.expectError(error.StreamNotReadable, stream.read(&read_buf));
+}
+
+test "stream read marks reset_recvd as reset_read" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.onResetReceived(0);
+
+    var read_buf: [1]u8 = undefined;
+    try std.testing.expectError(error.StreamNotReadable, stream.read(&read_buf));
+    try std.testing.expectEqual(types.StreamRecvState.reset_read, stream.recv_state);
 }
 
 test "stream receive flow control enforces local max data" {

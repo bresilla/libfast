@@ -375,5 +375,7 @@ test "integration: ssh stream flow works without window adjust messages" {
     try std.testing.expectEqualStrings("chunk-achunk-b", buf[0..n1]);
 
     // Stream closure is detected without any explicit SSH window-adjust signaling.
+    const eof_n = try stream.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), eof_n);
     try std.testing.expectError(error.StreamNotReadable, stream.read(&buf));
 }

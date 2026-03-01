@@ -785,9 +785,6 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.ProtocolViolation;
                 };
 
-                stream.recv_state = .reset_read;
-                stream.fin_received = true;
-
                 try self.events.append(self.allocator, .{
                     .stream_closed = .{
                         .id = decoded.frame.stream_id,
@@ -1103,8 +1100,12 @@ pub const QuicConnection = struct {
         const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
         // Read data from stream
-        const read_count = stream.read(buffer) catch {
-            return types_mod.QuicError.StreamError;
+        const read_count = stream.read(buffer) catch |err| {
+            return switch (err) {
+                error.StreamNotReadable => types_mod.QuicError.StreamClosed,
+                error.WouldBlock => types_mod.QuicError.StreamError,
+                else => types_mod.QuicError.StreamError,
+            };
         };
 
         return read_count;
@@ -1151,7 +1152,7 @@ pub const QuicConnection = struct {
             else => false,
         };
         const recv_closed = switch (stream.recv_state) {
-            .data_read, .reset_read => true,
+            .data_recvd, .data_read, .reset_recvd, .reset_read => true,
             else => false,
         };
 
@@ -1848,6 +1849,15 @@ test "TLS connect wires config ALPN into ClientHello" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
     try std.testing.expect(conn.tls_ctx != null);
     try std.testing.expect(conn.tls_ctx.?.state == .client_hello_sent);
     try std.testing.expect(std.mem.indexOf(u8, conn.tls_ctx.?.transcript.items, "h3") != null);
@@ -2892,6 +2902,10 @@ test "closeStream is FIN-based half close" {
     try stream.appendRecvData(&[_]u8{}, stream.recv_offset, true);
     const eof_len = try conn.streamRead(stream_id, &read_buf);
     try std.testing.expectEqual(@as(usize, 0), eof_len);
+
+    try std.testing.expectError(types_mod.QuicError.StreamClosed, conn.streamRead(stream_id, &read_buf));
+    const closed_info = try conn.getStreamInfo(stream_id);
+    try std.testing.expectEqual(types_mod.StreamState.closed, closed_info.state);
 }
 
 test "streamWrite respects congestion send budget" {
@@ -3138,8 +3152,9 @@ test "poll routes connection close frame to closing event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    _ = conn.nextEvent(); // connected
-    const event = conn.nextEvent();
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    const event = if (first.? == .connected) conn.nextEvent() else first;
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(@as(u64, 0x0a), event.?.closing.error_code);
@@ -3191,6 +3206,9 @@ test "poll routes STREAM frame into stream data and readable event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -3216,7 +3234,6 @@ test "poll routes STREAM frame into stream data and readable event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_readable);
@@ -3846,6 +3863,9 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -3870,12 +3890,22 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    _ = conn.nextEvent(); // connected
-    const event = conn.nextEvent();
-    try std.testing.expect(event != null);
-    try std.testing.expect(event.? == .stream_closed);
-    try std.testing.expectEqual(@as(u64, 4), event.?.stream_closed.id);
-    try std.testing.expectEqual(@as(?u64, 99), event.?.stream_closed.error_code);
+    var stream_closed_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_closed) {
+            stream_closed_event = event;
+            break;
+        }
+    }
+    try std.testing.expect(stream_closed_event != null);
+    try std.testing.expectEqual(@as(u64, 4), stream_closed_event.?.stream_closed.id);
+    try std.testing.expectEqual(@as(?u64, 99), stream_closed_event.?.stream_closed.error_code);
+
+    var read_buf: [8]u8 = undefined;
+    try std.testing.expectError(types_mod.QuicError.StreamClosed, conn.streamRead(4, &read_buf));
+
+    const info = try conn.getStreamInfo(4);
+    try std.testing.expectEqual(types_mod.StreamState.recv_closed, info.state);
 }
 
 test "poll routes PATH_CHALLENGE frame and queues response token" {
