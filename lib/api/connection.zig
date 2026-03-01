@@ -5103,6 +5103,94 @@ test "poll rejects truncated NEW_CONNECTION_ID frame payload" {
     try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x18, 0x00 }, 36);
 }
 
+test "poll rejects malformed version negotiation with non-4-byte version list" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    packet_buf[0] = 0xC0;
+    std.mem.writeInt(u32, packet_buf[1..5], 0, .big);
+    packet_buf[5] = 4;
+    @memcpy(packet_buf[6..10], &[_]u8{ 1, 2, 3, 4 });
+    packet_buf[10] = 4;
+    @memcpy(packet_buf[11..15], &[_]u8{ 5, 6, 7, 8 });
+    packet_buf[15] = 0x00;
+    packet_buf[16] = 0x00;
+    packet_buf[17] = 0x02; // 3 bytes, invalid VN version list width
+
+    _ = try sender.sendTo(packet_buf[0..18], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "poll rejects truncated MAX_DATA varint payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x10, 0x40 }, 69);
+}
+
+test "poll rejects truncated RETIRE_CONNECTION_ID varint payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x19, 0x40 }, 70);
+}
+
+test "poll rejects STREAM frame with oversized length claim" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // STREAM frame: type=0x0e (OFF+LEN), stream=0, offset=0, len=5, data="ab".
+    try expectProtocolViolationFromShortHeaderPayload(
+        &conn,
+        allocator,
+        &[_]u8{ 0x0e, 0x00, 0x00, 0x05, 'a', 'b' },
+        71,
+    );
+}
+
 test "poll rejects long header with fixed bit cleared" {
     const allocator = std.testing.allocator;
 
