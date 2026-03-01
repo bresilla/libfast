@@ -215,6 +215,14 @@ pub const Stream = struct {
             return error.FlowControlError;
         };
 
+        try self.validateOverlapWithReadableData(offset, data, end_offset);
+        self.validateOverlapWithBufferedChunks(offset, data, end_offset) catch |err| {
+            if (err == error.DuplicateData) {
+                return;
+            }
+            return err;
+        };
+
         if (end_offset <= self.recv_offset) {
             return;
         }
@@ -233,15 +241,52 @@ pub const Stream = struct {
             return;
         }
 
-        if (self.recv_chunks.get(offset)) |existing| {
-            if (std.mem.eql(u8, existing, data)) {
-                return;
-            }
-            return error.OutOfOrderData;
-        }
-
         const copy = try self.allocator.dupe(u8, data);
         try self.recv_chunks.put(offset, copy);
+    }
+
+    fn validateOverlapWithReadableData(self: *const Stream, offset: u64, data: []const u8, end_offset: u64) !void {
+        const readable_start = self.read_offset;
+        const readable_end = self.recv_offset;
+
+        const overlap_start = @max(offset, readable_start);
+        const overlap_end = @min(end_offset, readable_end);
+        if (overlap_start >= overlap_end) {
+            return;
+        }
+
+        const data_start: usize = @intCast(overlap_start - offset);
+        const buffer_start: usize = @intCast(overlap_start - readable_start);
+        const overlap_len: usize = @intCast(overlap_end - overlap_start);
+
+        if (!std.mem.eql(
+            u8,
+            data[data_start .. data_start + overlap_len],
+            self.recv_buffer.items[buffer_start .. buffer_start + overlap_len],
+        )) {
+            return error.OutOfOrderData;
+        }
+    }
+
+    fn validateOverlapWithBufferedChunks(self: *const Stream, offset: u64, data: []const u8, end_offset: u64) !void {
+        var it = self.recv_chunks.iterator();
+        while (it.next()) |entry| {
+            const chunk_offset = entry.key_ptr.*;
+            const chunk = entry.value_ptr.*;
+            const chunk_end = std.math.add(u64, chunk_offset, chunk.len) catch std.math.maxInt(u64);
+
+            const overlap_start = @max(offset, chunk_offset);
+            const overlap_end = @min(end_offset, chunk_end);
+            if (overlap_start >= overlap_end) {
+                continue;
+            }
+
+            if (offset == chunk_offset and data.len == chunk.len and std.mem.eql(u8, data, chunk)) {
+                return error.DuplicateData;
+            }
+
+            return error.OutOfOrderData;
+        }
     }
 
     fn deliverBufferedChunks(self: *Stream) !void {
@@ -726,6 +771,41 @@ test "stream receive ignores duplicate segment" {
     const n = try stream.read(&read_buf);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqualStrings("chunk", read_buf[0..n]);
+}
+
+test "stream receive rejects overlapping out-of-order chunks" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("world", 5, false);
+    try std.testing.expectError(error.OutOfOrderData, stream.appendRecvData("rld!", 7, false));
+}
+
+test "stream receive accepts matching overlap with contiguous data" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("hello", 0, false);
+    try stream.appendRecvData("lo world", 3, false);
+
+    var read_buf: [32]u8 = undefined;
+    const n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 11), n);
+    try std.testing.expectEqualStrings("hello world", read_buf[0..n]);
+}
+
+test "stream receive rejects mismatched overlap with contiguous data" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("hello", 0, false);
+    try std.testing.expectError(error.OutOfOrderData, stream.appendRecvData("xlo", 2, false));
 }
 
 test "stream receive enforces final size invariants" {
