@@ -6596,6 +6596,43 @@ test "poll accepts NEW_TOKEN frame in application packet space for client" {
     try std.testing.expect(conn.getLatestNewToken() == null);
 }
 
+test "multiple NEW_TOKEN frames keep latest token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 86,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const first_token = frame_mod.NewTokenFrame{ .token = "token-first" };
+    packet_len += try first_token.encode(packet_buf[packet_len..]);
+    const second_token = frame_mod.NewTokenFrame{ .token = "token-second" };
+    packet_len += try second_token.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const token = conn.getLatestNewToken();
+    try std.testing.expect(token != null);
+    try std.testing.expectEqualStrings("token-second", token.?);
+}
+
 test "poll rejects NEW_TOKEN frame in application packet space for server" {
     const allocator = std.testing.allocator;
 
