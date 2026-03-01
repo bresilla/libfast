@@ -628,6 +628,7 @@ pub const QuicConnection = struct {
             stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch |err| {
                 return switch (err) {
                     error.FlowControlError => types_mod.QuicError.FlowControlError,
+                    error.FinalSizeError => types_mod.QuicError.ProtocolViolation,
                     error.OutOfOrderData, error.StreamClosed => types_mod.QuicError.ProtocolViolation,
                     else => types_mod.QuicError.InvalidPacket,
                 };
@@ -778,6 +779,10 @@ pub const QuicConnection = struct {
                 const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
                 const stream = conn.getOrCreateStream(decoded.frame.stream_id) catch {
                     return types_mod.QuicError.StreamError;
+                };
+
+                stream.onResetReceived(decoded.frame.final_size) catch {
+                    return types_mod.QuicError.ProtocolViolation;
                 };
 
                 stream.recv_state = .reset_read;
@@ -3453,6 +3458,190 @@ test "poll processes multiple frames in a single packet payload" {
     const n = try conn.streamRead(4, &read_buf);
     try std.testing.expectEqual(@as(usize, 11), n);
     try std.testing.expectEqualStrings("multi-frame", read_buf[0..n]);
+}
+
+test "poll reassembles out-of-order stream frames" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 37,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const tail = frame_mod.StreamFrame{
+        .stream_id = 5,
+        .offset = 5,
+        .data = "world",
+        .fin = false,
+    };
+    packet_len += try tail.encode(packet_buf[packet_len..]);
+
+    const head = frame_mod.StreamFrame{
+        .stream_id = 5,
+        .offset = 0,
+        .data = "hello",
+        .fin = false,
+    };
+    packet_len += try head.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    // Drain non-stream events and verify stream becomes readable.
+    var saw_stream_readable = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 5) {
+            saw_stream_readable = true;
+        }
+    }
+    try std.testing.expect(saw_stream_readable);
+
+    var read_buf: [32]u8 = undefined;
+    const n = try conn.streamRead(5, &read_buf);
+    try std.testing.expectEqual(@as(usize, 10), n);
+    try std.testing.expectEqualStrings("helloworld", read_buf[0..n]);
+}
+
+test "poll rejects stream data beyond known final size" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 41,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const fin_frame = frame_mod.StreamFrame{
+        .stream_id = 7,
+        .offset = 0,
+        .data = "abc",
+        .fin = true,
+    };
+    packet_len += try fin_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    packet_len = try header.encode(&packet_buf);
+    const overflow_frame = frame_mod.StreamFrame{
+        .stream_id = 7,
+        .offset = 3,
+        .data = "x",
+        .fin = false,
+    };
+    packet_len += try overflow_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_event = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing_event != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing_event.?.closing.error_code,
+    );
+}
+
+test "poll rejects RESET_STREAM with inconsistent final size" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 42,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const data_frame = frame_mod.StreamFrame{
+        .stream_id = 9,
+        .offset = 0,
+        .data = "abcd",
+        .fin = false,
+    };
+    packet_len += try data_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    packet_len = try header.encode(&packet_buf);
+    const reset_frame = frame_mod.ResetStreamFrame{
+        .stream_id = 9,
+        .error_code = 0,
+        .final_size = 2,
+    };
+    packet_len += try reset_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_event = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing_event != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing_event.?.closing.error_code,
+    );
 }
 
 test "poll processes ACK frame carrying ranges" {
