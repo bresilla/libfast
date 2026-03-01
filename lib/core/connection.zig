@@ -519,6 +519,13 @@ pub const Connection = struct {
             .stateless_reset_token = stateless_reset_token,
         });
 
+        if (self.remote_params) |params| {
+            if (self.peer_connection_ids.items.len > params.active_connection_id_limit) {
+                _ = self.peer_connection_ids.pop();
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -1059,6 +1066,27 @@ test "connection validates RETIRE_CONNECTION_ID sequence bounds" {
 
     try std.testing.expect(conn.onRetireConnectionId(3));
     try std.testing.expect(!conn.onRetireConnectionId(9));
+}
+
+test "connection enforces peer active_connection_id_limit" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 1;
+    conn.setRemoteParams(remote);
+
+    const cid1 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 1 });
+    const cid2 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 2 });
+
+    try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, [_]u8{1} ** 16));
+    try std.testing.expect(!(try conn.onNewConnectionId(2, 0, cid2, [_]u8{2} ** 16)));
+    try std.testing.expectEqual(@as(usize, 1), conn.peer_connection_ids.items.len);
 }
 
 test "connection queues local NEW_CONNECTION_ID entries" {
