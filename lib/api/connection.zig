@@ -1334,6 +1334,25 @@ pub const QuicConnection = struct {
         return len;
     }
 
+    /// Encodes pending CID-control frames into a single payload buffer.
+    ///
+    /// At most one RETIRE_CONNECTION_ID and one NEW_CONNECTION_ID are encoded,
+    /// in that order. Returns null when nothing is pending.
+    pub fn popCidControlFrames(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        var pos: usize = 0;
+
+        if (try self.popRetireConnectionIdFrame(out[pos..])) |retire_len| {
+            pos += retire_len;
+        }
+
+        if (try self.popNewConnectionIdFrame(out[pos..])) |new_cid_len| {
+            pos += new_cid_len;
+        }
+
+        if (pos == 0) return null;
+        return pos;
+    }
+
     /// Advance local retire_prior_to used for NEW_CONNECTION_ID advertisements.
     pub fn advanceLocalRetirePriorTo(self: *QuicConnection, sequence_number: u64) types_mod.QuicError!void {
         const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
@@ -4157,6 +4176,39 @@ test "popNewConnectionIdFrame drains pending NEW_CONNECTION_ID adverts in order"
     try std.testing.expectEqual(@as(u64, 2), decoded2.frame.sequence_number);
 
     try std.testing.expect((try conn.popNewConnectionIdFrame(&out)) == null);
+}
+
+test "popCidControlFrames coalesces RETIRE and NEW_CONNECTION_ID" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid0 = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const peer_cid1 = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    try std.testing.expect(try conn.internal_conn.?.onNewConnectionId(0, 0, peer_cid0, [_]u8{3} ** 16));
+    try std.testing.expect(try conn.internal_conn.?.onNewConnectionId(1, 1, peer_cid1, [_]u8{4} ** 16));
+
+    _ = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 9 }, [_]u8{8} ** 16);
+
+    var out: [256]u8 = undefined;
+    const total_len = try conn.popCidControlFrames(&out);
+    try std.testing.expect(total_len != null);
+
+    const retire = try frame_mod.RetireConnectionIdFrame.decode(out[0..total_len.?]);
+    try std.testing.expectEqual(@as(u64, 0), retire.frame.sequence_number);
+
+    const new_cid = try frame_mod.NewConnectionIdFrame.decode(out[retire.consumed..total_len.?]);
+    try std.testing.expectEqual(@as(u64, 1), new_cid.frame.sequence_number);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9, 9, 9 }, new_cid.frame.connection_id.slice());
+
+    try std.testing.expect((try conn.popCidControlFrames(&out)) == null);
 }
 
 test "packet-space frame legality matrix baseline" {
