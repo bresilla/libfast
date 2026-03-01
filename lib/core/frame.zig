@@ -70,6 +70,11 @@ pub const AckFrame = struct {
         ecn_ce_count: u64,
     };
 
+    pub const DecodeResult = struct {
+        frame: AckFrame,
+        consumed: usize,
+    };
+
     pub fn encode(self: AckFrame, buf: []u8) FrameError!usize {
         var pos: usize = 0;
 
@@ -105,7 +110,14 @@ pub const AckFrame = struct {
         return pos;
     }
 
-    pub fn decode(buf: []const u8) FrameError!struct { frame: AckFrame, consumed: usize } {
+    pub fn decode(buf: []const u8) FrameError!DecodeResult {
+        return decodeWithAckRanges(buf, &.{});
+    }
+
+    pub fn decodeWithAckRanges(
+        buf: []const u8,
+        ack_ranges_out: []AckRange,
+    ) FrameError!DecodeResult {
         var pos: usize = 0;
 
         const type_result = try varint.decode(buf[pos..]);
@@ -129,13 +141,23 @@ pub const AckFrame = struct {
         const first_ack_range_result = try varint.decode(buf[pos..]);
         pos += first_ack_range_result.len;
 
-        // Decode and ignore additional ranges for now; not yet routed.
+        if (ack_range_count_result.value > ack_ranges_out.len) {
+            return error.BufferTooSmall;
+        }
+
+        var parsed_ranges: usize = 0;
         var i: u64 = 0;
         while (i < ack_range_count_result.value) : (i += 1) {
             const gap_result = try varint.decode(buf[pos..]);
             pos += gap_result.len;
             const range_len_result = try varint.decode(buf[pos..]);
             pos += range_len_result.len;
+
+            ack_ranges_out[parsed_ranges] = .{
+                .gap = gap_result.value,
+                .ack_range_length = range_len_result.value,
+            };
+            parsed_ranges += 1;
         }
 
         var ecn_counts: ?EcnCounts = null;
@@ -159,7 +181,7 @@ pub const AckFrame = struct {
                 .largest_acked = largest_acked_result.value,
                 .ack_delay = ack_delay_result.value,
                 .first_ack_range = first_ack_range_result.value,
-                .ack_ranges = &.{},
+                .ack_ranges = ack_ranges_out[0..parsed_ranges],
                 .ecn_counts = ecn_counts,
             },
             .consumed = pos,
@@ -866,6 +888,31 @@ test "ack frame encode" {
 
     const decoded = try AckFrame.decode(buf[0..encoded_len]);
     try std.testing.expectEqual(frame.largest_acked, decoded.frame.largest_acked);
+}
+
+test "ack frame decode preserves ranges" {
+    var buf: [128]u8 = undefined;
+
+    const frame = AckFrame{
+        .largest_acked = 100,
+        .ack_delay = 5,
+        .first_ack_range = 10,
+        .ack_ranges = &[_]AckFrame.AckRange{
+            .{ .gap = 1, .ack_range_length = 2 },
+            .{ .gap = 3, .ack_range_length = 4 },
+        },
+        .ecn_counts = null,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    var ranges: [4]AckFrame.AckRange = undefined;
+    const decoded = try AckFrame.decodeWithAckRanges(buf[0..encoded_len], &ranges);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.frame.ack_ranges.len);
+    try std.testing.expectEqual(@as(u64, 1), decoded.frame.ack_ranges[0].gap);
+    try std.testing.expectEqual(@as(u64, 2), decoded.frame.ack_ranges[0].ack_range_length);
+    try std.testing.expectEqual(@as(u64, 3), decoded.frame.ack_ranges[1].gap);
+    try std.testing.expectEqual(@as(u64, 4), decoded.frame.ack_ranges[1].ack_range_length);
 }
 
 test "connection close frame encode" {

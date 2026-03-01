@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const frame = @import("frame.zig");
 const stream = @import("stream.zig");
 const packet = @import("../core/packet.zig");
 const loss_detection = @import("loss_detection.zig");
@@ -680,6 +681,22 @@ pub const Connection = struct {
         }
     }
 
+    /// Process received ACK with parsed range metadata.
+    ///
+    /// This currently forwards to the largest-acked recovery path while
+    /// preserving a stable API surface for full range-driven recovery.
+    pub fn processAckDetailedWithRanges(
+        self: *Connection,
+        largest_acked: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) void {
+        _ = first_ack_range;
+        _ = ack_ranges;
+        self.processAckDetailed(largest_acked, ack_delay);
+    }
+
     /// Track a sent packet for RTT/loss/congestion accounting.
     pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
         const pn = self.nextPacketNumber();
@@ -1319,6 +1336,29 @@ test "connection ack integrates congestion accounting" {
     try std.testing.expect(conn.congestion_controller.getBytesInFlight() >= 3600);
 
     conn.processAckDetailed(2, 0);
+
+    try std.testing.expect(conn.largest_acked >= 2);
+    try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
+}
+
+test "connection ack with ranges keeps recovery path stable" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+
+    const ack_ranges = [_]frame.AckFrame.AckRange{
+        .{ .gap = 1, .ack_range_length = 0 },
+    };
+    conn.processAckDetailedWithRanges(2, 0, 0, &ack_ranges);
 
     try std.testing.expect(conn.largest_acked >= 2);
     try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);

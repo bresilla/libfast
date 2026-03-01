@@ -636,11 +636,17 @@ pub const QuicConnection = struct {
                 return decoded.consumed;
             },
             0x02, 0x03 => {
-                const decoded = frame_mod.AckFrame.decode(payload) catch {
+                var ack_ranges: [32]frame_mod.AckFrame.AckRange = undefined;
+                const decoded = frame_mod.AckFrame.decodeWithAckRanges(payload, &ack_ranges) catch {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 if (self.internal_conn) |conn| {
-                    conn.processAckDetailed(decoded.frame.largest_acked, decoded.frame.ack_delay);
+                    conn.processAckDetailedWithRanges(
+                        decoded.frame.largest_acked,
+                        decoded.frame.ack_delay,
+                        decoded.frame.first_ack_range,
+                        decoded.frame.ack_ranges,
+                    );
                 }
                 return decoded.consumed;
             },
@@ -3357,6 +3363,48 @@ test "poll processes multiple frames in a single packet payload" {
     const n = try conn.streamRead(4, &read_buf);
     try std.testing.expectEqual(@as(usize, 11), n);
     try std.testing.expectEqualStrings("multi-frame", read_buf[0..n]);
+}
+
+test "poll processes ACK frame carrying ranges" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 38,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 10,
+        .ack_delay = 1,
+        .first_ack_range = 0,
+        .ack_ranges = &[_]frame_mod.AckFrame.AckRange{
+            .{ .gap = 1, .ack_range_length = 0 },
+        },
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
 }
 
 test "poll routes RESET_STREAM frame to stream_closed event" {
