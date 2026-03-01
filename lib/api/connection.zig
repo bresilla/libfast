@@ -18,6 +18,7 @@ const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 const CLOSE_REASON_MAX_LEN: usize = 256;
 const MAX_VN_VERSIONS: usize = 16;
 const LOCAL_SUPPORTED_VERSIONS = [_]u32{core_types.QUIC_VERSION_1};
+const FALLBACK_DRAIN_TIMEOUT_US: u64 = 3 * time_mod.Duration.SECOND;
 
 const PacketSpace = enum {
     initial,
@@ -80,6 +81,7 @@ pub const QuicConnection = struct {
     close_reason_len: usize,
     close_error_code: u64,
     drain_pending: bool,
+    drain_deadline: ?time_mod.Instant,
     closed_event_emitted: bool,
 
     // Token lifecycle state
@@ -127,6 +129,7 @@ pub const QuicConnection = struct {
             .close_reason_len = 0,
             .close_error_code = 0,
             .drain_pending = false,
+            .drain_deadline = null,
             .closed_event_emitted = false,
             .latest_new_token = null,
             .token_validator_ctx = null,
@@ -154,9 +157,19 @@ pub const QuicConnection = struct {
         error_code: u64,
         reason: []const u8,
     ) types_mod.QuicError!void {
+        if (self.state == .closed or self.state == .draining) {
+            return;
+        }
+
+        const drain_timeout = if (self.internal_conn) |conn|
+            conn.drainTimeoutDuration()
+        else
+            FALLBACK_DRAIN_TIMEOUT_US;
+
         self.setCloseReason(reason);
         self.close_error_code = error_code;
         self.drain_pending = true;
+        self.drain_deadline = time_mod.Instant.now().add(drain_timeout);
         self.state = .draining;
 
         try self.events.append(self.allocator, .{
@@ -1226,12 +1239,15 @@ pub const QuicConnection = struct {
         }
 
         if (self.state == .draining) {
-            if (self.drain_pending) {
+            const deadline = self.drain_deadline orelse time_mod.Instant.now();
+
+            if (time_mod.Instant.now().isBefore(deadline)) {
                 self.drain_pending = false;
                 return;
             }
 
             self.state = .closed;
+            self.drain_deadline = null;
             if (self.internal_conn) |conn| {
                 conn.markClosed();
             }
@@ -3242,6 +3258,9 @@ test "draining transitions to closed and emits closed event" {
     try conn.poll();
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 
+    // Force drain timer expiry for deterministic test progression.
+    conn.drain_deadline = time_mod.Instant.now().sub(1);
+
     // Second poll transitions to closed and emits closed event
     try conn.poll();
     try std.testing.expectEqual(types_mod.ConnectionState.closed, conn.getState());
@@ -3249,6 +3268,33 @@ test "draining transitions to closed and emits closed event" {
     const closed_event = conn.nextEvent();
     try std.testing.expect(closed_event != null);
     try std.testing.expect(closed_event.? == .closed);
+}
+
+test "close is idempotent while draining" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try conn.close(77, "first-close");
+    try conn.close(88, "second-close");
+
+    const closing = conn.nextEvent();
+    try std.testing.expect(closing != null);
+    try std.testing.expect(closing.? == .closing);
+    try std.testing.expectEqual(@as(u64, 77), closing.?.closing.error_code);
+    try std.testing.expectEqualStrings("first-close", closing.?.closing.reason);
+    try std.testing.expect(conn.nextEvent() == null);
 }
 
 test "poll routes STREAM frame into stream data and readable event" {

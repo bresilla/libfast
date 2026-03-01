@@ -874,6 +874,13 @@ pub const Connection = struct {
         return pto;
     }
 
+    /// Drain timeout derived from recovery timing (RFC-style 3 PTOs).
+    pub fn drainTimeoutDuration(self: *const Connection) u64 {
+        const base = self.currentPtoDuration();
+        const derived = std.math.mul(u64, base, 3) catch std.math.maxInt(u64);
+        return @min(@max(derived, 50 * time.Duration.MILLISECOND), 30 * time.Duration.SECOND);
+    }
+
     /// Track a sent packet for RTT/loss/congestion accounting.
     pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
         self.trackPacketSentInSpace(.application, packet_size, ack_eliciting);
@@ -1624,6 +1631,20 @@ test "connection PTO includes peer max_ack_delay" {
         base_pto + (25 * time.Duration.MILLISECOND),
         conn.currentPtoDuration(),
     );
+}
+
+test "connection drain timeout derives from PTO" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const timeout = conn.drainTimeoutDuration();
+    try std.testing.expect(timeout >= 50 * time.Duration.MILLISECOND);
+    try std.testing.expect(timeout <= 30 * time.Duration.SECOND);
 }
 
 test "connection ack with ranges keeps recovery path stable" {
