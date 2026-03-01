@@ -362,6 +362,13 @@ pub const Connection = struct {
         );
     }
 
+    /// Apply peer MAX_DATA update (monotonic increase only).
+    pub fn onMaxData(self: *Connection, new_max_data: u64) void {
+        if (new_max_data > self.max_data_remote) {
+            self.max_data_remote = new_max_data;
+        }
+    }
+
     /// Process received ACK
     pub fn processAck(self: *Connection, largest_acked: u64) void {
         self.processAckDetailed(largest_acked, 0);
@@ -718,6 +725,23 @@ test "connection send budget follows max_data updates monotonically" {
     remote.initial_max_data = 1200;
     conn.setRemoteParams(remote);
     try std.testing.expectEqual(@as(u64, 0), conn.availableSendBudget());
+}
+
+test "connection applies MAX_DATA updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.max_data_remote = 1000;
+    conn.onMaxData(900);
+    try std.testing.expectEqual(@as(u64, 1000), conn.max_data_remote);
+
+    conn.onMaxData(2000);
+    try std.testing.expectEqual(@as(u64, 2000), conn.max_data_remote);
 }
 
 test "connection applies remote stream limits" {

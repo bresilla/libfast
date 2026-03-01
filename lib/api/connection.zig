@@ -491,6 +491,15 @@ pub const QuicConnection = struct {
                 try self.enterDraining(decoded.frame.error_code, decoded.frame.reason);
                 return decoded.consumed;
             },
+            0x10 => {
+                const decoded = frame_mod.MaxDataFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onMaxData(decoded.frame.max_data);
+                return decoded.consumed;
+            },
             0x04 => {
                 const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
@@ -2633,6 +2642,44 @@ test "poll routes STREAM frame into stream data and readable event" {
     const n = try conn.streamRead(4, &read_buf);
     try std.testing.expectEqual(@as(usize, 12), n);
     try std.testing.expectEqualStrings("hello-stream", read_buf[0..n]);
+}
+
+test "poll routes MAX_DATA frame and raises send budget" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const before_max_data = conn.internal_conn.?.max_data_remote;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 37,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const max_data = frame_mod.MaxDataFrame{ .max_data = conn.internal_conn.?.max_data_remote + 2048 };
+    packet_len += try max_data.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    const after_max_data = conn.internal_conn.?.max_data_remote;
+    try std.testing.expect(after_max_data > before_max_data);
 }
 
 test "poll processes multiple frames in a single packet payload" {

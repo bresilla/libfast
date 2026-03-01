@@ -375,6 +375,22 @@ pub const MaxDataFrame = struct {
         pos += try varint.encode(self.max_data, buf[pos..]);
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: MaxDataFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x10) return error.InvalidFrameType;
+
+        const max_data_result = try varint.decode(buf[pos..]);
+        pos += max_data_result.len;
+
+        return .{
+            .frame = .{ .max_data = max_data_result.value },
+            .consumed = pos,
+        };
+    }
 };
 
 /// MAX_STREAM_DATA frame (0x11)
@@ -739,6 +755,16 @@ test "path response frame encode/decode" {
     try std.testing.expectEqualSlices(u8, &frame.data, &decoded.frame.data);
 }
 
+test "max data frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = MaxDataFrame{ .max_data = 4096 };
+    const len = try frame.encode(&buf);
+
+    const decoded = try MaxDataFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(frame.max_data, decoded.frame.max_data);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
 test "frame decode malformed corpus" {
     try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
     try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
@@ -771,6 +797,7 @@ test "frame decode fuzz smoke" {
             0x02, 0x03 => _ = AckFrame.decode(sample) catch continue,
             0x04 => _ = ResetStreamFrame.decode(sample) catch continue,
             0x05 => _ = StopSendingFrame.decode(sample) catch continue,
+            0x10 => _ = MaxDataFrame.decode(sample) catch continue,
             0x1a => _ = PathChallengeFrame.decode(sample) catch continue,
             0x1b => _ = PathResponseFrame.decode(sample) catch continue,
             0x1c, 0x1d => _ = ConnectionCloseFrame.decode(sample) catch continue,
