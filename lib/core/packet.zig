@@ -174,8 +174,8 @@ pub const LongHeader = struct {
         @memcpy(buf[pos..][0..self.src_conn_id.len], self.src_conn_id.slice());
         pos += self.src_conn_id.len;
 
-        // Token (for Initial packets)
-        if (self.packet_type == .initial) {
+        // Token (for Initial and Retry packets)
+        if (self.packet_type == .initial or self.packet_type == .retry) {
             const token_len = try varint.encode(self.token.len, buf[pos..]);
             pos += token_len;
             if (pos + self.token.len > buf.len) return error.BufferTooSmall;
@@ -240,9 +240,9 @@ pub const LongHeader = struct {
         const src_conn_id = try ConnectionId.init(buf[pos..][0..scid_len]);
         pos += scid_len;
 
-        // Token (for Initial packets)
+        // Token (for Initial and Retry packets)
         var token: []const u8 = &.{};
-        if (packet_type == .initial) {
+        if (packet_type == .initial or packet_type == .retry) {
             const token_len_result = try varint.decode(buf[pos..]);
             pos += token_len_result.len;
             const token_len = token_len_result.value;
@@ -398,6 +398,29 @@ test "long header initial packet encode/decode" {
     try std.testing.expect(result.header.dest_conn_id.eql(&dcid));
     try std.testing.expect(result.header.src_conn_id.eql(&scid));
     try std.testing.expectEqual(@as(u64, 42), result.header.packet_number);
+}
+
+test "long header retry packet encodes and decodes token" {
+    var buf: [256]u8 = undefined;
+
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    const header = LongHeader{
+        .packet_type = .retry,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = "retry-token",
+        .payload_len = 1,
+        .packet_number = 7,
+    };
+
+    const encoded_len = try header.encode(&buf);
+    const result = try LongHeader.decode(buf[0..encoded_len]);
+
+    try std.testing.expectEqual(PacketType.retry, result.header.packet_type);
+    try std.testing.expectEqualStrings("retry-token", result.header.token);
 }
 
 test "short header packet encode/decode" {

@@ -30,6 +30,7 @@ const ParsedHeader = struct {
     packet_space: PacketSpace,
     is_short_header: bool,
     initial_token: []const u8,
+    src_conn_id: ?core_types.ConnectionId,
 };
 
 const TlsFailureStage = enum {
@@ -84,6 +85,11 @@ pub const QuicConnection = struct {
     token_validator_ctx: ?*anyopaque,
     token_validator: ?*const fn (ctx: ?*anyopaque, token: []const u8) bool,
 
+    // Retry handling state (client)
+    retry_token: ?[]u8,
+    retry_source_conn_id: ?core_types.ConnectionId,
+    retry_seen: bool,
+
     /// Initialize a new QUIC connection
     pub fn init(
         allocator: std.mem.Allocator,
@@ -121,6 +127,9 @@ pub const QuicConnection = struct {
             .latest_new_token = null,
             .token_validator_ctx = null,
             .token_validator = null,
+            .retry_token = null,
+            .retry_source_conn_id = null,
+            .retry_seen = false,
         };
     }
 
@@ -183,7 +192,8 @@ pub const QuicConnection = struct {
                 .consumed = result.consumed,
                 .packet_space = space,
                 .is_short_header = false,
-                .initial_token = if (space == .initial) result.header.token else &.{},
+                .initial_token = if (space == .initial or space == .retry) result.header.token else &.{},
+                .src_conn_id = result.header.src_conn_id,
             };
         }
 
@@ -196,6 +206,7 @@ pub const QuicConnection = struct {
             .packet_space = .application,
             .is_short_header = true,
             .initial_token = &.{},
+            .src_conn_id = null,
         };
     }
 
@@ -242,6 +253,49 @@ pub const QuicConnection = struct {
         };
         @memcpy(copy, token);
         self.latest_new_token = copy;
+    }
+
+    fn storeRetryToken(self: *QuicConnection, token: []const u8) types_mod.QuicError!void {
+        if (self.retry_token) |existing| {
+            self.allocator.free(existing);
+            self.retry_token = null;
+        }
+
+        const copy = self.allocator.alloc(u8, token.len) catch {
+            return types_mod.QuicError.OutOfMemory;
+        };
+        @memcpy(copy, token);
+        self.retry_token = copy;
+    }
+
+    fn handleRetryPacket(self: *QuicConnection, header: ParsedHeader) types_mod.QuicError!void {
+        if (self.config.role != .client or self.state != .connecting) {
+            try self.queueProtocolViolation("unexpected retry packet");
+            return;
+        }
+
+        if (self.retry_seen) {
+            try self.queueProtocolViolation("multiple retry packets");
+            return;
+        }
+
+        if (header.initial_token.len == 0) {
+            try self.queueInvalidToken("retry token missing");
+            return;
+        }
+
+        const retry_scid = header.src_conn_id orelse {
+            try self.queueProtocolViolation("retry source connection id missing");
+            return;
+        };
+
+        try self.storeRetryToken(header.initial_token);
+        self.retry_source_conn_id = retry_scid;
+        self.retry_seen = true;
+
+        if (self.internal_conn) |conn| {
+            conn.remote_conn_id = retry_scid;
+        }
     }
 
     fn validateToken(self: *QuicConnection, token: []const u8) bool {
@@ -1104,6 +1158,11 @@ pub const QuicConnection = struct {
                 }
             }
 
+            if (header.packet_space == .retry) {
+                try self.handleRetryPacket(header);
+                return;
+            }
+
             if (header.consumed >= packet.len) return;
 
             try self.transitionToEstablished();
@@ -1304,11 +1363,24 @@ pub const QuicConnection = struct {
         return self.latest_new_token;
     }
 
+    /// Returns the latest token received from a Retry packet.
+    pub fn getRetryToken(self: *const QuicConnection) ?[]const u8 {
+        return self.retry_token;
+    }
+
     /// Clears the currently cached NEW_TOKEN value.
     pub fn clearLatestNewToken(self: *QuicConnection) void {
         if (self.latest_new_token) |token| {
             self.allocator.free(token);
             self.latest_new_token = null;
+        }
+    }
+
+    /// Clears the currently cached Retry token value.
+    pub fn clearRetryToken(self: *QuicConnection) void {
+        if (self.retry_token) |token| {
+            self.allocator.free(token);
+            self.retry_token = null;
         }
     }
 
@@ -1537,6 +1609,7 @@ pub const QuicConnection = struct {
         }
 
         self.clearLatestNewToken();
+        self.clearRetryToken();
 
         if (self.internal_conn) |conn| {
             conn.deinit();
@@ -4178,6 +4251,128 @@ test "poll detects stateless reset pattern on short header failure" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqualStrings("stateless reset", event.?.closing.reason);
+}
+
+test "client processes Retry packet and updates retry state" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = "retry-token-from-server",
+        .payload_len = 1,
+        .packet_number = 50,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    const retry_token = conn.getRetryToken();
+    try std.testing.expect(retry_token != null);
+    try std.testing.expectEqualStrings("retry-token-from-server", retry_token.?);
+    try std.testing.expect(conn.internal_conn.?.remote_conn_id.eql(&retry_scid));
+}
+
+test "client rejects Retry packet with empty token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 8, 8, 8, 8 });
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = &.{},
+        .payload_len = 1,
+        .packet_number = 51,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.invalid_token)),
+        event.?.closing.error_code,
+    );
+}
+
+test "server rejects Retry packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 2, 2 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 3, 3, 4, 4 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = local_cid,
+        .src_conn_id = remote_cid,
+        .token = "retry-token",
+        .payload_len = 1,
+        .packet_number = 52,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "poll rejects RETIRE_CONNECTION_ID frame in zero_rtt packet space" {
