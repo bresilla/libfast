@@ -1387,6 +1387,14 @@ pub const QuicConnection = struct {
         return self.retry_token;
     }
 
+    /// Returns the latest Retry source connection ID advertised by peer.
+    pub fn getRetrySourceConnectionId(self: *const QuicConnection) ?[]const u8 {
+        if (self.retry_source_conn_id) |*cid| {
+            return cid.slice();
+        }
+        return null;
+    }
+
     /// Clears the currently cached NEW_TOKEN value.
     pub fn clearLatestNewToken(self: *QuicConnection) void {
         if (self.latest_new_token) |token| {
@@ -4342,6 +4350,58 @@ test "client processes Retry packet and updates retry state" {
     try std.testing.expect(retry_token != null);
     try std.testing.expectEqualStrings("retry-token-from-server", retry_token.?);
     try std.testing.expect(conn.internal_conn.?.remote_conn_id.eql(&retry_scid));
+
+    const retry_scid_slice = conn.getRetrySourceConnectionId();
+    try std.testing.expect(retry_scid_slice != null);
+    try std.testing.expectEqualSlices(u8, retry_scid.slice(), retry_scid_slice.?);
+}
+
+test "client rejects second Retry packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const expectation = RetryIntegrityExpectation{
+        .token = "retry-token",
+        .retry_scid = retry_scid.slice(),
+    };
+    conn.setRetryIntegrityValidator(@ptrCast(@constCast(&expectation)), retryIntegrityValidator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = "retry-token",
+        .payload_len = 1,
+        .packet_number = 54,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "client rejects Retry packet when integrity validator fails" {
