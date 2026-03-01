@@ -3665,6 +3665,166 @@ test "poll processes multiple frames in a single packet payload" {
     try std.testing.expectEqualStrings("multi-frame", read_buf[0..n]);
 }
 
+test "poll preserves earlier frame effects before later malformed frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 66,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 13,
+        .offset = 0,
+        .data = "ok",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    // Malformed ACK tail (truncated after type byte).
+    packet_buf[packet_len] = 0x02;
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream_readable = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 13) {
+            saw_stream_readable = true;
+        }
+        if (event == .closing) {
+            saw_closing = true;
+        }
+    }
+
+    try std.testing.expect(saw_stream_readable);
+    try std.testing.expect(saw_closing);
+
+    const info = try conn.getStreamInfo(13);
+    try std.testing.expectEqual(@as(types_mod.StreamId, 13), info.id);
+}
+
+test "poll stops frame loop on first malformed frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 67,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    // Malformed ACK first (truncated), should abort frame loop.
+    packet_buf[packet_len] = 0x02;
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 14,
+        .offset = 0,
+        .data = "late",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream_readable = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 14) {
+            saw_stream_readable = true;
+        }
+        if (event == .closing) {
+            saw_closing = true;
+        }
+    }
+
+    try std.testing.expect(!saw_stream_readable);
+    try std.testing.expect(saw_closing);
+    try std.testing.expectError(types_mod.QuicError.StreamNotFound, conn.getStreamInfo(14));
+}
+
+test "poll keeps path response side effect before malformed trailing frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 68,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const challenge = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try challenge.encode(packet_buf[packet_len..]);
+
+    // Malformed CONNECTION_CLOSE tail.
+    packet_buf[packet_len] = 0x1c;
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const pending = conn.internal_conn.?.popPathResponse();
+    try std.testing.expect(pending != null);
+    try std.testing.expectEqualSlices(u8, &challenge.data, &pending.?);
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_closing);
+}
+
 test "poll reassembles out-of-order stream frames" {
     const allocator = std.testing.allocator;
 
