@@ -248,6 +248,26 @@ pub const StreamManager = struct {
         self.max_local_streams_uni = max_streams_uni;
     }
 
+    pub fn onMaxStreams(self: *StreamManager, bidirectional: bool, max_streams: u64) void {
+        if (bidirectional) {
+            if (max_streams > self.max_local_streams_bidi) {
+                self.max_local_streams_bidi = max_streams;
+            }
+            return;
+        }
+
+        if (max_streams > self.max_local_streams_uni) {
+            self.max_local_streams_uni = max_streams;
+        }
+    }
+
+    pub fn onMaxStreamData(self: *StreamManager, stream_id: StreamId, max_stream_data: u64) void {
+        const stream = self.streams.getPtr(stream_id) orelse return;
+        if (max_stream_data > stream.max_stream_data_remote) {
+            stream.max_stream_data_remote = max_stream_data;
+        }
+    }
+
     pub fn setRemoteStreamDataLimits(self: *StreamManager, bidi_local: u64, bidi_remote: u64, uni: u64) void {
         self.remote_max_stream_data_bidi_local = bidi_local;
         self.remote_max_stream_data_bidi_remote = bidi_remote;
@@ -469,6 +489,39 @@ test "stream manager enforces local stream limits" {
     _ = try manager.createStream(.client_bidi);
     try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_bidi));
     try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_uni));
+}
+
+test "stream manager applies MAX_STREAMS updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    var manager = StreamManager.init(allocator, false, 1024);
+    defer manager.deinit();
+
+    manager.setLocalOpenLimits(1, 1);
+    manager.onMaxStreams(true, 0);
+    try std.testing.expectEqual(@as(u64, 1), manager.max_local_streams_bidi);
+
+    manager.onMaxStreams(true, 3);
+    try std.testing.expectEqual(@as(u64, 3), manager.max_local_streams_bidi);
+
+    manager.onMaxStreams(false, 2);
+    try std.testing.expectEqual(@as(u64, 2), manager.max_local_streams_uni);
+}
+
+test "stream manager applies MAX_STREAM_DATA updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    var manager = StreamManager.init(allocator, false, 1024);
+    defer manager.deinit();
+
+    const stream_id = try manager.createStream(.client_bidi);
+    const before = manager.getStream(stream_id).?.max_stream_data_remote;
+
+    manager.onMaxStreamData(stream_id, before - 1);
+    try std.testing.expectEqual(before, manager.getStream(stream_id).?.max_stream_data_remote);
+
+    manager.onMaxStreamData(stream_id, before + 4096);
+    try std.testing.expectEqual(before + 4096, manager.getStream(stream_id).?.max_stream_data_remote);
 }
 
 test "stream manager applies remote send limits by stream type" {

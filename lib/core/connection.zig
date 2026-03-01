@@ -369,6 +369,14 @@ pub const Connection = struct {
         }
     }
 
+    pub fn onMaxStreams(self: *Connection, bidirectional: bool, max_streams: u64) void {
+        self.streams.onMaxStreams(bidirectional, max_streams);
+    }
+
+    pub fn onMaxStreamData(self: *Connection, stream_id: StreamId, max_stream_data: u64) void {
+        self.streams.onMaxStreamData(stream_id, max_stream_data);
+    }
+
     /// Process received ACK
     pub fn processAck(self: *Connection, largest_acked: u64) void {
         self.processAckDetailed(largest_acked, 0);
@@ -742,6 +750,36 @@ test "connection applies MAX_DATA updates monotonically" {
 
     conn.onMaxData(2000);
     try std.testing.expectEqual(@as(u64, 2000), conn.max_data_remote);
+}
+
+test "connection applies MAX_STREAMS updates" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.streams.setLocalOpenLimits(1, 1);
+    conn.onMaxStreams(true, 4);
+    try std.testing.expectEqual(@as(u64, 4), conn.streams.max_local_streams_bidi);
+}
+
+test "connection applies MAX_STREAM_DATA updates" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    const sid = try conn.openStream(true);
+    const before = conn.getStream(sid).?.max_stream_data_remote;
+    conn.onMaxStreamData(sid, before + 5000);
+    try std.testing.expectEqual(before + 5000, conn.getStream(sid).?.max_stream_data_remote);
 }
 
 test "connection applies remote stream limits" {

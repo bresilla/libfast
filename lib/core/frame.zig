@@ -405,6 +405,28 @@ pub const MaxStreamDataFrame = struct {
         pos += try varint.encode(self.max_stream_data, buf[pos..]);
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: MaxStreamDataFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x11) return error.InvalidFrameType;
+
+        const stream_id_result = try varint.decode(buf[pos..]);
+        pos += stream_id_result.len;
+
+        const max_stream_data_result = try varint.decode(buf[pos..]);
+        pos += max_stream_data_result.len;
+
+        return .{
+            .frame = .{
+                .stream_id = stream_id_result.value,
+                .max_stream_data = max_stream_data_result.value,
+            },
+            .consumed = pos,
+        };
+    }
 };
 
 /// MAX_STREAMS frame (0x12-0x13)
@@ -418,6 +440,30 @@ pub const MaxStreamsFrame = struct {
         pos += try varint.encode(frame_type, buf[pos..]);
         pos += try varint.encode(self.max_streams, buf[pos..]);
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: MaxStreamsFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+
+        const bidirectional = switch (type_result.value) {
+            0x12 => true,
+            0x13 => false,
+            else => return error.InvalidFrameType,
+        };
+
+        const max_streams_result = try varint.decode(buf[pos..]);
+        pos += max_streams_result.len;
+
+        return .{
+            .frame = .{
+                .max_streams = max_streams_result.value,
+                .bidirectional = bidirectional,
+            },
+            .consumed = pos,
+        };
     }
 };
 
@@ -765,6 +811,39 @@ test "max data frame encode/decode" {
     try std.testing.expectEqual(len, decoded.consumed);
 }
 
+test "max stream data frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = MaxStreamDataFrame{ .stream_id = 4, .max_stream_data = 8192 };
+    const len = try frame.encode(&buf);
+
+    const decoded = try MaxStreamDataFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(frame.stream_id, decoded.frame.stream_id);
+    try std.testing.expectEqual(frame.max_stream_data, decoded.frame.max_stream_data);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
+test "max streams frame encode/decode bidi" {
+    var buf: [32]u8 = undefined;
+    const frame = MaxStreamsFrame{ .max_streams = 12, .bidirectional = true };
+    const len = try frame.encode(&buf);
+
+    const decoded = try MaxStreamsFrame.decode(buf[0..len]);
+    try std.testing.expect(decoded.frame.bidirectional);
+    try std.testing.expectEqual(frame.max_streams, decoded.frame.max_streams);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
+test "max streams frame encode/decode uni" {
+    var buf: [32]u8 = undefined;
+    const frame = MaxStreamsFrame{ .max_streams = 7, .bidirectional = false };
+    const len = try frame.encode(&buf);
+
+    const decoded = try MaxStreamsFrame.decode(buf[0..len]);
+    try std.testing.expect(!decoded.frame.bidirectional);
+    try std.testing.expectEqual(frame.max_streams, decoded.frame.max_streams);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
 test "frame decode malformed corpus" {
     try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
     try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
@@ -798,6 +877,8 @@ test "frame decode fuzz smoke" {
             0x04 => _ = ResetStreamFrame.decode(sample) catch continue,
             0x05 => _ = StopSendingFrame.decode(sample) catch continue,
             0x10 => _ = MaxDataFrame.decode(sample) catch continue,
+            0x11 => _ = MaxStreamDataFrame.decode(sample) catch continue,
+            0x12, 0x13 => _ = MaxStreamsFrame.decode(sample) catch continue,
             0x1a => _ = PathChallengeFrame.decode(sample) catch continue,
             0x1b => _ = PathResponseFrame.decode(sample) catch continue,
             0x1c, 0x1d => _ = ConnectionCloseFrame.decode(sample) catch continue,
