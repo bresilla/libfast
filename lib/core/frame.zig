@@ -141,6 +141,12 @@ pub const AckFrame = struct {
         const first_ack_range_result = try varint.decode(buf[pos..]);
         pos += first_ack_range_result.len;
 
+        if (first_ack_range_result.value > largest_acked_result.value) {
+            return error.InvalidData;
+        }
+
+        var current_smallest: u64 = largest_acked_result.value - first_ack_range_result.value;
+
         if (ack_range_count_result.value > ack_ranges_out.len) {
             return error.BufferTooSmall;
         }
@@ -158,6 +164,18 @@ pub const AckFrame = struct {
                 .ack_range_length = range_len_result.value,
             };
             parsed_ranges += 1;
+
+            const step = gap_result.value + 2;
+            if (current_smallest < step) {
+                return error.InvalidData;
+            }
+
+            const next_largest = current_smallest - step;
+            if (range_len_result.value > next_largest) {
+                return error.InvalidData;
+            }
+
+            current_smallest = next_largest - range_len_result.value;
         }
 
         var ecn_counts: ?EcnCounts = null;
@@ -913,6 +931,39 @@ test "ack frame decode preserves ranges" {
     try std.testing.expectEqual(@as(u64, 2), decoded.frame.ack_ranges[0].ack_range_length);
     try std.testing.expectEqual(@as(u64, 3), decoded.frame.ack_ranges[1].gap);
     try std.testing.expectEqual(@as(u64, 4), decoded.frame.ack_ranges[1].ack_range_length);
+}
+
+test "ack frame decode rejects first range larger than largest acked" {
+    var buf: [64]u8 = undefined;
+
+    const frame = AckFrame{
+        .largest_acked = 3,
+        .ack_delay = 0,
+        .first_ack_range = 4,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    try std.testing.expectError(error.InvalidData, AckFrame.decode(buf[0..encoded_len]));
+}
+
+test "ack frame decode rejects range underflow" {
+    var buf: [64]u8 = undefined;
+
+    const frame = AckFrame{
+        .largest_acked = 10,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &[_]AckFrame.AckRange{
+            .{ .gap = 15, .ack_range_length = 0 },
+        },
+        .ecn_counts = null,
+    };
+
+    const encoded_len = try frame.encode(&buf);
+    var ranges: [2]AckFrame.AckRange = undefined;
+    try std.testing.expectError(error.InvalidData, AckFrame.decodeWithAckRanges(buf[0..encoded_len], &ranges));
 }
 
 test "connection close frame encode" {
