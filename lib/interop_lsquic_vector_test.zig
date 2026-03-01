@@ -23,6 +23,14 @@ test "interop lsquic varint vectors" {
     }
 }
 
+test "interop lsquic varint incomplete-read vectors" {
+    // Mirrors incomplete input behavior from xtra/lsquic/tests/test_varint.c.
+    try std.testing.expectError(error.UnexpectedEof, varint.decode(&[_]u8{}));
+    try std.testing.expectError(error.UnexpectedEof, varint.decode(&[_]u8{0x40}));
+    try std.testing.expectError(error.UnexpectedEof, varint.decode(&[_]u8{ 0x9D, 0x7F }));
+    try std.testing.expectError(error.UnexpectedEof, varint.decode(&[_]u8{ 0xC2, 0x19, 0x7C, 0x5E, 0xFF, 0x14, 0xE8 }));
+}
+
 test "interop lsquic version negotiation low-bit tolerance" {
     const dcid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
     const scid = try core_types.ConnectionId.init(&[_]u8{ 9, 8, 7, 6 });
@@ -136,6 +144,34 @@ test "interop lsquic ack sparse range vectors" {
     var ranges_out: [256]frame_mod.AckFrame.AckRange = undefined;
     const decoded = try frame_mod.AckFrame.decodeWithAckRanges(buf[0..len], &ranges_out);
     try std.testing.expectEqual(@as(usize, 256), decoded.frame.ack_ranges.len);
+}
+
+test "interop lsquic ack 256-range capacity and overflow" {
+    var ranges_in: [256]frame_mod.AckFrame.AckRange = undefined;
+    for (ranges_in[0..], 0..) |*range, i| {
+        range.* = .{
+            .gap = @as(u64, @intCast(i % 2)),
+            .ack_range_length = @as(u64, @intCast(i % 3)),
+        };
+    }
+
+    const frame = frame_mod.AckFrame{
+        .largest_acked = 5_000,
+        .ack_delay = 0,
+        .first_ack_range = 200,
+        .ack_ranges = ranges_in[0..],
+        .ecn_counts = null,
+    };
+
+    var buf: [4096]u8 = undefined;
+    const len = try frame.encode(&buf);
+
+    var ok_out: [256]frame_mod.AckFrame.AckRange = undefined;
+    const decoded = try frame_mod.AckFrame.decodeWithAckRanges(buf[0..len], &ok_out);
+    try std.testing.expectEqual(@as(usize, 256), decoded.frame.ack_ranges.len);
+
+    var small_out: [255]frame_mod.AckFrame.AckRange = undefined;
+    try std.testing.expectError(error.BufferTooSmall, frame_mod.AckFrame.decodeWithAckRanges(buf[0..len], &small_out));
 }
 
 test "interop lsquic ack truncation matrix" {
