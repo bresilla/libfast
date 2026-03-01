@@ -1512,6 +1512,7 @@ pub const QuicConnection = struct {
     pub fn getStats(self: *QuicConnection) types_mod.ConnectionStats {
         var stats = types_mod.ConnectionStats{};
         stats.packets_received = self.packets_received;
+        stats.packets_invalid = self.packets_invalid;
 
         if (self.internal_conn) |conn| {
             stats.bytes_sent = conn.data_sent;
@@ -3252,6 +3253,72 @@ test "poll maps invalid packet header to closing event" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll malformed version negotiation increments invalid packet stats" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    packet_buf[0] = 0xC0;
+    std.mem.writeInt(u32, packet_buf[1..5], 0, .big);
+    packet_buf[5] = 4;
+    @memcpy(packet_buf[6..10], &[_]u8{ 1, 2, 3, 4 });
+    packet_buf[10] = 4;
+    @memcpy(packet_buf[11..15], &[_]u8{ 5, 6, 7, 8 });
+    // Missing versions list bytes.
+
+    _ = try sender.sendTo(packet_buf[0..15], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll while draining does not consume new packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(1, "enter-drain");
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+    _ = try sender.sendTo(&[_]u8{0x40}, local_addr);
+
+    const before = conn.getStats();
+    try conn.poll();
+    const after = conn.getStats();
+
+    try std.testing.expectEqual(before.packets_received, after.packets_received);
+    try std.testing.expectEqual(before.packets_invalid, after.packets_invalid);
 }
 
 test "poll routes ACK frame into connection ack tracking" {

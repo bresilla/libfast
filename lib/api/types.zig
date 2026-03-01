@@ -108,6 +108,9 @@ pub const ConnectionStats = struct {
     /// Total packets received
     packets_received: u64 = 0,
 
+    /// Total packets rejected as invalid/malformed
+    packets_invalid: u64 = 0,
+
     /// Total bytes sent
     bytes_sent: u64 = 0,
 
@@ -275,6 +278,7 @@ test "ConnectionStats initialization" {
     const stats = ConnectionStats{};
 
     try std.testing.expectEqual(@as(u64, 0), stats.packets_sent);
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_invalid);
     try std.testing.expectEqual(@as(u64, 0), stats.bytes_sent);
 }
 
