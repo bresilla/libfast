@@ -878,6 +878,12 @@ pub const HandshakeDoneFrame = struct {
     pub fn encode(_: HandshakeDoneFrame, buf: []u8) FrameError!usize {
         return try varint.encode(0x1e, buf);
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: HandshakeDoneFrame, consumed: usize } {
+        const type_result = try varint.decode(buf);
+        if (type_result.value != 0x1e) return error.InvalidFrameType;
+        return .{ .frame = HandshakeDoneFrame{}, .consumed = type_result.len };
+    }
 };
 
 // Tests
@@ -1201,6 +1207,16 @@ test "new token frame encode/decode" {
     try std.testing.expectEqual(len, decoded.consumed);
 }
 
+test "handshake done frame encode/decode" {
+    var buf: [16]u8 = undefined;
+    const frame = HandshakeDoneFrame{};
+    const len = try frame.encode(&buf);
+
+    const decoded = try HandshakeDoneFrame.decode(buf[0..len]);
+    _ = decoded.frame;
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
 test "stream frame decode without LEN consumes remaining payload" {
     var buf: [32]u8 = undefined;
     var pos: usize = 0;
@@ -1323,6 +1339,7 @@ test "connection close decode rejects truncated reason bytes" {
 }
 
 test "frame decode malformed corpus" {
+    try std.testing.expectError(error.InvalidFrameType, HandshakeDoneFrame.decode(&[_]u8{0x01}));
     try std.testing.expectError(error.UnexpectedEof, CryptoFrame.decode(&[_]u8{ 0x06, 0x00, 0x40 }));
     try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
     try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));

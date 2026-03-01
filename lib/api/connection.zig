@@ -909,6 +909,17 @@ pub const QuicConnection = struct {
                 try self.storeNewToken(decoded.frame.token);
                 return decoded.consumed;
             },
+            0x1e => {
+                const decoded = frame_mod.HandshakeDoneFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                if (self.config.role == .server) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                return decoded.consumed;
+            },
             else => {
                 // Unknown/unhandled frame type in this slice: ignore.
                 return payload.len;
@@ -6300,6 +6311,104 @@ test "poll allows HANDSHAKE_DONE frame in application packet space" {
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects HANDSHAKE_DONE frame in application packet space for server" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 6, 6, 6, 6 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = local_cid,
+        .packet_number = 98,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll processes HANDSHAKE_DONE then STREAM in application packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 99,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 33,
+        .offset = 0,
+        .data = "hs-done-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 33) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(!saw_closing);
 }
 
 test "poll rejects CRYPTO frame in application packet space" {
