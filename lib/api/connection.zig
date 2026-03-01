@@ -649,9 +649,11 @@ pub const QuicConnection = struct {
                         return types_mod.QuicError.ProtocolViolation;
                     }
 
+                    const ack_delay_us = conn.normalizePeerAckDelay(decoded.frame.ack_delay);
+
                     conn.processAckDetailedWithRanges(
                         decoded.frame.largest_acked,
-                        decoded.frame.ack_delay,
+                        ack_delay_us,
                         decoded.frame.first_ack_range,
                         decoded.frame.ack_ranges,
                     );

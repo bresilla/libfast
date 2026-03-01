@@ -632,6 +632,24 @@ pub const Connection = struct {
         return largest_acked < self.next_packet_number;
     }
 
+    /// Decode peer ACK Delay field into microseconds.
+    ///
+    /// ACK delay is encoded by peer using its advertised ack_delay_exponent and
+    /// bounded by its max_ack_delay transport parameter.
+    pub fn normalizePeerAckDelay(self: *const Connection, encoded_ack_delay: u64) u64 {
+        const params = self.remote_params orelse self.local_params;
+        const shift: u6 = @intCast(@min(params.ack_delay_exponent, 20));
+
+        var scaled = encoded_ack_delay;
+        var i: u6 = 0;
+        while (i < shift) : (i += 1) {
+            scaled = std.math.mul(u64, scaled, 2) catch std.math.maxInt(u64);
+        }
+
+        const max_ack_delay_us = params.max_ack_delay * time.Duration.MILLISECOND;
+        return @min(scaled, max_ack_delay_us);
+    }
+
     /// Validate ACK ranges against sent packet number space and processing limits.
     pub fn validateAckFrame(
         self: *const Connection,
@@ -1485,6 +1503,27 @@ test "connection validates ACK frame ranges against sent space" {
 
     const invalid_unsent = [_]frame.AckFrame.AckRange{};
     try std.testing.expect(!conn.validateAckFrame(3, 0, &invalid_unsent));
+}
+
+test "connection normalizes peer ACK delay with exponent and max" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var params = types.TransportParameters{};
+    params.ack_delay_exponent = 4;
+    params.max_ack_delay = 10; // milliseconds
+    conn.remote_params = params;
+
+    // encoded_ack_delay=100 => 100 * 2^4 = 1600us
+    try std.testing.expectEqual(@as(u64, 1600), conn.normalizePeerAckDelay(100));
+
+    // Large encoded value is clamped by max_ack_delay (10ms => 10000us)
+    try std.testing.expectEqual(@as(u64, 10 * time.Duration.MILLISECOND), conn.normalizePeerAckDelay(10_000));
 }
 
 test "connection ack with ranges keeps recovery path stable" {
