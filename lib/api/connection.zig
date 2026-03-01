@@ -1867,6 +1867,48 @@ fn tokenEqualsValidator(ctx: ?*anyopaque, token: []const u8) bool {
     return std.mem.eql(u8, expected.*, token);
 }
 
+fn expectProtocolViolationFromShortHeaderPayload(
+    conn: *QuicConnection,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    packet_number: u64,
+) !void {
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = packet_number,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    if (packet_len + payload.len > packet_buf.len) {
+        return error.BufferTooSmall;
+    }
+    @memcpy(packet_buf[packet_len .. packet_len + payload.len], payload);
+    packet_len += payload.len;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
 const RetryIntegrityExpectation = struct {
     token: []const u8,
     retry_scid: []const u8,
@@ -4523,6 +4565,128 @@ test "poll rejects spoofed version negotiation including current version" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqualStrings("invalid version negotiation", event.?.closing.reason);
+}
+
+test "poll rejects malformed version negotiation packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    packet_buf[0] = 0xC0; // long header + fixed bit
+    std.mem.writeInt(u32, packet_buf[1..5], 0, .big); // VN marker version
+    packet_buf[5] = 4; // DCID length
+    @memcpy(packet_buf[6..10], &[_]u8{ 1, 2, 3, 4 });
+    packet_buf[10] = 4; // SCID length
+    @memcpy(packet_buf[11..15], &[_]u8{ 5, 6, 7, 8 });
+    // No versions list bytes -> malformed VN packet.
+
+    _ = try sender.sendTo(packet_buf[0..15], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "poll rejects truncated ACK frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{0x02}, 34);
+}
+
+test "poll rejects truncated RESET_STREAM frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // RESET_STREAM frame type + partial stream id varint only.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x04, 0x00 }, 35);
+}
+
+test "poll rejects truncated NEW_CONNECTION_ID frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // NEW_CONNECTION_ID frame type + sequence number only.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x18, 0x00 }, 36);
+}
+
+test "poll rejects long header with fixed bit cleared" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 37,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[0] &= 0xBF; // clear fixed bit
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
