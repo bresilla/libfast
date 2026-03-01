@@ -1285,7 +1285,7 @@ pub const QuicConnection = struct {
 
         const frame = frame_mod.NewConnectionIdFrame{
             .sequence_number = latest.sequence_number,
-            .retire_prior_to = 0,
+            .retire_prior_to = conn.localRetirePriorTo(),
             .connection_id = latest.connection_id,
             .stateless_reset_token = latest.stateless_reset_token,
         };
@@ -1294,6 +1294,12 @@ pub const QuicConnection = struct {
             return types_mod.QuicError.InvalidPacket;
         };
         return len;
+    }
+
+    /// Advance local retire_prior_to used for NEW_CONNECTION_ID advertisements.
+    pub fn advanceLocalRetirePriorTo(self: *QuicConnection, sequence_number: u64) types_mod.QuicError!void {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        conn.advanceLocalRetirePriorTo(sequence_number);
     }
 
     /// Returns a point-in-time negotiation snapshot.
@@ -4051,6 +4057,7 @@ test "queueNewConnectionId and encodeLatestNewConnectionIdFrame" {
 
     const seq = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 9 }, [_]u8{8} ** 16);
     try std.testing.expectEqual(@as(u64, 1), seq);
+    try conn.advanceLocalRetirePriorTo(1);
 
     var out: [128]u8 = undefined;
     const encoded_len = try conn.encodeLatestNewConnectionIdFrame(&out);
@@ -4058,7 +4065,7 @@ test "queueNewConnectionId and encodeLatestNewConnectionIdFrame" {
 
     const decoded = try frame_mod.NewConnectionIdFrame.decode(out[0..encoded_len.?]);
     try std.testing.expectEqual(@as(u64, 1), decoded.frame.sequence_number);
-    try std.testing.expectEqual(@as(u64, 0), decoded.frame.retire_prior_to);
+    try std.testing.expectEqual(@as(u64, 1), decoded.frame.retire_prior_to);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9, 9, 9 }, decoded.frame.connection_id.slice());
     try std.testing.expectEqualSlices(u8, &([_]u8{8} ** 16), &decoded.frame.stateless_reset_token);
 }

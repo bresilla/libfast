@@ -95,6 +95,7 @@ pub const Connection = struct {
     /// Local NEW_CONNECTION_ID advertisement state
     local_connection_ids: std.ArrayList(LocalConnectionIdEntry),
     local_next_cid_sequence: u64,
+    local_retire_prior_to: u64,
 
     /// Allocator
     allocator: std.mem.Allocator,
@@ -151,6 +152,7 @@ pub const Connection = struct {
             .pending_retire_connection_ids = .{},
             .local_connection_ids = .{},
             .local_next_cid_sequence = 0,
+            .local_retire_prior_to = 0,
             .allocator = allocator,
         };
 
@@ -220,6 +222,7 @@ pub const Connection = struct {
             .pending_retire_connection_ids = .{},
             .local_connection_ids = .{},
             .local_next_cid_sequence = 0,
+            .local_retire_prior_to = 0,
             .allocator = allocator,
         };
 
@@ -560,6 +563,22 @@ pub const Connection = struct {
     pub fn latestLocalConnectionId(self: *const Connection) ?LocalConnectionIdEntry {
         if (self.local_connection_ids.items.len == 0) return null;
         return self.local_connection_ids.items[self.local_connection_ids.items.len - 1];
+    }
+
+    pub fn localRetirePriorTo(self: *const Connection) u64 {
+        return self.local_retire_prior_to;
+    }
+
+    pub fn advanceLocalRetirePriorTo(self: *Connection, sequence_number: u64) void {
+        if (sequence_number <= self.local_retire_prior_to) {
+            return;
+        }
+
+        if (sequence_number > self.local_next_cid_sequence) {
+            return;
+        }
+
+        self.local_retire_prior_to = sequence_number;
     }
 
     /// Process received ACK
@@ -1059,6 +1078,30 @@ test "connection queues local NEW_CONNECTION_ID entries" {
     try std.testing.expect(latest != null);
     try std.testing.expectEqual(@as(u64, 1), latest.?.sequence_number);
     try std.testing.expect(latest.?.connection_id.eql(&cid1));
+}
+
+test "connection local retire_prior_to advances monotonically" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.advanceLocalRetirePriorTo(0);
+    try std.testing.expectEqual(@as(u64, 0), conn.localRetirePriorTo());
+
+    // Cannot advance past advertised local sequence horizon.
+    conn.advanceLocalRetirePriorTo(2);
+    try std.testing.expectEqual(@as(u64, 0), conn.localRetirePriorTo());
+
+    _ = try conn.queueNewConnectionId(try ConnectionId.init(&[_]u8{ 9, 9, 9, 9 }), [_]u8{1} ** 16);
+    conn.advanceLocalRetirePriorTo(1);
+    try std.testing.expectEqual(@as(u64, 1), conn.localRetirePriorTo());
+
+    conn.advanceLocalRetirePriorTo(1);
+    try std.testing.expectEqual(@as(u64, 1), conn.localRetirePriorTo());
 }
 
 test "connection applies remote stream limits" {
