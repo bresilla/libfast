@@ -295,26 +295,31 @@ pub const QuicConnection = struct {
 
     fn handleRetryPacket(self: *QuicConnection, header: ParsedHeader) types_mod.QuicError!void {
         if (self.config.role != .client or self.state != .connecting) {
+            self.packets_invalid += 1;
             try self.queueProtocolViolation("unexpected retry packet");
             return;
         }
 
         if (self.retry_seen) {
+            self.packets_invalid += 1;
             try self.queueProtocolViolation("multiple retry packets");
             return;
         }
 
         if (header.initial_token.len == 0) {
+            self.packets_invalid += 1;
             try self.queueInvalidToken("retry token missing");
             return;
         }
 
         const retry_scid = header.src_conn_id orelse {
+            self.packets_invalid += 1;
             try self.queueProtocolViolation("retry source connection id missing");
             return;
         };
 
         if (!self.validateRetryIntegrity(header.initial_token, retry_scid)) {
+            self.packets_invalid += 1;
             try self.queueProtocolViolation("retry integrity check failed");
             return;
         }
@@ -413,12 +418,14 @@ pub const QuicConnection = struct {
 
         const mutual = selectMutualVersion(decoded.packet.supported_versions);
         if (mutual == null) {
+            self.packets_invalid += 1;
             try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), "no mutual QUIC version");
             return true;
         }
 
         // VN packets advertising the currently attempted version are invalid.
         if (mutual.? == core_types.QUIC_VERSION_1) {
+            self.packets_invalid += 1;
             try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), "invalid version negotiation");
             return true;
         }
@@ -5456,6 +5463,9 @@ test "poll handles version negotiation packet with no mutual version" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqualStrings("no mutual QUIC version", event.?.closing.reason);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "server ignores version negotiation packets" {
@@ -5497,6 +5507,9 @@ test "server ignores version negotiation packets" {
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expect(conn.getState() != .draining);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_invalid);
 }
 
 test "client ignores version negotiation packet after establishment" {
@@ -5535,6 +5548,9 @@ test "client ignores version negotiation packet after establishment" {
     }
     try std.testing.expect(!saw_closing);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_invalid);
 }
 
 test "poll rejects spoofed version negotiation including current version" {
@@ -5569,6 +5585,9 @@ test "poll rejects spoofed version negotiation including current version" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqualStrings("invalid version negotiation", event.?.closing.reason);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll rejects malformed version negotiation packet" {
@@ -5970,6 +5989,9 @@ test "poll rejects long header with fixed bit cleared" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
@@ -6413,6 +6435,9 @@ test "poll rejects HANDSHAKE_DONE frame in application packet space for server" 
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll processes HANDSHAKE_DONE then STREAM in application packet" {
@@ -6500,6 +6525,9 @@ test "poll rejects CRYPTO frame in application packet space" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll allows CRYPTO frame in Initial packet space" {
@@ -7239,6 +7267,9 @@ test "server token validator rejects invalid Initial token" {
         @as(u64, @intFromEnum(core_types.ErrorCode.invalid_token)),
         event.?.closing.error_code,
     );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll detects stateless reset pattern on short header failure" {
