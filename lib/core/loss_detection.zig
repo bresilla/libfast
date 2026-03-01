@@ -115,7 +115,7 @@ pub const RttStats = struct {
     }
 
     /// Get probe timeout (PTO) in microseconds
-    pub fn pto(self: *RttStats) u64 {
+    pub fn pto(self: *const RttStats) u64 {
         return self.smoothed_rtt + (self.rttvar * 4);
     }
 };
@@ -380,12 +380,12 @@ pub const LossDetection = struct {
     }
 
     /// Get PTO (Probe Timeout) in microseconds
-    pub fn getPto(self: *LossDetection) u64 {
+    pub fn getPto(self: *const LossDetection) u64 {
         return self.rtt_stats.pto();
     }
 
     /// Get smoothed RTT in microseconds
-    pub fn getSmoothedRtt(self: *LossDetection) u64 {
+    pub fn getSmoothedRtt(self: *const LossDetection) u64 {
         return self.rtt_stats.smoothed_rtt;
     }
 

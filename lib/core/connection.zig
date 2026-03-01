@@ -760,7 +760,7 @@ pub const Connection = struct {
             if (acked.in_flight) {
                 self.congestion_controller.onPacketAcked(acked.size, acked.packet_number);
                 self.pto_count = 0;
-                self.next_pto_at = now.add(self.loss_detection.getPto());
+                self.next_pto_at = now.add(self.currentPtoDuration());
             }
         }
 
@@ -863,6 +863,17 @@ pub const Connection = struct {
         }
     }
 
+    fn currentPtoDuration(self: *const Connection) u64 {
+        var pto = self.loss_detection.getPto();
+
+        // Apply peer max_ack_delay once transport parameters are available.
+        if (self.remote_params) |params| {
+            pto += params.max_ack_delay * time.Duration.MILLISECOND;
+        }
+
+        return pto;
+    }
+
     /// Track a sent packet for RTT/loss/congestion accounting.
     pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
         self.trackPacketSentInSpace(.application, packet_size, ack_eliciting);
@@ -884,7 +895,7 @@ pub const Connection = struct {
         }
 
         if (ack_eliciting) {
-            self.next_pto_at = now.add(self.loss_detection.getPto());
+            self.next_pto_at = now.add(self.currentPtoDuration());
         }
     }
 
@@ -903,7 +914,7 @@ pub const Connection = struct {
 
             self.pto_count += 1;
 
-            const base_pto = self.loss_detection.getPto();
+            const base_pto = self.currentPtoDuration();
             const shift: u6 = @intCast(@min(self.pto_count, 20));
             const backoff = (@as(u64, 1) << shift);
             self.next_pto_at = now.add(base_pto * backoff);
@@ -1593,6 +1604,26 @@ test "connection normalizes peer ACK delay with exponent and max" {
 
     // Large encoded value is clamped by max_ack_delay (10ms => 10000us)
     try std.testing.expectEqual(@as(u64, 10 * time.Duration.MILLISECOND), conn.normalizePeerAckDelay(10_000));
+}
+
+test "connection PTO includes peer max_ack_delay" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var params = types.TransportParameters{};
+    params.max_ack_delay = 25; // milliseconds
+    conn.remote_params = params;
+
+    const base_pto = conn.loss_detection.getPto();
+    try std.testing.expectEqual(
+        base_pto + (25 * time.Duration.MILLISECOND),
+        conn.currentPtoDuration(),
+    );
 }
 
 test "connection ack with ranges keeps recovery path stable" {
