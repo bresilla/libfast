@@ -239,6 +239,18 @@ pub const SpaceDetectionState = struct {
 
         return lost_packets;
     }
+
+    pub fn maxObservedPacketNumber(self: *const SpaceDetectionState) ?types.PacketNumber {
+        var max_seen = self.largest_acked;
+
+        for (self.sent_packets.items) |packet| {
+            if (max_seen == null or packet.packet_number > max_seen.?) {
+                max_seen = packet.packet_number;
+            }
+        }
+
+        return max_seen;
+    }
 };
 
 /// Loss detection manager
@@ -280,6 +292,14 @@ pub const LossDetection = struct {
 
     /// Get space state
     fn getSpace(self: *LossDetection, space: PacketNumberSpace) *SpaceDetectionState {
+        return switch (space) {
+            .initial => &self.initial,
+            .handshake => &self.handshake,
+            .application => &self.application,
+        };
+    }
+
+    fn getSpaceConst(self: *const LossDetection, space: PacketNumberSpace) *const SpaceDetectionState {
         return switch (space) {
             .initial => &self.initial,
             .handshake => &self.handshake,
@@ -367,6 +387,12 @@ pub const LossDetection = struct {
     /// Get smoothed RTT in microseconds
     pub fn getSmoothedRtt(self: *LossDetection) u64 {
         return self.rtt_stats.smoothed_rtt;
+    }
+
+    /// Returns the highest packet number observed in a packet number space.
+    pub fn maxObservedPacketNumber(self: *const LossDetection, space: PacketNumberSpace) ?types.PacketNumber {
+        const space_state = self.getSpaceConst(space);
+        return space_state.maxObservedPacketNumber();
     }
 };
 

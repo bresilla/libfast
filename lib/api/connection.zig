@@ -364,6 +364,15 @@ pub const QuicConnection = struct {
         return false;
     }
 
+    fn recoverySpaceForPacketSpace(packet_space: PacketSpace) ?conn_internal.RecoverySpace {
+        return switch (packet_space) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .application => .application,
+            .zero_rtt, .retry => null,
+        };
+    }
+
     fn queueTlsFailure(self: *QuicConnection, stage: TlsFailureStage, err: anyerror) types_mod.QuicError!void {
         if (self.state == .closed) {
             return;
@@ -641,7 +650,12 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 if (self.internal_conn) |conn| {
-                    if (!conn.validateAckFrame(
+                    const recovery_space = recoverySpaceForPacketSpace(packet_space) orelse {
+                        return types_mod.QuicError.ProtocolViolation;
+                    };
+
+                    if (!conn.validateAckFrameInSpace(
+                        recovery_space,
                         decoded.frame.largest_acked,
                         decoded.frame.first_ack_range,
                         decoded.frame.ack_ranges,
@@ -651,7 +665,8 @@ pub const QuicConnection = struct {
 
                     const ack_delay_us = conn.normalizePeerAckDelay(decoded.frame.ack_delay);
 
-                    conn.processAckDetailedWithRanges(
+                    conn.processAckDetailedWithRangesInSpace(
+                        recovery_space,
                         decoded.frame.largest_acked,
                         ack_delay_us,
                         decoded.frame.first_ack_range,
@@ -2991,7 +3006,7 @@ test "poll routes ACK frame into connection ack tracking" {
     try conn.connect("127.0.0.1", 4433);
     var sent_count: usize = 0;
     while (sent_count < 8) : (sent_count += 1) {
-        conn.internal_conn.?.trackPacketSent(1200, true);
+        conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true);
     }
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);

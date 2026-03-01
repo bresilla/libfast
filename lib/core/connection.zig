@@ -14,6 +14,7 @@ const TransportParameters = types.TransportParameters;
 const StreamManager = stream.StreamManager;
 const StreamId = types.StreamId;
 const MAX_ACK_PACKETS_PER_FRAME: usize = 1024;
+pub const RecoverySpace = loss_detection.PacketNumberSpace;
 
 /// QUIC Connection
 pub const Connection = struct {
@@ -629,7 +630,19 @@ pub const Connection = struct {
 
     /// Returns whether ACKed packet number is plausible for packets sent so far.
     pub fn canAcknowledgePacket(self: *const Connection, largest_acked: u64) bool {
-        return largest_acked < self.next_packet_number;
+        return self.canAcknowledgePacketInSpace(.application, largest_acked);
+    }
+
+    /// Returns whether ACKed packet number is plausible in a specific packet number space.
+    pub fn canAcknowledgePacketInSpace(
+        self: *const Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+    ) bool {
+        if (self.loss_detection.maxObservedPacketNumber(space)) |max_seen| {
+            return largest_acked <= max_seen;
+        }
+        return false;
     }
 
     /// Decode peer ACK Delay field into microseconds.
@@ -657,7 +670,17 @@ pub const Connection = struct {
         first_ack_range: u64,
         ack_ranges: []const frame.AckFrame.AckRange,
     ) bool {
-        if (!self.canAcknowledgePacket(largest_acked)) {
+        return self.validateAckFrameInSpace(.application, largest_acked, first_ack_range, ack_ranges);
+    }
+
+    pub fn validateAckFrameInSpace(
+        self: *const Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) bool {
+        if (!self.canAcknowledgePacketInSpace(space, largest_acked)) {
             return false;
         }
 
@@ -678,7 +701,7 @@ pub const Connection = struct {
             }
 
             const next_largest = current_smallest - step;
-            if (!self.canAcknowledgePacket(next_largest)) {
+            if (!self.canAcknowledgePacketInSpace(space, next_largest)) {
                 return false;
             }
 
@@ -700,10 +723,19 @@ pub const Connection = struct {
 
     /// Process received ACK with delay (microseconds), update RTT and congestion state.
     pub fn processAckDetailed(self: *Connection, largest_acked: u64, ack_delay: u64) void {
+        self.processAckDetailedInSpace(.application, largest_acked, ack_delay);
+    }
+
+    pub fn processAckDetailedInSpace(
+        self: *Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+        ack_delay: u64,
+    ) void {
         const now = time.Instant.now();
 
         var ack_result = self.loss_detection.onAckReceived(
-            .application,
+            space,
             largest_acked,
             ack_delay,
             now,
@@ -769,7 +801,18 @@ pub const Connection = struct {
         first_ack_range: u64,
         ack_ranges: []const frame.AckFrame.AckRange,
     ) void {
-        if (!self.validateAckFrame(largest_acked, first_ack_range, ack_ranges)) {
+        self.processAckDetailedWithRangesInSpace(.application, largest_acked, ack_delay, first_ack_range, ack_ranges);
+    }
+
+    pub fn processAckDetailedWithRangesInSpace(
+        self: *Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) void {
+        if (!self.validateAckFrameInSpace(space, largest_acked, first_ack_range, ack_ranges)) {
             return;
         }
 
@@ -799,7 +842,7 @@ pub const Connection = struct {
 
         const now = time.Instant.now();
         var ack_result = self.loss_detection.onAckReceivedWithPacketNumbers(
-            .application,
+            space,
             largest_acked,
             ack_delay,
             now,
@@ -822,11 +865,20 @@ pub const Connection = struct {
 
     /// Track a sent packet for RTT/loss/congestion accounting.
     pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
+        self.trackPacketSentInSpace(.application, packet_size, ack_eliciting);
+    }
+
+    pub fn trackPacketSentInSpace(
+        self: *Connection,
+        space: RecoverySpace,
+        packet_size: usize,
+        ack_eliciting: bool,
+    ) void {
         const pn = self.nextPacketNumber();
         const now = time.Instant.now();
         const sent = loss_detection.SentPacket.init(pn, now, packet_size, ack_eliciting);
 
-        self.loss_detection.onPacketSent(.application, sent) catch {};
+        self.loss_detection.onPacketSent(space, sent) catch {};
         if (sent.in_flight) {
             self.congestion_controller.onPacketSent(packet_size);
         }
@@ -1503,6 +1555,23 @@ test "connection validates ACK frame ranges against sent space" {
 
     const invalid_unsent = [_]frame.AckFrame.AckRange{};
     try std.testing.expect(!conn.validateAckFrame(3, 0, &invalid_unsent));
+}
+
+test "connection validates ACK frame in packet-number space" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSentInSpace(.initial, 1200, true); // pn 0 in Initial
+
+    const no_ranges = [_]frame.AckFrame.AckRange{};
+    try std.testing.expect(conn.validateAckFrameInSpace(.initial, 0, 0, &no_ranges));
+    try std.testing.expect(!conn.validateAckFrameInSpace(.application, 0, 0, &no_ranges));
 }
 
 test "connection normalizes peer ACK delay with exponent and max" {
