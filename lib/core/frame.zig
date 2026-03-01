@@ -1451,6 +1451,43 @@ test "new connection id decode rejects truncated reset token" {
     try std.testing.expectError(error.UnexpectedEof, NewConnectionIdFrame.decode(buf[0 .. len - 3]));
 }
 
+test "new connection id decode rejects lsquic-style prefix truncation matrix" {
+    var buf: [256]u8 = undefined;
+    const cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4, 5, 6 });
+    const frame = NewConnectionIdFrame{
+        .sequence_number = 9,
+        .retire_prior_to = 3,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{0xCC} ** 16,
+    };
+
+    const len = try frame.encode(&buf);
+
+    var cut: usize = 0;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, NewConnectionIdFrame.decode(buf[0..cut]));
+    }
+
+    const decoded = try NewConnectionIdFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(@as(u64, 9), decoded.frame.sequence_number);
+    try std.testing.expectEqual(@as(u64, 3), decoded.frame.retire_prior_to);
+    try std.testing.expect(decoded.frame.connection_id.eql(&cid));
+}
+
+test "new token decode rejects lsquic-style prefix truncation matrix" {
+    var buf: [128]u8 = undefined;
+    const frame = NewTokenFrame{ .token = "token-material-123" };
+    const len = try frame.encode(&buf);
+
+    var cut: usize = 0;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, NewTokenFrame.decode(buf[0..cut]));
+    }
+
+    const decoded = try NewTokenFrame.decode(buf[0..len]);
+    try std.testing.expectEqualStrings("token-material-123", decoded.frame.token);
+}
+
 test "connection close decode rejects truncated reason length varint" {
     // 0x1d, error_code=0, reason_len starts with 2-byte varint prefix but truncated.
     try std.testing.expectError(
@@ -1465,6 +1502,44 @@ test "connection close decode rejects truncated reason bytes" {
         error.UnexpectedEof,
         ConnectionCloseFrame.decode(&[_]u8{ 0x1d, 0x00, 0x03, 'x' }),
     );
+}
+
+test "connection close decode rejects lsquic-style prefix truncation matrix" {
+    var transport_buf: [128]u8 = undefined;
+    const transport_close = ConnectionCloseFrame{
+        .error_code = 42,
+        .frame_type = 0x10,
+        .reason = "transport-close",
+    };
+    const transport_len = try transport_close.encode(&transport_buf);
+
+    var app_buf: [128]u8 = undefined;
+    const app_close = ConnectionCloseFrame{
+        .error_code = 7,
+        .frame_type = null,
+        .reason = "app-close",
+    };
+    const app_len = try app_close.encode(&app_buf);
+
+    var cut: usize = 0;
+    while (cut < transport_len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(transport_buf[0..cut]));
+    }
+
+    cut = 0;
+    while (cut < app_len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(app_buf[0..cut]));
+    }
+
+    const transport_decoded = try ConnectionCloseFrame.decode(transport_buf[0..transport_len]);
+    try std.testing.expectEqual(@as(u64, 42), transport_decoded.frame.error_code);
+    try std.testing.expectEqual(@as(?u64, 0x10), transport_decoded.frame.frame_type);
+    try std.testing.expectEqualStrings("transport-close", transport_decoded.frame.reason);
+
+    const app_decoded = try ConnectionCloseFrame.decode(app_buf[0..app_len]);
+    try std.testing.expectEqual(@as(u64, 7), app_decoded.frame.error_code);
+    try std.testing.expectEqual(@as(?u64, null), app_decoded.frame.frame_type);
+    try std.testing.expectEqualStrings("app-close", app_decoded.frame.reason);
 }
 
 test "frame decode malformed corpus" {
