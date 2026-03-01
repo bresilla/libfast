@@ -84,6 +84,8 @@ pub const QuicConnection = struct {
     latest_new_token: ?[]u8,
     token_validator_ctx: ?*anyopaque,
     token_validator: ?*const fn (ctx: ?*anyopaque, token: []const u8) bool,
+    retry_validator_ctx: ?*anyopaque,
+    retry_validator: ?*const fn (ctx: ?*anyopaque, token: []const u8, retry_source_conn_id: core_types.ConnectionId) bool,
 
     // Retry handling state (client)
     retry_token: ?[]u8,
@@ -127,6 +129,8 @@ pub const QuicConnection = struct {
             .latest_new_token = null,
             .token_validator_ctx = null,
             .token_validator = null,
+            .retry_validator_ctx = null,
+            .retry_validator = null,
             .retry_token = null,
             .retry_source_conn_id = null,
             .retry_seen = false,
@@ -289,6 +293,11 @@ pub const QuicConnection = struct {
             return;
         };
 
+        if (!self.validateRetryIntegrity(header.initial_token, retry_scid)) {
+            try self.queueProtocolViolation("retry integrity check failed");
+            return;
+        }
+
         try self.storeRetryToken(header.initial_token);
         self.retry_source_conn_id = retry_scid;
         self.retry_seen = true;
@@ -304,6 +313,16 @@ pub const QuicConnection = struct {
         }
 
         // Default policy accepts token-bearing Initial packets when no explicit
+        // validator is configured by the application.
+        return true;
+    }
+
+    fn validateRetryIntegrity(self: *QuicConnection, token: []const u8, retry_source_conn_id: core_types.ConnectionId) bool {
+        if (self.retry_validator) |validator| {
+            return validator(self.retry_validator_ctx, token, retry_source_conn_id);
+        }
+
+        // Default policy accepts Retry packets when no explicit integrity
         // validator is configured by the application.
         return true;
     }
@@ -1397,6 +1416,19 @@ pub const QuicConnection = struct {
         self.token_validator = validator;
     }
 
+    /// Configures client-side Retry integrity validation callback.
+    ///
+    /// The callback is invoked when a Retry packet is received while connecting.
+    /// Returning false triggers deterministic protocol violation close behavior.
+    pub fn setRetryIntegrityValidator(
+        self: *QuicConnection,
+        ctx: ?*anyopaque,
+        validator: *const fn (ctx: ?*anyopaque, token: []const u8, retry_source_conn_id: core_types.ConnectionId) bool,
+    ) void {
+        self.retry_validator_ctx = ctx;
+        self.retry_validator = validator;
+    }
+
     /// Returns true when handshake negotiation is complete enough to gate app traffic.
     ///
     /// For TLS mode this requires:
@@ -1692,6 +1724,23 @@ fn tokenEqualsValidator(ctx: ?*anyopaque, token: []const u8) bool {
     const expected_ptr = ctx orelse return false;
     const expected: *const []const u8 = @ptrCast(@alignCast(expected_ptr));
     return std.mem.eql(u8, expected.*, token);
+}
+
+const RetryIntegrityExpectation = struct {
+    token: []const u8,
+    retry_scid: []const u8,
+};
+
+fn retryIntegrityValidator(
+    ctx: ?*anyopaque,
+    token: []const u8,
+    retry_source_conn_id: core_types.ConnectionId,
+) bool {
+    const expectation_ptr = ctx orelse return false;
+    const expectation: *const RetryIntegrityExpectation = @ptrCast(@alignCast(expectation_ptr));
+
+    return std.mem.eql(u8, expectation.token, token) and
+        std.mem.eql(u8, expectation.retry_scid, retry_source_conn_id.slice());
 }
 
 test "Create SSH client connection" {
@@ -4268,6 +4317,12 @@ test "client processes Retry packet and updates retry state" {
 
     var packet_buf: [256]u8 = undefined;
     const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const expectation = RetryIntegrityExpectation{
+        .token = "retry-token-from-server",
+        .retry_scid = retry_scid.slice(),
+    };
+    conn.setRetryIntegrityValidator(@ptrCast(@constCast(&expectation)), retryIntegrityValidator);
+
     const header = packet_mod.LongHeader{
         .packet_type = .retry,
         .version = core_types.QUIC_VERSION_1,
@@ -4287,6 +4342,50 @@ test "client processes Retry packet and updates retry state" {
     try std.testing.expect(retry_token != null);
     try std.testing.expectEqualStrings("retry-token-from-server", retry_token.?);
     try std.testing.expect(conn.internal_conn.?.remote_conn_id.eql(&retry_scid));
+}
+
+test "client rejects Retry packet when integrity validator fails" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const expectation = RetryIntegrityExpectation{
+        .token = "some-other-token",
+        .retry_scid = retry_scid.slice(),
+    };
+    conn.setRetryIntegrityValidator(@ptrCast(@constCast(&expectation)), retryIntegrityValidator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = "retry-token-from-server",
+        .payload_len = 1,
+        .packet_number = 53,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "client rejects Retry packet with empty token" {
