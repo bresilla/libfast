@@ -641,7 +641,11 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 if (self.internal_conn) |conn| {
-                    if (!conn.canAcknowledgePacket(decoded.frame.largest_acked)) {
+                    if (!conn.validateAckFrame(
+                        decoded.frame.largest_acked,
+                        decoded.frame.first_ack_range,
+                        decoded.frame.ack_ranges,
+                    )) {
                         return types_mod.QuicError.ProtocolViolation;
                     }
 

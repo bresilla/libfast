@@ -13,6 +13,7 @@ const QuicMode = types.QuicMode;
 const TransportParameters = types.TransportParameters;
 const StreamManager = stream.StreamManager;
 const StreamId = types.StreamId;
+const MAX_ACK_PACKETS_PER_FRAME: usize = 1024;
 
 /// QUIC Connection
 pub const Connection = struct {
@@ -631,6 +632,54 @@ pub const Connection = struct {
         return largest_acked < self.next_packet_number;
     }
 
+    /// Validate ACK ranges against sent packet number space and processing limits.
+    pub fn validateAckFrame(
+        self: *const Connection,
+        largest_acked: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) bool {
+        if (!self.canAcknowledgePacket(largest_acked)) {
+            return false;
+        }
+
+        if (first_ack_range > largest_acked) {
+            return false;
+        }
+
+        var total_acked: usize = @intCast(first_ack_range + 1);
+        if (total_acked > MAX_ACK_PACKETS_PER_FRAME) {
+            return false;
+        }
+
+        var current_smallest = largest_acked - first_ack_range;
+        for (ack_ranges) |range| {
+            const step = range.gap + 2;
+            if (current_smallest < step) {
+                return false;
+            }
+
+            const next_largest = current_smallest - step;
+            if (!self.canAcknowledgePacket(next_largest)) {
+                return false;
+            }
+
+            if (range.ack_range_length > next_largest) {
+                return false;
+            }
+
+            const range_packets: usize = @intCast(range.ack_range_length + 1);
+            total_acked += range_packets;
+            if (total_acked > MAX_ACK_PACKETS_PER_FRAME) {
+                return false;
+            }
+
+            current_smallest = next_largest - range.ack_range_length;
+        }
+
+        return true;
+    }
+
     /// Process received ACK with delay (microseconds), update RTT and congestion state.
     pub fn processAckDetailed(self: *Connection, largest_acked: u64, ack_delay: u64) void {
         const now = time.Instant.now();
@@ -646,9 +695,18 @@ pub const Connection = struct {
             }
             return;
         };
+        defer ack_result.acked_packets.deinit(self.allocator);
         defer ack_result.lost_packets.deinit(self.allocator);
 
-        if (ack_result.acked_packet) |acked| {
+        self.applyAckResult(&ack_result, now);
+
+        if (largest_acked > self.largest_acked) {
+            self.largest_acked = largest_acked;
+        }
+    }
+
+    fn applyAckResult(self: *Connection, ack_result: *const loss_detection.AckResult, now: time.Instant) void {
+        for (ack_result.acked_packets.items) |acked| {
             if (acked.in_flight) {
                 self.congestion_controller.onPacketAcked(acked.size, acked.packet_number);
                 self.pto_count = 0;
@@ -680,10 +738,6 @@ pub const Connection = struct {
                 }
             }
         }
-
-        if (largest_acked > self.largest_acked) {
-            self.largest_acked = largest_acked;
-        }
     }
 
     /// Process received ACK with parsed range metadata.
@@ -697,27 +751,54 @@ pub const Connection = struct {
         first_ack_range: u64,
         ack_ranges: []const frame.AckFrame.AckRange,
     ) void {
-        if (first_ack_range > largest_acked) {
+        if (!self.validateAckFrame(largest_acked, first_ack_range, ack_ranges)) {
             return;
         }
 
-        self.processAckDetailed(largest_acked, ack_delay);
+        var acknowledged_numbers: [MAX_ACK_PACKETS_PER_FRAME]u64 = undefined;
+        var count: usize = 0;
 
-        var current_smallest: u64 = largest_acked - first_ack_range;
+        var current_smallest = largest_acked - first_ack_range;
+
+        var pn = current_smallest;
+        while (pn <= largest_acked) : (pn += 1) {
+            acknowledged_numbers[count] = pn;
+            count += 1;
+        }
+
         for (ack_ranges) |range| {
-            const step = range.gap + 2;
-            if (current_smallest < step) {
-                break;
+            const next_largest = current_smallest - (range.gap + 2);
+            const next_smallest = next_largest - range.ack_range_length;
+
+            pn = next_smallest;
+            while (pn <= next_largest) : (pn += 1) {
+                acknowledged_numbers[count] = pn;
+                count += 1;
             }
 
-            const next_largest = current_smallest - step;
-            self.processAckDetailed(next_largest, ack_delay);
+            current_smallest = next_smallest;
+        }
 
-            if (range.ack_range_length > next_largest) {
-                break;
+        const now = time.Instant.now();
+        var ack_result = self.loss_detection.onAckReceivedWithPacketNumbers(
+            .application,
+            largest_acked,
+            ack_delay,
+            now,
+            acknowledged_numbers[0..count],
+        ) catch {
+            if (largest_acked > self.largest_acked) {
+                self.largest_acked = largest_acked;
             }
+            return;
+        };
+        defer ack_result.acked_packets.deinit(self.allocator);
+        defer ack_result.lost_packets.deinit(self.allocator);
 
-            current_smallest = next_largest - range.ack_range_length;
+        self.applyAckResult(&ack_result, now);
+
+        if (largest_acked > self.largest_acked) {
+            self.largest_acked = largest_acked;
         }
     }
 
@@ -1383,6 +1464,27 @@ test "connection ack plausibility tracks sent packet numbers" {
     try std.testing.expect(conn.canAcknowledgePacket(0));
     try std.testing.expect(conn.canAcknowledgePacket(1));
     try std.testing.expect(!conn.canAcknowledgePacket(2));
+}
+
+test "connection validates ACK frame ranges against sent space" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+
+    const valid_ranges = [_]frame.AckFrame.AckRange{.{ .gap = 0, .ack_range_length = 0 }};
+    try std.testing.expect(conn.validateAckFrame(2, 0, &valid_ranges));
+
+    const invalid_unsent = [_]frame.AckFrame.AckRange{};
+    try std.testing.expect(!conn.validateAckFrame(3, 0, &invalid_unsent));
 }
 
 test "connection ack with ranges keeps recovery path stable" {
