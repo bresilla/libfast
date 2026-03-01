@@ -96,6 +96,7 @@ pub const Connection = struct {
     local_connection_ids: std.ArrayList(LocalConnectionIdEntry),
     local_next_cid_sequence: u64,
     local_retire_prior_to: u64,
+    pending_new_connection_ids: std.ArrayList(u64),
 
     /// Allocator
     allocator: std.mem.Allocator,
@@ -153,6 +154,7 @@ pub const Connection = struct {
             .local_connection_ids = .{},
             .local_next_cid_sequence = 0,
             .local_retire_prior_to = 0,
+            .pending_new_connection_ids = .{},
             .allocator = allocator,
         };
 
@@ -223,6 +225,7 @@ pub const Connection = struct {
             .local_connection_ids = .{},
             .local_next_cid_sequence = 0,
             .local_retire_prior_to = 0,
+            .pending_new_connection_ids = .{},
             .allocator = allocator,
         };
 
@@ -256,6 +259,7 @@ pub const Connection = struct {
         self.peer_connection_ids.deinit(self.allocator);
         self.pending_retire_connection_ids.deinit(self.allocator);
         self.local_connection_ids.deinit(self.allocator);
+        self.pending_new_connection_ids.deinit(self.allocator);
     }
 
     /// Open a new stream
@@ -567,6 +571,7 @@ pub const Connection = struct {
             .connection_id = connection_id,
             .stateless_reset_token = stateless_reset_token,
         });
+        try self.pending_new_connection_ids.append(self.allocator, sequence_number);
 
         return sequence_number;
     }
@@ -574,6 +579,21 @@ pub const Connection = struct {
     pub fn latestLocalConnectionId(self: *const Connection) ?LocalConnectionIdEntry {
         if (self.local_connection_ids.items.len == 0) return null;
         return self.local_connection_ids.items[self.local_connection_ids.items.len - 1];
+    }
+
+    pub fn popPendingNewConnectionId(self: *Connection) ?LocalConnectionIdEntry {
+        if (self.pending_new_connection_ids.items.len == 0) {
+            return null;
+        }
+
+        const sequence_number = self.pending_new_connection_ids.orderedRemove(0);
+        for (self.local_connection_ids.items) |entry| {
+            if (entry.sequence_number == sequence_number) {
+                return entry;
+            }
+        }
+
+        return null;
     }
 
     pub fn localRetirePriorTo(self: *const Connection) u64 {
@@ -1132,6 +1152,11 @@ test "connection queues local NEW_CONNECTION_ID entries" {
     try std.testing.expect(latest != null);
     try std.testing.expectEqual(@as(u64, 1), latest.?.sequence_number);
     try std.testing.expect(latest.?.connection_id.eql(&cid1));
+
+    const pending = conn.popPendingNewConnectionId();
+    try std.testing.expect(pending != null);
+    try std.testing.expectEqual(@as(u64, 1), pending.?.sequence_number);
+    try std.testing.expect(conn.popPendingNewConnectionId() == null);
 }
 
 test "connection local retire_prior_to advances monotonically" {

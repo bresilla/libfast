@@ -1316,6 +1316,24 @@ pub const QuicConnection = struct {
         return len;
     }
 
+    /// Pop and encode next pending NEW_CONNECTION_ID advertisement frame.
+    pub fn popNewConnectionIdFrame(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        const next = conn.popPendingNewConnectionId() orelse return null;
+
+        const frame = frame_mod.NewConnectionIdFrame{
+            .sequence_number = next.sequence_number,
+            .retire_prior_to = conn.localRetirePriorTo(),
+            .connection_id = next.connection_id,
+            .stateless_reset_token = next.stateless_reset_token,
+        };
+
+        const len = frame.encode(out) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return len;
+    }
+
     /// Advance local retire_prior_to used for NEW_CONNECTION_ID advertisements.
     pub fn advanceLocalRetirePriorTo(self: *QuicConnection, sequence_number: u64) types_mod.QuicError!void {
         const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
@@ -4108,6 +4126,37 @@ test "queueNewConnectionId and encodeLatestNewConnectionIdFrame" {
     try std.testing.expectEqual(@as(u64, 1), decoded.frame.retire_prior_to);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9, 9, 9 }, decoded.frame.connection_id.slice());
     try std.testing.expectEqualSlices(u8, &([_]u8{8} ** 16), &decoded.frame.stateless_reset_token);
+}
+
+test "popNewConnectionIdFrame drains pending NEW_CONNECTION_ID adverts in order" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+
+    const seq1 = try conn.queueNewConnectionId(&[_]u8{ 7, 7, 7, 1 }, [_]u8{1} ** 16);
+    const seq2 = try conn.queueNewConnectionId(&[_]u8{ 7, 7, 7, 2 }, [_]u8{2} ** 16);
+    try std.testing.expectEqual(@as(u64, 1), seq1);
+    try std.testing.expectEqual(@as(u64, 2), seq2);
+
+    var out: [128]u8 = undefined;
+
+    const len1 = try conn.popNewConnectionIdFrame(&out);
+    try std.testing.expect(len1 != null);
+    const decoded1 = try frame_mod.NewConnectionIdFrame.decode(out[0..len1.?]);
+    try std.testing.expectEqual(@as(u64, 1), decoded1.frame.sequence_number);
+
+    const len2 = try conn.popNewConnectionIdFrame(&out);
+    try std.testing.expect(len2 != null);
+    const decoded2 = try frame_mod.NewConnectionIdFrame.decode(out[0..len2.?]);
+    try std.testing.expectEqual(@as(u64, 2), decoded2.frame.sequence_number);
+
+    try std.testing.expect((try conn.popNewConnectionIdFrame(&out)) == null);
 }
 
 test "packet-space frame legality matrix baseline" {
