@@ -1656,6 +1656,25 @@ test "connection validates ACK frame in packet-number space" {
     try std.testing.expect(!conn.validateAckFrameInSpace(.application, 0, 0, &no_ranges));
 }
 
+test "connection rejects ACK frame with excessive acknowledged span" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        conn.trackPacketSent(1200, true);
+    }
+
+    const no_ranges = [_]frame.AckFrame.AckRange{};
+    try std.testing.expect(!conn.validateAckFrame(1500, 1500, &no_ranges));
+}
+
 test "connection normalizes peer ACK delay with exponent and max" {
     const allocator = std.testing.allocator;
 

@@ -1909,6 +1909,53 @@ fn expectProtocolViolationFromShortHeaderPayload(
     );
 }
 
+fn expectProtocolViolationFromLongHeaderPayload(
+    conn: *QuicConnection,
+    allocator: std.mem.Allocator,
+    packet_type: core_types.PacketType,
+    payload: []const u8,
+    packet_number: u64,
+) !void {
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = packet_type,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = if (packet_type == .initial) &.{} else &.{},
+        .payload_len = @as(u64, payload.len + 4),
+        .packet_number = packet_number,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    if (packet_len + payload.len > packet_buf.len) {
+        return error.BufferTooSmall;
+    }
+    @memcpy(packet_buf[packet_len .. packet_len + payload.len], payload);
+    packet_len += payload.len;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
 const RetryIntegrityExpectation = struct {
     token: []const u8,
     retry_scid: []const u8,
@@ -3994,6 +4041,115 @@ test "poll rejects malformed ACK range encoding" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+}
+
+test "poll rejects ACK frame with excessive acknowledged packet count" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // Track enough sent packets so largest_acked itself is plausible.
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        conn.internal_conn.?.trackPacketSent(1200, true);
+    }
+
+    var payload: [128]u8 = undefined;
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1500,
+        .ack_delay = 0,
+        .first_ack_range = 1500, // implies 1501 acked packets, above limit
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const payload_len = try ack.encode(&payload);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 58);
+}
+
+test "poll accepts ACK in handshake space when handshake packets were sent" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 59,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll rejects ACK in handshake space for unsent handshake packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var payload: [64]u8 = undefined;
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 5,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const payload_len = try ack.encode(&payload);
+
+    try expectProtocolViolationFromLongHeaderPayload(&conn, allocator, .handshake, payload[0..payload_len], 60);
 }
 
 test "poll routes RESET_STREAM frame to stream_closed event" {
