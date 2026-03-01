@@ -199,6 +199,10 @@ pub const QuicConnection = struct {
                 return types_mod.QuicError.InvalidPacket;
             };
 
+            if (result.header.version != core_types.QUIC_VERSION_1) {
+                return types_mod.QuicError.ProtocolViolation;
+            }
+
             const space: PacketSpace = switch (result.header.packet_type) {
                 .initial => .initial,
                 .handshake => .handshake,
@@ -1290,11 +1294,16 @@ pub const QuicConnection = struct {
                 return;
             }
 
-            const header = self.decodePacketHeader(packet) catch {
+            const header = self.decodePacketHeader(packet) catch |err| {
                 self.packets_invalid += 1;
 
                 if (self.detectStatelessResetRaw(packet)) {
                     try self.enterDraining(@intFromEnum(core_types.ErrorCode.no_error), "stateless reset");
+                    return;
+                }
+
+                if (err == types_mod.QuicError.ProtocolViolation) {
+                    try self.queueProtocolViolation("unsupported version");
                     return;
                 }
 
@@ -4987,6 +4996,85 @@ test "poll handles version negotiation packet with no mutual version" {
     try std.testing.expectEqualStrings("no mutual QUIC version", event.?.closing.reason);
 }
 
+test "server ignores version negotiation packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 9, 1, 9 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 2, 8, 2, 8 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expect(conn.getState() != .draining);
+}
+
+test "client ignores version negotiation packet after establishment" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
 test "poll rejects spoofed version negotiation including current version" {
     const allocator = std.testing.allocator;
 
@@ -5054,6 +5142,46 @@ test "poll rejects malformed version negotiation packet" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "poll rejects unsupported long header version" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = 0x00000002,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 73,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("unsupported version", event.?.closing.reason);
 }
 
 test "poll rejects truncated ACK frame payload" {
