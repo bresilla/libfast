@@ -754,6 +754,32 @@ test "version negotiation decode rejects invalid wire forms" {
     try std.testing.expectError(error.BufferTooSmall, VersionNegotiationPacket.decode(buf[0..len], &small_versions));
 }
 
+test "version negotiation decode accepts randomized low header bits" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 9, 8, 7, 6 });
+
+    var buf: [128]u8 = undefined;
+    const vn = VersionNegotiationPacket{
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003, types.QUIC_VERSION_1 },
+    };
+
+    const len = try vn.encode(&buf);
+    // LSQUIC-style VN tests randomize the low header bits. RFC requires only
+    // long-header and fixed-bit for VN packets.
+    buf[0] = 0xFF;
+
+    var versions: [8]u32 = undefined;
+    const decoded = try VersionNegotiationPacket.decode(buf[0..len], &versions);
+    try std.testing.expect(decoded.packet.dest_conn_id.eql(&dcid));
+    try std.testing.expect(decoded.packet.src_conn_id.eql(&scid));
+    try std.testing.expectEqual(@as(usize, 3), decoded.packet.supported_versions.len);
+    try std.testing.expectEqual(@as(u32, 0x00000002), decoded.packet.supported_versions[0]);
+    try std.testing.expectEqual(@as(u32, 0x00000003), decoded.packet.supported_versions[1]);
+    try std.testing.expectEqual(types.QUIC_VERSION_1, decoded.packet.supported_versions[2]);
+}
+
 test "packet decode fuzz smoke" {
     var prng = std.Random.DefaultPrng.init(0xBAD5EED);
     const rand = prng.random();
