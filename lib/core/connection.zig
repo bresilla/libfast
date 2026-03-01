@@ -506,6 +506,10 @@ pub const Connection = struct {
         }
 
         for (self.peer_connection_ids.items) |cid| {
+            if (std.mem.eql(u8, &cid.stateless_reset_token, &stateless_reset_token) and cid.sequence_number != sequence_number) {
+                return false;
+            }
+
             if (cid.sequence_number == sequence_number) {
                 if (!cid.connection_id.eql(&connection_id)) return false;
                 if (!std.mem.eql(u8, &cid.stateless_reset_token, &stateless_reset_token)) return false;
@@ -1086,6 +1090,28 @@ test "connection enforces peer active_connection_id_limit" {
 
     try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, [_]u8{1} ** 16));
     try std.testing.expect(!(try conn.onNewConnectionId(2, 0, cid2, [_]u8{2} ** 16)));
+    try std.testing.expectEqual(@as(usize, 1), conn.peer_connection_ids.items.len);
+}
+
+test "connection rejects duplicate stateless reset token across peer CIDs" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.setRemoteParams(remote);
+
+    const token = [_]u8{9} ** 16;
+    const cid1 = try ConnectionId.init(&[_]u8{ 8, 8, 8, 1 });
+    const cid2 = try ConnectionId.init(&[_]u8{ 8, 8, 8, 2 });
+
+    try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, token));
+    try std.testing.expect(!(try conn.onNewConnectionId(2, 0, cid2, token)));
     try std.testing.expectEqual(@as(usize, 1), conn.peer_connection_ids.items.len);
 }
 
