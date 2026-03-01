@@ -470,3 +470,64 @@ test "interop lsquic-style stream frame generation vectors" {
         try std.testing.expectEqualSlices(u8, vector.frame.data, decoded.frame.data);
     }
 }
+
+test "interop lsquic-style packet buffer capacity ladder short header" {
+    const dcid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = dcid,
+        .packet_number = 0x01020304,
+        .key_phase = true,
+    };
+
+    var full_buf: [128]u8 = undefined;
+    const expected_len = try header.encode(&full_buf);
+
+    var cap: usize = 0;
+    while (cap < expected_len) : (cap += 1) {
+        var small: [128]u8 = undefined;
+        try std.testing.expectError(error.BufferTooSmall, header.encode(small[0..cap]));
+    }
+
+    var exact: [128]u8 = undefined;
+    const exact_len = try header.encode(exact[0..expected_len]);
+    try std.testing.expectEqual(expected_len, exact_len);
+
+    const decoded = try packet_mod.ShortHeader.decode(exact[0..exact_len], dcid.len);
+    try std.testing.expect(decoded.header.dest_conn_id.eql(&dcid));
+    try std.testing.expectEqual(@as(u64, 0x01020304), decoded.header.packet_number);
+    try std.testing.expect(decoded.header.key_phase);
+}
+
+test "interop lsquic-style packet buffer capacity ladder long header" {
+    const dcid = try core_types.ConnectionId.init(&[_]u8{ 1, 3, 5, 7, 9, 11, 13, 15 });
+    const scid = try core_types.ConnectionId.init(&[_]u8{ 2, 4, 6, 8 });
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = "tok",
+        .payload_len = 4,
+        .packet_number = 0x1234,
+    };
+
+    var full_buf: [256]u8 = undefined;
+    const expected_len = try header.encode(&full_buf);
+
+    var cap: usize = 0;
+    while (cap < expected_len) : (cap += 1) {
+        var small: [256]u8 = undefined;
+        try std.testing.expectError(error.BufferTooSmall, header.encode(small[0..cap]));
+    }
+
+    var exact: [256]u8 = undefined;
+    const exact_len = try header.encode(exact[0..expected_len]);
+    try std.testing.expectEqual(expected_len, exact_len);
+
+    const decoded = try packet_mod.LongHeader.decode(exact[0..exact_len]);
+    try std.testing.expect(decoded.header.packet_type == .initial);
+    try std.testing.expect(decoded.header.dest_conn_id.eql(&dcid));
+    try std.testing.expect(decoded.header.src_conn_id.eql(&scid));
+    try std.testing.expectEqualStrings("tok", decoded.header.token);
+    try std.testing.expectEqual(@as(u64, 0x1234), decoded.header.packet_number);
+}
