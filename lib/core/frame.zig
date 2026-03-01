@@ -275,6 +275,27 @@ pub const NewTokenFrame = struct {
         pos += self.token.len;
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: NewTokenFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x07) return error.InvalidFrameType;
+
+        const token_len_result = try varint.decode(buf[pos..]);
+        pos += token_len_result.len;
+        const token_len = token_len_result.value;
+
+        if (pos + token_len > buf.len) return error.UnexpectedEof;
+        const token = buf[pos..][0..token_len];
+        pos += token_len;
+
+        return .{
+            .frame = .{ .token = token },
+            .consumed = pos,
+        };
+    }
 };
 
 /// STREAM frame (0x08-0x0f)
@@ -1030,6 +1051,16 @@ test "retire connection id frame encode/decode" {
 
     const decoded = try RetireConnectionIdFrame.decode(buf[0..len]);
     try std.testing.expectEqual(frame.sequence_number, decoded.frame.sequence_number);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
+test "new token frame encode/decode" {
+    var buf: [64]u8 = undefined;
+    const frame = NewTokenFrame{ .token = "retry-token" };
+    const len = try frame.encode(&buf);
+
+    const decoded = try NewTokenFrame.decode(buf[0..len]);
+    try std.testing.expectEqualStrings(frame.token, decoded.frame.token);
     try std.testing.expectEqual(len, decoded.consumed);
 }
 

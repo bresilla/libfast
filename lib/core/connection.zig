@@ -562,6 +562,10 @@ pub const Connection = struct {
         return self.pending_retire_connection_ids.orderedRemove(0);
     }
 
+    pub fn hasPendingRetireConnectionId(self: *const Connection) bool {
+        return self.pending_retire_connection_ids.items.len > 0;
+    }
+
     pub fn queueNewConnectionId(self: *Connection, connection_id: ConnectionId, stateless_reset_token: [16]u8) Error!u64 {
         const sequence_number = self.local_next_cid_sequence;
         self.local_next_cid_sequence += 1;
@@ -594,6 +598,10 @@ pub const Connection = struct {
         }
 
         return null;
+    }
+
+    pub fn hasPendingNewConnectionId(self: *const Connection) bool {
+        return self.pending_new_connection_ids.items.len > 0;
     }
 
     pub fn localRetirePriorTo(self: *const Connection) u64 {
@@ -1181,6 +1189,34 @@ test "connection local retire_prior_to advances monotonically" {
 
     conn.advanceLocalRetirePriorTo(1);
     try std.testing.expectEqual(@as(u64, 1), conn.localRetirePriorTo());
+}
+
+test "connection pending CID flags reflect queue state" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    try std.testing.expect(!conn.hasPendingRetireConnectionId());
+    try std.testing.expect(!conn.hasPendingNewConnectionId());
+
+    const cid0 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 1 });
+    const cid1 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 2 });
+    try std.testing.expect(try conn.onNewConnectionId(0, 0, cid0, [_]u8{1} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, cid1, [_]u8{2} ** 16));
+    try std.testing.expect(conn.hasPendingRetireConnectionId());
+
+    _ = conn.popRetireConnectionId();
+    try std.testing.expect(!conn.hasPendingRetireConnectionId());
+
+    _ = try conn.queueNewConnectionId(try ConnectionId.init(&[_]u8{ 7, 7, 7, 7 }), [_]u8{3} ** 16);
+    try std.testing.expect(conn.hasPendingNewConnectionId());
+
+    _ = conn.popPendingNewConnectionId();
+    try std.testing.expect(!conn.hasPendingNewConnectionId());
 }
 
 test "connection applies remote stream limits" {

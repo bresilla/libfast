@@ -28,6 +28,8 @@ const PacketSpace = enum {
 const ParsedHeader = struct {
     consumed: usize,
     packet_space: PacketSpace,
+    is_short_header: bool,
+    initial_token: []const u8,
 };
 
 const TlsFailureStage = enum {
@@ -77,6 +79,11 @@ pub const QuicConnection = struct {
     drain_pending: bool,
     closed_event_emitted: bool,
 
+    // Token lifecycle state
+    latest_new_token: ?[]u8,
+    token_validator_ctx: ?*anyopaque,
+    token_validator: ?*const fn (ctx: ?*anyopaque, token: []const u8) bool,
+
     /// Initialize a new QUIC connection
     pub fn init(
         allocator: std.mem.Allocator,
@@ -111,6 +118,9 @@ pub const QuicConnection = struct {
             .close_error_code = 0,
             .drain_pending = false,
             .closed_event_emitted = false,
+            .latest_new_token = null,
+            .token_validator_ctx = null,
+            .token_validator = null,
         };
     }
 
@@ -169,14 +179,24 @@ pub const QuicConnection = struct {
                 else => .application,
             };
 
-            return .{ .consumed = result.consumed, .packet_space = space };
+            return .{
+                .consumed = result.consumed,
+                .packet_space = space,
+                .is_short_header = false,
+                .initial_token = if (space == .initial) result.header.token else &.{},
+            };
         }
 
         const dcid_len = self.shortHeaderDcidLen();
         const result = packet_mod.ShortHeader.decode(packet, dcid_len) catch {
             return types_mod.QuicError.InvalidPacket;
         };
-        return .{ .consumed = result.consumed, .packet_space = .application };
+        return .{
+            .consumed = result.consumed,
+            .packet_space = .application,
+            .is_short_header = true,
+            .initial_token = &.{},
+        };
     }
 
     fn queueProtocolViolation(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
@@ -201,6 +221,53 @@ pub const QuicConnection = struct {
         }
 
         try self.enterDraining(@intFromEnum(core_types.ErrorCode.flow_control_error), reason);
+    }
+
+    fn queueInvalidToken(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.invalid_token), reason);
+    }
+
+    fn storeNewToken(self: *QuicConnection, token: []const u8) types_mod.QuicError!void {
+        if (self.latest_new_token) |existing| {
+            self.allocator.free(existing);
+            self.latest_new_token = null;
+        }
+
+        const copy = self.allocator.alloc(u8, token.len) catch {
+            return types_mod.QuicError.OutOfMemory;
+        };
+        @memcpy(copy, token);
+        self.latest_new_token = copy;
+    }
+
+    fn validateToken(self: *QuicConnection, token: []const u8) bool {
+        if (self.token_validator) |validator| {
+            return validator(self.token_validator_ctx, token);
+        }
+
+        // Default policy accepts token-bearing Initial packets when no explicit
+        // validator is configured by the application.
+        return true;
+    }
+
+    fn detectStatelessReset(self: *QuicConnection, packet: []const u8, header: ParsedHeader) bool {
+        if (!header.is_short_header or packet.len < 17) {
+            return false;
+        }
+
+        const conn = self.internal_conn orelse return false;
+        const token = packet[packet.len - 16 .. packet.len];
+        for (conn.peer_connection_ids.items) |entry| {
+            if (std.mem.eql(u8, token, &entry.stateless_reset_token)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     fn queueTlsFailure(self: *QuicConnection, stage: TlsFailureStage, err: anyerror) types_mod.QuicError!void {
@@ -631,6 +698,18 @@ pub const QuicConnection = struct {
                 _ = conn.onPathResponse(decoded.frame.data);
                 return decoded.consumed;
             },
+            0x07 => {
+                const decoded = frame_mod.NewTokenFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                if (self.config.role == .server) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                try self.storeNewToken(decoded.frame.token);
+                return decoded.consumed;
+            },
             else => {
                 // Unknown/unhandled frame type in this slice: ignore.
                 return payload.len;
@@ -1017,6 +1096,14 @@ pub const QuicConnection = struct {
                 return;
             };
 
+            if (self.config.role == .server and header.packet_space == .initial and header.initial_token.len > 0) {
+                if (!self.validateToken(header.initial_token)) {
+                    self.packets_invalid += 1;
+                    try self.queueInvalidToken("initial token rejected");
+                    return;
+                }
+            }
+
             if (header.consumed >= packet.len) return;
 
             try self.transitionToEstablished();
@@ -1025,6 +1112,11 @@ pub const QuicConnection = struct {
             while (frame_offset < packet.len) {
                 const consumed = self.routeFrame(packet[frame_offset..], header.packet_space) catch |err| {
                     self.packets_invalid += 1;
+                    if (self.detectStatelessReset(packet, header)) {
+                        try self.enterDraining(@intFromEnum(core_types.ErrorCode.no_error), "stateless reset");
+                        return;
+                    }
+
                     if (err == types_mod.QuicError.ProtocolViolation) {
                         try self.queueProtocolViolation("frame not allowed in current context");
                         return;
@@ -1205,6 +1297,32 @@ pub const QuicConnection = struct {
     /// Returns negotiated ALPN protocol when available.
     pub fn getNegotiatedAlpn(self: *const QuicConnection) ?[]const u8 {
         return self.negotiated_alpn;
+    }
+
+    /// Returns the latest token received in a NEW_TOKEN frame.
+    pub fn getLatestNewToken(self: *const QuicConnection) ?[]const u8 {
+        return self.latest_new_token;
+    }
+
+    /// Clears the currently cached NEW_TOKEN value.
+    pub fn clearLatestNewToken(self: *QuicConnection) void {
+        if (self.latest_new_token) |token| {
+            self.allocator.free(token);
+            self.latest_new_token = null;
+        }
+    }
+
+    /// Configures application token validation for Initial packets.
+    ///
+    /// The validator is called only when a server receives an Initial packet
+    /// that carries a non-empty token.
+    pub fn setTokenValidator(
+        self: *QuicConnection,
+        ctx: ?*anyopaque,
+        validator: *const fn (ctx: ?*anyopaque, token: []const u8) bool,
+    ) void {
+        self.token_validator_ctx = ctx;
+        self.token_validator = validator;
     }
 
     /// Returns true when handshake negotiation is complete enough to gate app traffic.
@@ -1418,6 +1536,8 @@ pub const QuicConnection = struct {
             self.close(0, "Connection closed") catch {};
         }
 
+        self.clearLatestNewToken();
+
         if (self.internal_conn) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -1493,6 +1613,12 @@ fn buildTlsServerHelloForTests(
     };
 
     return server_hello.encode(allocator);
+}
+
+fn tokenEqualsValidator(ctx: ?*anyopaque, token: []const u8) bool {
+    const expected_ptr = ctx orelse return false;
+    const expected: *const []const u8 = @ptrCast(@alignCast(expected_ptr));
+    return std.mem.eql(u8, expected.*, token);
 }
 
 test "Create SSH client connection" {
@@ -3861,6 +3987,197 @@ test "poll rejects NEW_TOKEN frame in Initial packet space" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         closing.?.closing.error_code,
     );
+}
+
+test "poll accepts NEW_TOKEN frame in application packet space for client" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 46,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const new_token = frame_mod.NewTokenFrame{ .token = "retry-ticket-123" };
+    packet_len += try new_token.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    const token = conn.getLatestNewToken();
+    try std.testing.expect(token != null);
+    try std.testing.expectEqualStrings("retry-ticket-123", token.?);
+
+    conn.clearLatestNewToken();
+    try std.testing.expect(conn.getLatestNewToken() == null);
+}
+
+test "poll rejects NEW_TOKEN frame in application packet space for server" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = local_cid,
+        .packet_number = 47,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const new_token = frame_mod.NewTokenFrame{ .token = "client-must-not-send" };
+    packet_len += try new_token.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "server token validator rejects invalid Initial token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 3, 3, 7 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 7, 7, 5 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+
+    const expected_token: []const u8 = "valid-token";
+    conn.setTokenValidator(@ptrCast(@constCast(&expected_token)), tokenEqualsValidator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = local_cid,
+        .src_conn_id = remote_cid,
+        .token = "invalid-token",
+        .payload_len = 4,
+        .packet_number = 48,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.invalid_token)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll detects stateless reset pattern on short header failure" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 7 });
+    try std.testing.expect(
+        try conn.internal_conn.?.onNewConnectionId(1, 0, peer_cid, [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19 }),
+    );
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 49,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    packet_buf[packet_len] = 0x1f; // reserved frame type to force frame processing failure
+    packet_len += 1;
+
+    const reset_token = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19 };
+    @memcpy(packet_buf[packet_len .. packet_len + reset_token.len], &reset_token);
+    packet_len += reset_token.len;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.no_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("stateless reset", event.?.closing.reason);
 }
 
 test "poll rejects RETIRE_CONNECTION_ID frame in zero_rtt packet space" {
