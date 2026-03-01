@@ -154,6 +154,11 @@ pub const QuicConnection = struct {
         return self.close_reason_buf[0..self.close_reason_len];
     }
 
+    fn drain_deadline_expired(now: time_mod.Instant, deadline: time_mod.Instant) bool {
+        // Strict alarm semantics: deadline must be strictly earlier than now.
+        return deadline.isBefore(now);
+    }
+
     fn enterDraining(
         self: *QuicConnection,
         error_code: u64,
@@ -1275,9 +1280,10 @@ pub const QuicConnection = struct {
         }
 
         if (self.state == .draining) {
-            const deadline = self.drain_deadline orelse time_mod.Instant.now();
+            const now = time_mod.Instant.now();
+            const deadline = self.drain_deadline orelse now;
 
-            if (time_mod.Instant.now().isBefore(deadline)) {
+            if (!drain_deadline_expired(now, deadline)) {
                 self.drain_pending = false;
                 return;
             }
@@ -3736,6 +3742,17 @@ test "drain timeout closes even with queued inbound packets" {
     try std.testing.expect(closed != null);
     try std.testing.expect(closed.? == .closed);
     try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "drain deadline expiry uses strict less-than" {
+    const now = time_mod.Instant{ .micros = 1000 };
+    const before = time_mod.Instant{ .micros = 999 };
+    const equal = time_mod.Instant{ .micros = 1000 };
+    const after = time_mod.Instant{ .micros = 1001 };
+
+    try std.testing.expect(QuicConnection.drain_deadline_expired(now, before));
+    try std.testing.expect(!QuicConnection.drain_deadline_expired(now, equal));
+    try std.testing.expect(!QuicConnection.drain_deadline_expired(now, after));
 }
 
 test "poll routes STREAM frame into stream data and readable event" {
