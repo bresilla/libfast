@@ -6167,6 +6167,203 @@ test "poll allows STREAM frame in zero_rtt packet space" {
     try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
 }
 
+test "poll allows mixed legal frames in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 32,
+        .packet_number = 81,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    const max_data = frame_mod.MaxDataFrame{ .max_data = 4096 };
+    packet_len += try max_data.encode(packet_buf[packet_len..]);
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 15,
+        .offset = 0,
+        .data = "zmix",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 15) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll preserves zero_rtt stream side effect before later illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 48,
+        .packet_number = 82,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 16,
+        .offset = 0,
+        .data = "ok-first",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    const illegal = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 16) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(saw_closing);
+
+    const info = try conn.getStreamInfo(16);
+    try std.testing.expectEqual(@as(types_mod.StreamId, 16), info.id);
+}
+
+test "poll ignores trailing legal zero_rtt frame after first illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 48,
+        .packet_number = 83,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const illegal = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 17,
+        .offset = 0,
+        .data = "late",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 17) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(!saw_stream);
+    try std.testing.expect(saw_closing);
+    try std.testing.expectError(types_mod.QuicError.StreamNotFound, conn.getStreamInfo(17));
+}
+
+test "poll rejects ACK frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var payload: [64]u8 = undefined;
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const payload_len = try ack.encode(&payload);
+
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .zero_rtt,
+        payload[0..payload_len],
+        84,
+    );
+}
+
 test "poll rejects NEW_TOKEN frame in Initial packet space" {
     const allocator = std.testing.allocator;
 
