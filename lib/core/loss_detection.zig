@@ -115,7 +115,7 @@ pub const RttStats = struct {
     }
 
     /// Get probe timeout (PTO) in microseconds
-    pub fn pto(self: *RttStats) u64 {
+    pub fn pto(self: *const RttStats) u64 {
         return self.smoothed_rtt + (self.rttvar * 4);
     }
 };
@@ -184,6 +184,23 @@ pub const SpaceDetectionState = struct {
         return acked_packet;
     }
 
+    /// Process ACKs for multiple packet numbers.
+    pub fn onAckReceivedMany(
+        self: *SpaceDetectionState,
+        allocator: std.mem.Allocator,
+        packet_numbers: []const types.PacketNumber,
+    ) !std.ArrayList(SentPacket) {
+        var acked_packets: std.ArrayList(SentPacket) = .{};
+
+        for (packet_numbers) |packet_number| {
+            if (try self.onAckReceived(allocator, packet_number)) |acked| {
+                try acked_packets.append(allocator, acked);
+            }
+        }
+
+        return acked_packets;
+    }
+
     /// Detect lost packets
     pub fn detectLostPackets(
         self: *SpaceDetectionState,
@@ -221,6 +238,18 @@ pub const SpaceDetectionState = struct {
         }
 
         return lost_packets;
+    }
+
+    pub fn maxObservedPacketNumber(self: *const SpaceDetectionState) ?types.PacketNumber {
+        var max_seen = self.largest_acked;
+
+        for (self.sent_packets.items) |packet| {
+            if (max_seen == null or packet.packet_number > max_seen.?) {
+                max_seen = packet.packet_number;
+            }
+        }
+
+        return max_seen;
     }
 };
 
@@ -270,6 +299,14 @@ pub const LossDetection = struct {
         };
     }
 
+    fn getSpaceConst(self: *const LossDetection, space: PacketNumberSpace) *const SpaceDetectionState {
+        return switch (space) {
+            .initial => &self.initial,
+            .handshake => &self.handshake,
+            .application => &self.application,
+        };
+    }
+
     /// Record sent packet
     pub fn onPacketSent(
         self: *LossDetection,
@@ -288,6 +325,18 @@ pub const LossDetection = struct {
         ack_delay: u64,
         now: time_mod.Instant,
     ) !AckResult {
+        return self.onAckReceivedWithPacketNumbers(space, largest_acked, ack_delay, now, &[_]types.PacketNumber{largest_acked});
+    }
+
+    /// Process ACK frame with explicit acknowledged packet numbers.
+    pub fn onAckReceivedWithPacketNumbers(
+        self: *LossDetection,
+        space: PacketNumberSpace,
+        largest_acked: types.PacketNumber,
+        ack_delay: u64,
+        now: time_mod.Instant,
+        acknowledged_packet_numbers: []const types.PacketNumber,
+    ) !AckResult {
         const space_state = self.getSpace(space);
 
         // Update RTT if this ACKs the largest packet
@@ -302,8 +351,17 @@ pub const LossDetection = struct {
             }
         }
 
-        // Process the ACK
-        const acked_packet = try space_state.onAckReceived(self.allocator, largest_acked);
+        // Process all acknowledged packets in this ACK frame.
+        var acked_packets = try space_state.onAckReceivedMany(self.allocator, acknowledged_packet_numbers);
+        errdefer acked_packets.deinit(self.allocator);
+
+        var acked_packet: ?SentPacket = null;
+        for (acked_packets.items) |acked| {
+            if (acked.packet_number == largest_acked) {
+                acked_packet = acked;
+                break;
+            }
+        }
 
         // Detect lost packets
         const loss_delay = (self.rtt_stats.smoothed_rtt * self.time_threshold) / 8;
@@ -316,18 +374,25 @@ pub const LossDetection = struct {
 
         return AckResult{
             .acked_packet = acked_packet,
+            .acked_packets = acked_packets,
             .lost_packets = lost_packets,
         };
     }
 
     /// Get PTO (Probe Timeout) in microseconds
-    pub fn getPto(self: *LossDetection) u64 {
+    pub fn getPto(self: *const LossDetection) u64 {
         return self.rtt_stats.pto();
     }
 
     /// Get smoothed RTT in microseconds
-    pub fn getSmoothedRtt(self: *LossDetection) u64 {
+    pub fn getSmoothedRtt(self: *const LossDetection) u64 {
         return self.rtt_stats.smoothed_rtt;
+    }
+
+    /// Returns the highest packet number observed in a packet number space.
+    pub fn maxObservedPacketNumber(self: *const LossDetection, space: PacketNumberSpace) ?types.PacketNumber {
+        const space_state = self.getSpaceConst(space);
+        return space_state.maxObservedPacketNumber();
     }
 };
 
@@ -447,10 +512,33 @@ test "Loss detection by packet threshold" {
 
     // ACK packet 5 (packet threshold is 3, so packet 1 is declared lost)
     var ack_result = try ld.onAckReceived(.application, 5, 0, now);
+    defer ack_result.acked_packets.deinit(allocator);
     defer ack_result.lost_packets.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), ack_result.lost_packets.items.len);
     try std.testing.expectEqual(@as(u64, 1), ack_result.lost_packets.items[0].packet_number);
+}
+
+test "ACK processing with multiple packet numbers" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
+
+    const acked_numbers = [_]types.PacketNumber{ 2, 4 };
+    var ack_result = try ld.onAckReceivedWithPacketNumbers(.application, 4, 0, now, &acked_numbers);
+    defer ack_result.acked_packets.deinit(allocator);
+    defer ack_result.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?types.PacketNumber, 4), if (ack_result.acked_packet) |p| p.packet_number else null);
+    try std.testing.expectEqual(@as(usize, 2), ack_result.acked_packets.items.len);
 }
 
 test "RTT ack delay does not underflow below min_rtt" {
@@ -476,6 +564,7 @@ test "ACK for unsent packet updates largest_acked safely" {
 
     // Acking a packet that was never tracked should not fail.
     var ack_result = try ld.onAckReceived(.application, 42, 0, now);
+    defer ack_result.acked_packets.deinit(allocator);
     defer ack_result.lost_packets.deinit(allocator);
 
     try std.testing.expect(ack_result.acked_packet == null);
@@ -503,6 +592,7 @@ test "Loss detection by time threshold" {
     // ACK packet 2 much later (packet 1 should be lost by time)
     const much_later = later.add(2 * time_mod.Duration.SECOND);
     var ack_result = try ld.onAckReceived(.application, 2, 0, much_later);
+    defer ack_result.acked_packets.deinit(allocator);
     defer ack_result.lost_packets.deinit(allocator);
 
     // Packet 1 should be lost by time
@@ -528,6 +618,7 @@ test "Packet number space isolation" {
 
     // ACK in one space shouldn't affect others
     var ack_result = try ld.onAckReceived(.application, 1, 0, now);
+    defer ack_result.acked_packets.deinit(allocator);
     defer ack_result.lost_packets.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), ld.initial.sent_packets.items.len);
@@ -536,5 +627,6 @@ test "Packet number space isolation" {
 }
 pub const AckResult = struct {
     acked_packet: ?SentPacket,
+    acked_packets: std.ArrayList(SentPacket),
     lost_packets: std.ArrayList(SentPacket),
 };

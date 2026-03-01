@@ -8,17 +8,22 @@ const StreamRecvState = types.StreamRecvState;
 
 /// QUIC Stream
 pub const Stream = struct {
+    const BufferedChunkMap = std.AutoHashMap(u64, []u8);
+
     id: StreamId,
     send_state: StreamSendState,
     recv_state: StreamRecvState,
     send_offset: u64,
     recv_offset: u64,
+    read_offset: u64,
     max_stream_data_local: u64,
     max_stream_data_remote: u64,
     send_buffer: std.ArrayList(u8),
     recv_buffer: std.ArrayList(u8),
+    recv_chunks: BufferedChunkMap,
     fin_sent: bool,
     fin_received: bool,
+    final_size: ?u64,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, id: StreamId, max_stream_data: u64) Stream {
@@ -28,12 +33,15 @@ pub const Stream = struct {
             .recv_state = .recv,
             .send_offset = 0,
             .recv_offset = 0,
+            .read_offset = 0,
             .max_stream_data_local = max_stream_data,
             .max_stream_data_remote = max_stream_data,
             .send_buffer = .{},
             .recv_buffer = .{},
+            .recv_chunks = BufferedChunkMap.init(allocator),
             .fin_sent = false,
             .fin_received = false,
+            .final_size = null,
             .allocator = allocator,
         };
     }
@@ -41,6 +49,12 @@ pub const Stream = struct {
     pub fn deinit(self: *Stream) void {
         self.send_buffer.deinit(self.allocator);
         self.recv_buffer.deinit(self.allocator);
+
+        var it = self.recv_chunks.valueIterator();
+        while (it.next()) |chunk| {
+            self.allocator.free(chunk.*);
+        }
+        self.recv_chunks.deinit();
     }
 
     /// Get stream type from stream ID
@@ -91,14 +105,22 @@ pub const Stream = struct {
 
     /// Read data from receive buffer
     pub fn read(self: *Stream, buf: []u8) !usize {
-        if (self.recv_state != .recv and self.recv_state != .size_known) {
+        if (self.recv_state == .reset_recvd) {
+            self.recv_state = .reset_read;
+            return error.StreamNotReadable;
+        }
+
+        if (self.recv_state != .recv and
+            self.recv_state != .size_known and
+            self.recv_state != .data_recvd)
+        {
             return error.StreamNotReadable;
         }
 
         const available = @min(buf.len, self.recv_buffer.items.len);
         if (available == 0) {
-            if (self.fin_received and self.recv_state == .size_known) {
-                self.recv_state = .data_recvd;
+            if (self.fin_received and (self.recv_state == .size_known or self.recv_state == .data_recvd)) {
+                self.recv_state = .data_read;
                 return 0; // EOF
             }
             return error.WouldBlock;
@@ -110,10 +132,10 @@ pub const Stream = struct {
         std.mem.copyForwards(u8, self.recv_buffer.items, self.recv_buffer.items[available..]);
         try self.recv_buffer.resize(self.allocator, self.recv_buffer.items.len - available);
 
-        self.recv_offset += available;
+        self.read_offset += available;
 
-        if (self.recv_buffer.items.len == 0 and self.fin_received) {
-            self.recv_state = .data_read;
+        if (self.recv_buffer.items.len == 0 and self.fin_received and self.recv_state == .size_known) {
+            self.recv_state = .data_recvd;
         }
 
         return available;
@@ -125,22 +147,184 @@ pub const Stream = struct {
             return error.StreamClosed;
         }
 
-        // Enforce in-order delivery (out-of-order packets trigger retransmission)
-        // This is simpler than buffering out-of-order data and achieves the same goal
-        if (offset != self.recv_offset) {
-            return error.OutOfOrderData;
-        }
+        const end_offset = std.math.add(u64, offset, data.len) catch {
+            return error.FlowControlError;
+        };
 
-        if (offset + data.len > self.max_stream_data_local) {
+        if (end_offset > self.max_stream_data_local) {
             return error.FlowControlError;
         }
 
-        try self.recv_buffer.appendSlice(self.allocator, data);
-        self.recv_offset += data.len;
+        if (self.final_size) |known_final_size| {
+            if (end_offset > known_final_size) {
+                return error.FinalSizeError;
+            }
+            if (fin and end_offset != known_final_size) {
+                return error.FinalSizeError;
+            }
+        }
 
         if (fin) {
+            if (self.final_size) |known_final_size| {
+                if (known_final_size != end_offset) {
+                    return error.FinalSizeError;
+                }
+            } else {
+                self.final_size = end_offset;
+            }
+
             self.fin_received = true;
+        }
+
+        try self.bufferReceivedSegment(offset, data);
+        try self.deliverBufferedChunks();
+
+        if (self.final_size != null and self.recv_offset == self.final_size.?) {
             self.recv_state = .size_known;
+        }
+    }
+
+    /// Apply a RESET_STREAM final size to the receive side.
+    pub fn onResetReceived(self: *Stream, final_size: u64) !void {
+        switch (self.recv_state) {
+            .reset_recvd, .reset_read => {
+                if (self.final_size) |known_final_size| {
+                    if (known_final_size != final_size) {
+                        return error.FinalSizeError;
+                    }
+                }
+                return;
+            },
+            .recv, .size_known, .data_recvd, .data_read => {},
+        }
+
+        if (final_size < self.recv_offset) {
+            return error.FinalSizeError;
+        }
+
+        if (self.final_size) |known_final_size| {
+            if (known_final_size != final_size) {
+                return error.FinalSizeError;
+            }
+        } else {
+            self.final_size = final_size;
+        }
+
+        self.fin_received = true;
+        self.recv_state = .reset_recvd;
+    }
+
+    fn bufferReceivedSegment(self: *Stream, offset: u64, data: []const u8) !void {
+        if (data.len == 0) {
+            return;
+        }
+
+        const end_offset = std.math.add(u64, offset, data.len) catch {
+            return error.FlowControlError;
+        };
+
+        try self.validateOverlapWithReadableData(offset, data, end_offset);
+        self.validateOverlapWithBufferedChunks(offset, data, end_offset) catch |err| {
+            if (err == error.DuplicateData) {
+                return;
+            }
+            return err;
+        };
+
+        if (end_offset <= self.recv_offset) {
+            return;
+        }
+
+        if (offset < self.recv_offset) {
+            const overlap: usize = @intCast(self.recv_offset - offset);
+            const tail = data[overlap..];
+            try self.recv_buffer.appendSlice(self.allocator, tail);
+            self.recv_offset += tail.len;
+            return;
+        }
+
+        if (offset == self.recv_offset) {
+            try self.recv_buffer.appendSlice(self.allocator, data);
+            self.recv_offset += data.len;
+            return;
+        }
+
+        const copy = try self.allocator.dupe(u8, data);
+        try self.recv_chunks.put(offset, copy);
+    }
+
+    fn validateOverlapWithReadableData(self: *const Stream, offset: u64, data: []const u8, end_offset: u64) !void {
+        const readable_start = self.read_offset;
+        const readable_end = self.recv_offset;
+
+        const overlap_start = @max(offset, readable_start);
+        const overlap_end = @min(end_offset, readable_end);
+        if (overlap_start >= overlap_end) {
+            return;
+        }
+
+        const data_start: usize = @intCast(overlap_start - offset);
+        const buffer_start: usize = @intCast(overlap_start - readable_start);
+        const overlap_len: usize = @intCast(overlap_end - overlap_start);
+
+        if (!std.mem.eql(
+            u8,
+            data[data_start .. data_start + overlap_len],
+            self.recv_buffer.items[buffer_start .. buffer_start + overlap_len],
+        )) {
+            return error.OutOfOrderData;
+        }
+    }
+
+    fn validateOverlapWithBufferedChunks(self: *const Stream, offset: u64, data: []const u8, end_offset: u64) !void {
+        var it = self.recv_chunks.iterator();
+        while (it.next()) |entry| {
+            const chunk_offset = entry.key_ptr.*;
+            const chunk = entry.value_ptr.*;
+            const chunk_end = std.math.add(u64, chunk_offset, chunk.len) catch std.math.maxInt(u64);
+
+            const overlap_start = @max(offset, chunk_offset);
+            const overlap_end = @min(end_offset, chunk_end);
+            if (overlap_start >= overlap_end) {
+                continue;
+            }
+
+            if (offset == chunk_offset and data.len == chunk.len and std.mem.eql(u8, data, chunk)) {
+                return error.DuplicateData;
+            }
+
+            return error.OutOfOrderData;
+        }
+    }
+
+    fn deliverBufferedChunks(self: *Stream) !void {
+        while (self.recv_chunks.get(self.recv_offset)) |chunk| {
+            const chunk_offset = self.recv_offset;
+            try self.recv_buffer.appendSlice(self.allocator, chunk);
+            self.recv_offset += chunk.len;
+
+            _ = self.recv_chunks.remove(chunk_offset);
+            self.allocator.free(chunk);
+        }
+
+        // Drop stale buffered chunks now fully covered by contiguous data.
+        var stale_offsets = std.ArrayList(u64){};
+        defer stale_offsets.deinit(self.allocator);
+
+        var it = self.recv_chunks.iterator();
+        while (it.next()) |entry| {
+            const chunk_offset = entry.key_ptr.*;
+            const chunk = entry.value_ptr.*;
+            const chunk_end = std.math.add(u64, chunk_offset, chunk.len) catch std.math.maxInt(u64);
+            if (chunk_end <= self.recv_offset) {
+                try stale_offsets.append(self.allocator, chunk_offset);
+            }
+        }
+
+        for (stale_offsets.items) |stale_offset| {
+            if (self.recv_chunks.fetchRemove(stale_offset)) |kv| {
+                self.allocator.free(kv.value);
+            }
         }
     }
 
@@ -246,6 +430,26 @@ pub const StreamManager = struct {
     pub fn setLocalOpenLimits(self: *StreamManager, max_streams_bidi: u64, max_streams_uni: u64) void {
         self.max_local_streams_bidi = max_streams_bidi;
         self.max_local_streams_uni = max_streams_uni;
+    }
+
+    pub fn onMaxStreams(self: *StreamManager, bidirectional: bool, max_streams: u64) void {
+        if (bidirectional) {
+            if (max_streams > self.max_local_streams_bidi) {
+                self.max_local_streams_bidi = max_streams;
+            }
+            return;
+        }
+
+        if (max_streams > self.max_local_streams_uni) {
+            self.max_local_streams_uni = max_streams;
+        }
+    }
+
+    pub fn onMaxStreamData(self: *StreamManager, stream_id: StreamId, max_stream_data: u64) void {
+        const stream = self.streams.getPtr(stream_id) orelse return;
+        if (max_stream_data > stream.max_stream_data_remote) {
+            stream.max_stream_data_remote = max_stream_data;
+        }
     }
 
     pub fn setRemoteStreamDataLimits(self: *StreamManager, bidi_local: u64, bidi_remote: u64, uni: u64) void {
@@ -471,6 +675,39 @@ test "stream manager enforces local stream limits" {
     try std.testing.expectError(error.StreamLimitReached, manager.createStream(.client_uni));
 }
 
+test "stream manager applies MAX_STREAMS updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    var manager = StreamManager.init(allocator, false, 1024);
+    defer manager.deinit();
+
+    manager.setLocalOpenLimits(1, 1);
+    manager.onMaxStreams(true, 0);
+    try std.testing.expectEqual(@as(u64, 1), manager.max_local_streams_bidi);
+
+    manager.onMaxStreams(true, 3);
+    try std.testing.expectEqual(@as(u64, 3), manager.max_local_streams_bidi);
+
+    manager.onMaxStreams(false, 2);
+    try std.testing.expectEqual(@as(u64, 2), manager.max_local_streams_uni);
+}
+
+test "stream manager applies MAX_STREAM_DATA updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    var manager = StreamManager.init(allocator, false, 1024);
+    defer manager.deinit();
+
+    const stream_id = try manager.createStream(.client_bidi);
+    const before = manager.getStream(stream_id).?.max_stream_data_remote;
+
+    manager.onMaxStreamData(stream_id, before - 1);
+    try std.testing.expectEqual(before, manager.getStream(stream_id).?.max_stream_data_remote);
+
+    manager.onMaxStreamData(stream_id, before + 4096);
+    try std.testing.expectEqual(before + 4096, manager.getStream(stream_id).?.max_stream_data_remote);
+}
+
 test "stream manager applies remote send limits by stream type" {
     const allocator = std.testing.allocator;
 
@@ -507,6 +744,136 @@ test "stream manager applies local receive limits by stream type" {
     try std.testing.expectEqual(@as(u64, 0), manager.getStream(client_uni).?.max_stream_data_local);
     try std.testing.expectEqual(@as(u64, 500), server_bidi.max_stream_data_local);
     try std.testing.expectEqual(@as(u64, 300), server_uni.max_stream_data_local);
+}
+
+test "stream receive buffers out-of-order segments" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("world", 6, false);
+    try std.testing.expectEqual(@as(usize, 0), stream.recv_buffer.items.len);
+    try std.testing.expectEqual(@as(u64, 0), stream.recv_offset);
+
+    try stream.appendRecvData("hello ", 0, false);
+    try std.testing.expectEqual(@as(u64, 11), stream.recv_offset);
+
+    var read_buf: [32]u8 = undefined;
+    const n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 11), n);
+    try std.testing.expectEqualStrings("hello world", read_buf[0..n]);
+}
+
+test "stream receive ignores duplicate segment" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("chunk", 0, false);
+    try stream.appendRecvData("chunk", 0, false);
+    try std.testing.expectEqual(@as(u64, 5), stream.recv_offset);
+
+    var read_buf: [16]u8 = undefined;
+    const n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqualStrings("chunk", read_buf[0..n]);
+}
+
+test "stream receive rejects overlapping out-of-order chunks" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("world", 5, false);
+    try std.testing.expectError(error.OutOfOrderData, stream.appendRecvData("rld!", 7, false));
+}
+
+test "stream receive accepts matching overlap with contiguous data" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("hello", 0, false);
+    try stream.appendRecvData("lo world", 3, false);
+
+    var read_buf: [32]u8 = undefined;
+    const n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 11), n);
+    try std.testing.expectEqualStrings("hello world", read_buf[0..n]);
+}
+
+test "stream receive rejects mismatched overlap with contiguous data" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("hello", 0, false);
+    try std.testing.expectError(error.OutOfOrderData, stream.appendRecvData("xlo", 2, false));
+}
+
+test "stream receive enforces final size invariants" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("abcd", 0, true);
+    try std.testing.expectEqual(@as(?u64, 4), stream.final_size);
+    try std.testing.expectEqual(types.StreamRecvState.size_known, stream.recv_state);
+
+    try std.testing.expectError(error.FinalSizeError, stream.appendRecvData("x", 4, false));
+    try std.testing.expectError(error.FinalSizeError, stream.appendRecvData("", 0, true));
+}
+
+test "stream reset enforces final size consistency" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("ab", 0, false);
+    try stream.onResetReceived(2);
+    try std.testing.expectEqual(types.StreamRecvState.reset_recvd, stream.recv_state);
+
+    try std.testing.expectError(error.FinalSizeError, stream.onResetReceived(3));
+}
+
+test "stream read transitions from data_recvd to data_read" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.appendRecvData("done", 0, true);
+
+    var read_buf: [16]u8 = undefined;
+    const n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(types.StreamRecvState.data_recvd, stream.recv_state);
+
+    const eof_n = try stream.read(&read_buf);
+    try std.testing.expectEqual(@as(usize, 0), eof_n);
+    try std.testing.expectEqual(types.StreamRecvState.data_read, stream.recv_state);
+
+    try std.testing.expectError(error.StreamNotReadable, stream.read(&read_buf));
+}
+
+test "stream read marks reset_recvd as reset_read" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 0, 1024);
+    defer stream.deinit();
+
+    try stream.onResetReceived(0);
+
+    var read_buf: [1]u8 = undefined;
+    try std.testing.expectError(error.StreamNotReadable, stream.read(&read_buf));
+    try std.testing.expectEqual(types.StreamRecvState.reset_read, stream.recv_state);
 }
 
 test "stream receive flow control enforces local max data" {

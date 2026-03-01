@@ -16,6 +16,9 @@ const time_mod = @import("../utils/time.zig");
 
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 const CLOSE_REASON_MAX_LEN: usize = 256;
+const MAX_VN_VERSIONS: usize = 16;
+const LOCAL_SUPPORTED_VERSIONS = [_]u32{core_types.QUIC_VERSION_1};
+const FALLBACK_DRAIN_TIMEOUT_US: u64 = 3 * time_mod.Duration.SECOND;
 
 const PacketSpace = enum {
     initial,
@@ -28,6 +31,9 @@ const PacketSpace = enum {
 const ParsedHeader = struct {
     consumed: usize,
     packet_space: PacketSpace,
+    is_short_header: bool,
+    initial_token: []const u8,
+    src_conn_id: ?core_types.ConnectionId,
 };
 
 const TlsFailureStage = enum {
@@ -63,6 +69,7 @@ pub const QuicConnection = struct {
     // Basic packet visibility counters
     packets_received: u64,
     packets_invalid: u64,
+    created_at: time_mod.Instant,
 
     // Negotiated protocol metadata
     negotiated_alpn: ?[]const u8,
@@ -75,7 +82,20 @@ pub const QuicConnection = struct {
     close_reason_len: usize,
     close_error_code: u64,
     drain_pending: bool,
+    drain_deadline: ?time_mod.Instant,
     closed_event_emitted: bool,
+
+    // Token lifecycle state
+    latest_new_token: ?[]u8,
+    token_validator_ctx: ?*anyopaque,
+    token_validator: ?*const fn (ctx: ?*anyopaque, token: []const u8) bool,
+    retry_validator_ctx: ?*anyopaque,
+    retry_validator: ?*const fn (ctx: ?*anyopaque, token: []const u8, retry_source_conn_id: core_types.ConnectionId) bool,
+
+    // Retry handling state (client)
+    retry_token: ?[]u8,
+    retry_source_conn_id: ?core_types.ConnectionId,
+    retry_seen: bool,
 
     /// Initialize a new QUIC connection
     pub fn init(
@@ -104,13 +124,23 @@ pub const QuicConnection = struct {
             .remote_addr = null,
             .packets_received = 0,
             .packets_invalid = 0,
+            .created_at = time_mod.Instant.now(),
             .negotiated_alpn = null,
             .tls_server_hello_applied = false,
             .close_reason_buf = [_]u8{0} ** CLOSE_REASON_MAX_LEN,
             .close_reason_len = 0,
             .close_error_code = 0,
             .drain_pending = false,
+            .drain_deadline = null,
             .closed_event_emitted = false,
+            .latest_new_token = null,
+            .token_validator_ctx = null,
+            .token_validator = null,
+            .retry_validator_ctx = null,
+            .retry_validator = null,
+            .retry_token = null,
+            .retry_source_conn_id = null,
+            .retry_seen = false,
         };
     }
 
@@ -129,9 +159,19 @@ pub const QuicConnection = struct {
         error_code: u64,
         reason: []const u8,
     ) types_mod.QuicError!void {
+        if (self.state == .closed or self.state == .draining) {
+            return;
+        }
+
+        const drain_timeout = if (self.internal_conn) |conn|
+            conn.drainTimeoutDuration()
+        else
+            FALLBACK_DRAIN_TIMEOUT_US;
+
         self.setCloseReason(reason);
         self.close_error_code = error_code;
         self.drain_pending = true;
+        self.drain_deadline = time_mod.Instant.now().add(drain_timeout);
         self.state = .draining;
 
         try self.events.append(self.allocator, .{
@@ -161,6 +201,10 @@ pub const QuicConnection = struct {
                 return types_mod.QuicError.InvalidPacket;
             };
 
+            if (result.header.version != core_types.QUIC_VERSION_1) {
+                return types_mod.QuicError.ProtocolViolation;
+            }
+
             const space: PacketSpace = switch (result.header.packet_type) {
                 .initial => .initial,
                 .handshake => .handshake,
@@ -169,14 +213,26 @@ pub const QuicConnection = struct {
                 else => .application,
             };
 
-            return .{ .consumed = result.consumed, .packet_space = space };
+            return .{
+                .consumed = result.consumed,
+                .packet_space = space,
+                .is_short_header = false,
+                .initial_token = if (space == .initial or space == .retry) result.header.token else &.{},
+                .src_conn_id = result.header.src_conn_id,
+            };
         }
 
         const dcid_len = self.shortHeaderDcidLen();
         const result = packet_mod.ShortHeader.decode(packet, dcid_len) catch {
             return types_mod.QuicError.InvalidPacket;
         };
-        return .{ .consumed = result.consumed, .packet_space = .application };
+        return .{
+            .consumed = result.consumed,
+            .packet_space = .application,
+            .is_short_header = true,
+            .initial_token = &.{},
+            .src_conn_id = null,
+        };
     }
 
     fn queueProtocolViolation(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
@@ -201,6 +257,189 @@ pub const QuicConnection = struct {
         }
 
         try self.enterDraining(@intFromEnum(core_types.ErrorCode.flow_control_error), reason);
+    }
+
+    fn queueInvalidToken(self: *QuicConnection, reason: []const u8) types_mod.QuicError!void {
+        if (self.state == .closed) {
+            return;
+        }
+
+        try self.enterDraining(@intFromEnum(core_types.ErrorCode.invalid_token), reason);
+    }
+
+    fn storeNewToken(self: *QuicConnection, token: []const u8) types_mod.QuicError!void {
+        if (self.latest_new_token) |existing| {
+            self.allocator.free(existing);
+            self.latest_new_token = null;
+        }
+
+        const copy = self.allocator.alloc(u8, token.len) catch {
+            return types_mod.QuicError.OutOfMemory;
+        };
+        @memcpy(copy, token);
+        self.latest_new_token = copy;
+    }
+
+    fn storeRetryToken(self: *QuicConnection, token: []const u8) types_mod.QuicError!void {
+        if (self.retry_token) |existing| {
+            self.allocator.free(existing);
+            self.retry_token = null;
+        }
+
+        const copy = self.allocator.alloc(u8, token.len) catch {
+            return types_mod.QuicError.OutOfMemory;
+        };
+        @memcpy(copy, token);
+        self.retry_token = copy;
+    }
+
+    fn handleRetryPacket(self: *QuicConnection, header: ParsedHeader) types_mod.QuicError!void {
+        if (self.config.role != .client or self.state != .connecting) {
+            self.packets_invalid += 1;
+            try self.queueProtocolViolation("unexpected retry packet");
+            return;
+        }
+
+        if (self.retry_seen) {
+            self.packets_invalid += 1;
+            try self.queueProtocolViolation("multiple retry packets");
+            return;
+        }
+
+        if (header.initial_token.len == 0) {
+            self.packets_invalid += 1;
+            try self.queueInvalidToken("retry token missing");
+            return;
+        }
+
+        const retry_scid = header.src_conn_id orelse {
+            self.packets_invalid += 1;
+            try self.queueProtocolViolation("retry source connection id missing");
+            return;
+        };
+
+        if (!self.validateRetryIntegrity(header.initial_token, retry_scid)) {
+            self.packets_invalid += 1;
+            try self.queueProtocolViolation("retry integrity check failed");
+            return;
+        }
+
+        try self.storeRetryToken(header.initial_token);
+        self.retry_source_conn_id = retry_scid;
+        self.retry_seen = true;
+
+        if (self.internal_conn) |conn| {
+            conn.remote_conn_id = retry_scid;
+        }
+    }
+
+    fn validateToken(self: *QuicConnection, token: []const u8) bool {
+        if (self.token_validator) |validator| {
+            return validator(self.token_validator_ctx, token);
+        }
+
+        // Default policy accepts token-bearing Initial packets when no explicit
+        // validator is configured by the application.
+        return true;
+    }
+
+    fn validateRetryIntegrity(self: *QuicConnection, token: []const u8, retry_source_conn_id: core_types.ConnectionId) bool {
+        if (self.retry_validator) |validator| {
+            return validator(self.retry_validator_ctx, token, retry_source_conn_id);
+        }
+
+        // Default policy accepts Retry packets when no explicit integrity
+        // validator is configured by the application.
+        return true;
+    }
+
+    fn detectStatelessReset(self: *QuicConnection, packet: []const u8, header: ParsedHeader) bool {
+        if (!header.is_short_header or packet.len < 17) {
+            return false;
+        }
+
+        const conn = self.internal_conn orelse return false;
+        const token = packet[packet.len - 16 .. packet.len];
+        for (conn.peer_connection_ids.items) |entry| {
+            if (std.mem.eql(u8, token, &entry.stateless_reset_token)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn detectStatelessResetRaw(self: *QuicConnection, packet: []const u8) bool {
+        if (packet.len < 17) {
+            return false;
+        }
+
+        // Stateless reset is carried in a packet that appears as a short header.
+        if ((packet[0] & 0x80) != 0) {
+            return false;
+        }
+
+        const conn = self.internal_conn orelse return false;
+        const token = packet[packet.len - 16 .. packet.len];
+        for (conn.peer_connection_ids.items) |entry| {
+            if (std.mem.eql(u8, token, &entry.stateless_reset_token)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn selectMutualVersion(peer_versions: []const u32) ?u32 {
+        for (LOCAL_SUPPORTED_VERSIONS) |local| {
+            for (peer_versions) |peer| {
+                if (peer == local) return local;
+            }
+        }
+        return null;
+    }
+
+    fn handleVersionNegotiationPacket(self: *QuicConnection, packet: []const u8) types_mod.QuicError!bool {
+        if (packet.len < 5) return false;
+        if ((packet[0] & 0x80) == 0) return false;
+
+        const version = std.mem.readInt(u32, packet[1..5], .big);
+        if (version != 0) return false;
+
+        var versions: [MAX_VN_VERSIONS]u32 = undefined;
+        const decoded = packet_mod.VersionNegotiationPacket.decode(packet, &versions) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+
+        // Policy: only client in connecting state reacts to VN packets.
+        if (self.config.role != .client or self.state != .connecting) {
+            return true;
+        }
+
+        const mutual = selectMutualVersion(decoded.packet.supported_versions);
+        if (mutual == null) {
+            self.packets_invalid += 1;
+            try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), "no mutual QUIC version");
+            return true;
+        }
+
+        // VN packets advertising the currently attempted version are invalid.
+        if (mutual.? == core_types.QUIC_VERSION_1) {
+            self.packets_invalid += 1;
+            try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), "invalid version negotiation");
+            return true;
+        }
+
+        return true;
+    }
+
+    fn recoverySpaceForPacketSpace(packet_space: PacketSpace) ?conn_internal.RecoverySpace {
+        return switch (packet_space) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .application => .application,
+            .zero_rtt, .retry => null,
+        };
     }
 
     fn queueTlsFailure(self: *QuicConnection, stage: TlsFailureStage, err: anyerror) types_mod.QuicError!void {
@@ -434,8 +673,8 @@ pub const QuicConnection = struct {
         return (frame_type & 0x1f) == 0x1f;
     }
 
-    fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!void {
-        if (payload.len == 0) return;
+    fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!usize {
+        if (payload.len == 0) return 0;
 
         const frame_type_result = varint.decode(payload) catch {
             return types_mod.QuicError.InvalidPacket;
@@ -458,28 +697,65 @@ pub const QuicConnection = struct {
             stream.appendRecvData(decoded.frame.data, decoded.frame.offset, decoded.frame.fin) catch |err| {
                 return switch (err) {
                     error.FlowControlError => types_mod.QuicError.FlowControlError,
+                    error.FinalSizeError => types_mod.QuicError.ProtocolViolation,
                     error.OutOfOrderData, error.StreamClosed => types_mod.QuicError.ProtocolViolation,
                     else => types_mod.QuicError.InvalidPacket,
                 };
             };
 
             try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
-            return;
+            return decoded.consumed;
         }
 
         switch (frame_type) {
-            0x01 => {
-                _ = frame_mod.PingFrame.decode(payload) catch {
+            0x00 => {
+                const decoded = frame_mod.PaddingFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
                 };
+                return decoded.consumed;
+            },
+            0x01 => {
+                const decoded = frame_mod.PingFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+                return decoded.consumed;
+            },
+            0x06 => {
+                const decoded = frame_mod.CryptoFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+                return decoded.consumed;
             },
             0x02, 0x03 => {
-                const decoded = frame_mod.AckFrame.decode(payload) catch {
+                var ack_ranges: [32]frame_mod.AckFrame.AckRange = undefined;
+                const decoded = frame_mod.AckFrame.decodeWithAckRanges(payload, &ack_ranges) catch {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 if (self.internal_conn) |conn| {
-                    conn.processAckDetailed(decoded.frame.largest_acked, decoded.frame.ack_delay);
+                    const recovery_space = recoverySpaceForPacketSpace(packet_space) orelse {
+                        return types_mod.QuicError.ProtocolViolation;
+                    };
+
+                    if (!conn.validateAckFrameInSpace(
+                        recovery_space,
+                        decoded.frame.largest_acked,
+                        decoded.frame.first_ack_range,
+                        decoded.frame.ack_ranges,
+                    )) {
+                        return types_mod.QuicError.ProtocolViolation;
+                    }
+
+                    const ack_delay_us = conn.normalizePeerAckDelay(decoded.frame.ack_delay);
+
+                    conn.processAckDetailedWithRangesInSpace(
+                        recovery_space,
+                        decoded.frame.largest_acked,
+                        ack_delay_us,
+                        decoded.frame.first_ack_range,
+                        decoded.frame.ack_ranges,
+                    );
                 }
+                return decoded.consumed;
             },
             0x1c, 0x1d => {
                 const decoded = frame_mod.ConnectionCloseFrame.decode(payload) catch {
@@ -487,6 +763,94 @@ pub const QuicConnection = struct {
                 };
 
                 try self.enterDraining(decoded.frame.error_code, decoded.frame.reason);
+                return decoded.consumed;
+            },
+            0x10 => {
+                const decoded = frame_mod.MaxDataFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onMaxData(decoded.frame.max_data);
+                return decoded.consumed;
+            },
+            0x11 => {
+                const decoded = frame_mod.MaxStreamDataFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onMaxStreamData(decoded.frame.stream_id, decoded.frame.max_stream_data);
+                return decoded.consumed;
+            },
+            0x12, 0x13 => {
+                const decoded = frame_mod.MaxStreamsFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onMaxStreams(decoded.frame.bidirectional, decoded.frame.max_streams);
+                return decoded.consumed;
+            },
+            0x14 => {
+                const decoded = frame_mod.DataBlockedFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onDataBlocked(decoded.frame.max_data);
+                return decoded.consumed;
+            },
+            0x15 => {
+                const decoded = frame_mod.StreamDataBlockedFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onStreamDataBlocked(decoded.frame.max_stream_data);
+                return decoded.consumed;
+            },
+            0x16, 0x17 => {
+                const decoded = frame_mod.StreamsBlockedFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onStreamsBlocked(decoded.frame.bidirectional, decoded.frame.max_streams);
+                return decoded.consumed;
+            },
+            0x18 => {
+                const decoded = frame_mod.NewConnectionIdFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                const ok = conn.onNewConnectionId(
+                    decoded.frame.sequence_number,
+                    decoded.frame.retire_prior_to,
+                    decoded.frame.connection_id,
+                    decoded.frame.stateless_reset_token,
+                ) catch {
+                    return types_mod.QuicError.OutOfMemory;
+                };
+
+                if (!ok) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                return decoded.consumed;
+            },
+            0x19 => {
+                const decoded = frame_mod.RetireConnectionIdFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                if (!conn.onRetireConnectionId(decoded.frame.sequence_number)) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                return decoded.consumed;
             },
             0x04 => {
                 const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
@@ -498,8 +862,9 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.StreamError;
                 };
 
-                stream.recv_state = .reset_read;
-                stream.fin_received = true;
+                stream.onResetReceived(decoded.frame.final_size) catch {
+                    return types_mod.QuicError.ProtocolViolation;
+                };
 
                 try self.events.append(self.allocator, .{
                     .stream_closed = .{
@@ -507,6 +872,7 @@ pub const QuicConnection = struct {
                         .error_code = decoded.frame.error_code,
                     },
                 });
+                return decoded.consumed;
             },
             0x05 => {
                 const decoded = frame_mod.StopSendingFrame.decode(payload) catch {
@@ -518,6 +884,7 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.StreamError;
                 };
                 stream.reset(decoded.frame.error_code);
+                return decoded.consumed;
             },
             0x1a => {
                 const decoded = frame_mod.PathChallengeFrame.decode(payload) catch {
@@ -528,6 +895,7 @@ pub const QuicConnection = struct {
                 conn.onPathChallenge(decoded.frame.data) catch {
                     return types_mod.QuicError.OutOfMemory;
                 };
+                return decoded.consumed;
             },
             0x1b => {
                 const decoded = frame_mod.PathResponseFrame.decode(payload) catch {
@@ -536,9 +904,34 @@ pub const QuicConnection = struct {
 
                 const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
                 _ = conn.onPathResponse(decoded.frame.data);
+                return decoded.consumed;
+            },
+            0x07 => {
+                const decoded = frame_mod.NewTokenFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                if (self.config.role == .server) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                try self.storeNewToken(decoded.frame.token);
+                return decoded.consumed;
+            },
+            0x1e => {
+                const decoded = frame_mod.HandshakeDoneFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                if (self.config.role == .server) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                return decoded.consumed;
             },
             else => {
                 // Unknown/unhandled frame type in this slice: ignore.
+                return payload.len;
             },
         }
     }
@@ -799,8 +1192,12 @@ pub const QuicConnection = struct {
         const stream = conn.getStream(stream_id) orelse return types_mod.QuicError.StreamNotFound;
 
         // Read data from stream
-        const read_count = stream.read(buffer) catch {
-            return types_mod.QuicError.StreamError;
+        const read_count = stream.read(buffer) catch |err| {
+            return switch (err) {
+                error.StreamNotReadable => types_mod.QuicError.StreamClosed,
+                error.WouldBlock => types_mod.QuicError.StreamError,
+                else => types_mod.QuicError.StreamError,
+            };
         };
 
         return read_count;
@@ -847,7 +1244,7 @@ pub const QuicConnection = struct {
             else => false,
         };
         const recv_closed = switch (stream.recv_state) {
-            .data_read, .reset_read => true,
+            .data_recvd, .data_read, .reset_recvd, .reset_read => true,
             else => false,
         };
 
@@ -878,12 +1275,15 @@ pub const QuicConnection = struct {
         }
 
         if (self.state == .draining) {
-            if (self.drain_pending) {
+            const deadline = self.drain_deadline orelse time_mod.Instant.now();
+
+            if (time_mod.Instant.now().isBefore(deadline)) {
                 self.drain_pending = false;
                 return;
             }
 
             self.state = .closed;
+            self.drain_deadline = null;
             if (self.internal_conn) |conn| {
                 conn.markClosed();
             }
@@ -916,31 +1316,85 @@ pub const QuicConnection = struct {
                 conn.updateDataReceived(packet.len);
             }
 
-            const header = self.decodePacketHeader(packet) catch {
+            const vn_handled = self.handleVersionNegotiationPacket(packet) catch {
                 self.packets_invalid += 1;
+                try self.queueProtocolViolation("invalid version negotiation packet");
+                return;
+            };
+
+            if (vn_handled) {
+                return;
+            }
+
+            const header = self.decodePacketHeader(packet) catch |err| {
+                self.packets_invalid += 1;
+
+                if (self.detectStatelessResetRaw(packet)) {
+                    try self.enterDraining(@intFromEnum(core_types.ErrorCode.no_error), "stateless reset");
+                    return;
+                }
+
+                if (err == types_mod.QuicError.ProtocolViolation) {
+                    try self.queueProtocolViolation("unsupported version");
+                    return;
+                }
+
                 try self.queueProtocolViolation("invalid packet header");
                 return;
             };
+
+            if (self.config.role == .server and header.packet_space == .initial and header.initial_token.len > 0) {
+                if (!self.validateToken(header.initial_token)) {
+                    self.packets_invalid += 1;
+                    try self.queueInvalidToken("initial token rejected");
+                    return;
+                }
+            }
+
+            if (header.packet_space == .retry) {
+                try self.handleRetryPacket(header);
+                return;
+            }
 
             if (header.consumed >= packet.len) return;
 
             try self.transitionToEstablished();
 
-            self.routeFrame(packet[header.consumed..], header.packet_space) catch |err| {
-                self.packets_invalid += 1;
-                if (err == types_mod.QuicError.ProtocolViolation) {
-                    try self.queueProtocolViolation("frame not allowed in current context");
+            var frame_offset = header.consumed;
+            while (frame_offset < packet.len) {
+                const consumed = self.routeFrame(packet[frame_offset..], header.packet_space) catch |err| {
+                    self.packets_invalid += 1;
+                    if (self.detectStatelessReset(packet, header)) {
+                        try self.enterDraining(@intFromEnum(core_types.ErrorCode.no_error), "stateless reset");
+                        return;
+                    }
+
+                    if (err == types_mod.QuicError.ProtocolViolation) {
+                        try self.queueProtocolViolation("frame not allowed in current context");
+                        return;
+                    }
+
+                    if (err == types_mod.QuicError.FlowControlError) {
+                        try self.queueFlowControlError("stream flow control exceeded");
+                        return;
+                    }
+
+                    try self.queueProtocolViolation("invalid frame payload");
+                    return;
+                };
+
+                if (consumed == 0 or consumed > (packet.len - frame_offset)) {
+                    self.packets_invalid += 1;
+                    try self.queueProtocolViolation("invalid frame length");
                     return;
                 }
 
-                if (err == types_mod.QuicError.FlowControlError) {
-                    try self.queueFlowControlError("stream flow control exceeded");
+                frame_offset += consumed;
+
+                if (self.state == .draining or self.state == .closed) {
                     return;
                 }
-
-                try self.queueProtocolViolation("invalid frame payload");
-                return;
-            };
+            }
         }
     }
 
@@ -1078,10 +1532,16 @@ pub const QuicConnection = struct {
     pub fn getStats(self: *QuicConnection) types_mod.ConnectionStats {
         var stats = types_mod.ConnectionStats{};
         stats.packets_received = self.packets_received;
+        stats.packets_invalid = self.packets_invalid;
+        const elapsed_us = time_mod.Instant.now().durationSince(self.created_at);
+        stats.duration_ms = @divFloor(elapsed_us, time_mod.Duration.MILLISECOND);
 
         if (self.internal_conn) |conn| {
+            stats.packets_sent = conn.next_packet_number;
             stats.bytes_sent = conn.data_sent;
             stats.bytes_received = conn.data_received;
+            stats.active_streams = @intCast(conn.streams.streams.count());
+            stats.rtt = conn.loss_detection.getSmoothedRtt();
         }
 
         return stats;
@@ -1095,6 +1555,66 @@ pub const QuicConnection = struct {
     /// Returns negotiated ALPN protocol when available.
     pub fn getNegotiatedAlpn(self: *const QuicConnection) ?[]const u8 {
         return self.negotiated_alpn;
+    }
+
+    /// Returns the latest token received in a NEW_TOKEN frame.
+    pub fn getLatestNewToken(self: *const QuicConnection) ?[]const u8 {
+        return self.latest_new_token;
+    }
+
+    /// Returns the latest token received from a Retry packet.
+    pub fn getRetryToken(self: *const QuicConnection) ?[]const u8 {
+        return self.retry_token;
+    }
+
+    /// Returns the latest Retry source connection ID advertised by peer.
+    pub fn getRetrySourceConnectionId(self: *const QuicConnection) ?[]const u8 {
+        if (self.retry_source_conn_id) |*cid| {
+            return cid.slice();
+        }
+        return null;
+    }
+
+    /// Clears the currently cached NEW_TOKEN value.
+    pub fn clearLatestNewToken(self: *QuicConnection) void {
+        if (self.latest_new_token) |token| {
+            self.allocator.free(token);
+            self.latest_new_token = null;
+        }
+    }
+
+    /// Clears the currently cached Retry token value.
+    pub fn clearRetryToken(self: *QuicConnection) void {
+        if (self.retry_token) |token| {
+            self.allocator.free(token);
+            self.retry_token = null;
+        }
+    }
+
+    /// Configures application token validation for Initial packets.
+    ///
+    /// The validator is called only when a server receives an Initial packet
+    /// that carries a non-empty token.
+    pub fn setTokenValidator(
+        self: *QuicConnection,
+        ctx: ?*anyopaque,
+        validator: *const fn (ctx: ?*anyopaque, token: []const u8) bool,
+    ) void {
+        self.token_validator_ctx = ctx;
+        self.token_validator = validator;
+    }
+
+    /// Configures client-side Retry integrity validation callback.
+    ///
+    /// The callback is invoked when a Retry packet is received while connecting.
+    /// Returning false triggers deterministic protocol violation close behavior.
+    pub fn setRetryIntegrityValidator(
+        self: *QuicConnection,
+        ctx: ?*anyopaque,
+        validator: *const fn (ctx: ?*anyopaque, token: []const u8, retry_source_conn_id: core_types.ConnectionId) bool,
+    ) void {
+        self.retry_validator_ctx = ctx;
+        self.retry_validator = validator;
     }
 
     /// Returns true when handshake negotiation is complete enough to gate app traffic.
@@ -1131,6 +1651,139 @@ pub const QuicConnection = struct {
 
     pub fn getNegotiationResult(self: *const QuicConnection) types_mod.NegotiationResult {
         return self.buildNegotiationResult();
+    }
+
+    /// Returns number of currently tracked peer-issued connection IDs.
+    pub fn getPeerConnectionIdCount(self: *const QuicConnection) usize {
+        const conn = self.internal_conn orelse return 0;
+        return conn.peer_connection_ids.items.len;
+    }
+
+    /// Returns peer connection ID metadata by index.
+    pub fn getPeerConnectionIdInfo(self: *const QuicConnection, index: usize) ?types_mod.PeerConnectionIdInfo {
+        const conn = self.internal_conn orelse return null;
+        if (index >= conn.peer_connection_ids.items.len) return null;
+
+        const entry = conn.peer_connection_ids.items[index];
+        return .{
+            .sequence_number = entry.sequence_number,
+            .connection_id = entry.connection_id.data,
+            .connection_id_len = entry.connection_id.len,
+            .stateless_reset_token = entry.stateless_reset_token,
+        };
+    }
+
+    /// Pop next pending RETIRE_CONNECTION_ID sequence requested by peer CID updates.
+    pub fn popRetireConnectionId(self: *QuicConnection) ?u64 {
+        const conn = self.internal_conn orelse return null;
+        return conn.popRetireConnectionId();
+    }
+
+    /// Pop and encode next pending RETIRE_CONNECTION_ID frame.
+    ///
+    /// Returns the encoded frame length, or null if no pending retire request
+    /// exists.
+    pub fn popRetireConnectionIdFrame(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        const seq = self.popRetireConnectionId() orelse return null;
+        const frame = frame_mod.RetireConnectionIdFrame{ .sequence_number = seq };
+        const len = frame.encode(out) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return len;
+    }
+
+    /// Queue a local connection ID for NEW_CONNECTION_ID advertisement.
+    pub fn queueNewConnectionId(
+        self: *QuicConnection,
+        connection_id_bytes: []const u8,
+        stateless_reset_token: [16]u8,
+    ) types_mod.QuicError!u64 {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        const connection_id = core_types.ConnectionId.init(connection_id_bytes) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+
+        return conn.queueNewConnectionId(connection_id, stateless_reset_token) catch {
+            return types_mod.QuicError.OutOfMemory;
+        };
+    }
+
+    /// Encode latest queued NEW_CONNECTION_ID advertisement frame.
+    pub fn encodeLatestNewConnectionIdFrame(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        const latest = conn.latestLocalConnectionId() orelse return null;
+
+        const frame = frame_mod.NewConnectionIdFrame{
+            .sequence_number = latest.sequence_number,
+            .retire_prior_to = conn.localRetirePriorTo(),
+            .connection_id = latest.connection_id,
+            .stateless_reset_token = latest.stateless_reset_token,
+        };
+
+        const len = frame.encode(out) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return len;
+    }
+
+    /// Pop and encode next pending NEW_CONNECTION_ID advertisement frame.
+    pub fn popNewConnectionIdFrame(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        const next = conn.popPendingNewConnectionId() orelse return null;
+
+        const frame = frame_mod.NewConnectionIdFrame{
+            .sequence_number = next.sequence_number,
+            .retire_prior_to = conn.localRetirePriorTo(),
+            .connection_id = next.connection_id,
+            .stateless_reset_token = next.stateless_reset_token,
+        };
+
+        const len = frame.encode(out) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return len;
+    }
+
+    /// Encodes pending CID-control frames into a single payload buffer.
+    ///
+    /// At most one RETIRE_CONNECTION_ID and one NEW_CONNECTION_ID are encoded,
+    /// in that order. Returns null when nothing is pending.
+    pub fn popCidControlFrames(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        var pos: usize = 0;
+
+        if (try self.popRetireConnectionIdFrame(out[pos..])) |retire_len| {
+            pos += retire_len;
+        }
+
+        if (try self.popNewConnectionIdFrame(out[pos..])) |new_cid_len| {
+            pos += new_cid_len;
+        }
+
+        if (pos == 0) return null;
+        return pos;
+    }
+
+    /// Drain pending CID-control frames into a fixed output array.
+    ///
+    /// Each entry in `out_frames` receives one coalesced payload as produced by
+    /// `popCidControlFrames`. Returns how many entries were filled.
+    pub fn popAllCidControlFrames(
+        self: *QuicConnection,
+        out_frames: [][]u8,
+    ) types_mod.QuicError!usize {
+        var filled: usize = 0;
+        while (filled < out_frames.len) : (filled += 1) {
+            const out = out_frames[filled];
+            const len = try self.popCidControlFrames(out) orelse break;
+            out_frames[filled] = out[0..len];
+        }
+        return filled;
+    }
+
+    /// Advance local retire_prior_to used for NEW_CONNECTION_ID advertisements.
+    pub fn advanceLocalRetirePriorTo(self: *QuicConnection, sequence_number: u64) types_mod.QuicError!void {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        conn.advanceLocalRetirePriorTo(sequence_number);
     }
 
     /// Returns a point-in-time negotiation snapshot.
@@ -1175,6 +1828,9 @@ pub const QuicConnection = struct {
             self.close(0, "Connection closed") catch {};
         }
 
+        self.clearLatestNewToken();
+        self.clearRetryToken();
+
         if (self.internal_conn) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -1218,6 +1874,25 @@ fn applyPeerTransportParamsWithLimits(conn: *QuicConnection, allocator: std.mem.
     try conn.applyPeerTransportParams(encoded);
 }
 
+fn expectTransportParamProtocolViolation(conn: *QuicConnection, encoded_params: []const u8) !void {
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.applyPeerTransportParams(encoded_params));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.transport_parameter_error)),
+        closing.?.closing.error_code,
+    );
+}
+
 fn buildTlsServerHelloForTests(
     allocator: std.mem.Allocator,
     alpn: []const u8,
@@ -1250,6 +1925,118 @@ fn buildTlsServerHelloForTests(
     };
 
     return server_hello.encode(allocator);
+}
+
+fn tokenEqualsValidator(ctx: ?*anyopaque, token: []const u8) bool {
+    const expected_ptr = ctx orelse return false;
+    const expected: *const []const u8 = @ptrCast(@alignCast(expected_ptr));
+    return std.mem.eql(u8, expected.*, token);
+}
+
+fn expectProtocolViolationFromShortHeaderPayload(
+    conn: *QuicConnection,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    packet_number: u64,
+) !void {
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = packet_number,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    if (packet_len + payload.len > packet_buf.len) {
+        return error.BufferTooSmall;
+    }
+    @memcpy(packet_buf[packet_len .. packet_len + payload.len], payload);
+    packet_len += payload.len;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+fn expectProtocolViolationFromLongHeaderPayload(
+    conn: *QuicConnection,
+    allocator: std.mem.Allocator,
+    packet_type: core_types.PacketType,
+    payload: []const u8,
+    packet_number: u64,
+) !void {
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = packet_type,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = if (packet_type == .initial) &.{} else &.{},
+        .payload_len = @as(u64, payload.len + 4),
+        .packet_number = packet_number,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    if (packet_len + payload.len > packet_buf.len) {
+        return error.BufferTooSmall;
+    }
+    @memcpy(packet_buf[packet_len .. packet_len + payload.len], payload);
+    packet_len += payload.len;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+const RetryIntegrityExpectation = struct {
+    token: []const u8,
+    retry_scid: []const u8,
+};
+
+fn retryIntegrityValidator(
+    ctx: ?*anyopaque,
+    token: []const u8,
+    retry_source_conn_id: core_types.ConnectionId,
+) bool {
+    const expectation_ptr = ctx orelse return false;
+    const expectation: *const RetryIntegrityExpectation = @ptrCast(@alignCast(expectation_ptr));
+
+    return std.mem.eql(u8, expectation.token, token) and
+        std.mem.eql(u8, expectation.retry_scid, retry_source_conn_id.slice());
 }
 
 test "Create SSH client connection" {
@@ -1286,6 +2073,15 @@ test "TLS connect wires config ALPN into ClientHello" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
     try std.testing.expect(conn.tls_ctx != null);
     try std.testing.expect(conn.tls_ctx.?.state == .client_hello_sent);
     try std.testing.expect(std.mem.indexOf(u8, conn.tls_ctx.?.transcript.items, "h3") != null);
@@ -1770,6 +2566,47 @@ test "processTlsServerHello rejects invalid transport params extension payload" 
     );
 }
 
+test "processTlsServerHello rejects transport params protocol violation values" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.ack_delay_exponent = 21; // Protocol violation per RFC bounds.
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    const server_hello_bytes = try buildTlsServerHelloForTests(allocator, "h3", encoded_server_params);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
 test "processTlsServerHello surfaces ALPN mismatch reason" {
     const allocator = std.testing.allocator;
 
@@ -2211,6 +3048,52 @@ test "Get connection stats" {
     const stats = conn.getStats();
     try std.testing.expectEqual(@as(u64, 0), stats.packets_sent);
     try std.testing.expectEqual(@as(u64, 0), stats.bytes_received);
+    try std.testing.expect(stats.duration_ms <= 1000);
+}
+
+test "Get connection stats duration reflects elapsed runtime" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    conn.created_at = time_mod.Instant.now().sub(2500); // 2.5ms ago
+    const stats = conn.getStats();
+    try std.testing.expect(stats.duration_ms >= 2);
+}
+
+test "Get connection stats reflects active connection counters" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // Populate send/recovery counters.
+    conn.internal_conn.?.trackPacketSent(1200, true);
+    conn.internal_conn.?.trackPacketSent(800, true);
+    conn.internal_conn.?.data_sent = 2000;
+    conn.internal_conn.?.data_received = 1500;
+    conn.packets_received = 3;
+    conn.packets_invalid = 1;
+
+    _ = try conn.openStream(true);
+    _ = conn.nextEvent();
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.packets_sent);
+    try std.testing.expectEqual(@as(u64, 3), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+    try std.testing.expectEqual(@as(u64, 2000), stats.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 1500), stats.bytes_received);
+    try std.testing.expect(stats.active_streams >= 1);
+    try std.testing.expect(stats.rtt > 0);
 }
 
 test "Event queue" {
@@ -2330,6 +3213,10 @@ test "closeStream is FIN-based half close" {
     try stream.appendRecvData(&[_]u8{}, stream.recv_offset, true);
     const eof_len = try conn.streamRead(stream_id, &read_buf);
     try std.testing.expectEqual(@as(usize, 0), eof_len);
+
+    try std.testing.expectError(types_mod.QuicError.StreamClosed, conn.streamRead(stream_id, &read_buf));
+    const closed_info = try conn.getStreamInfo(stream_id);
+    try std.testing.expectEqual(types_mod.StreamState.closed, closed_info.state);
 }
 
 test "streamWrite respects congestion send budget" {
@@ -2437,6 +3324,72 @@ test "poll maps invalid packet header to closing event" {
         event.?.closing.error_code,
     );
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll malformed version negotiation increments invalid packet stats" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    packet_buf[0] = 0xC0;
+    std.mem.writeInt(u32, packet_buf[1..5], 0, .big);
+    packet_buf[5] = 4;
+    @memcpy(packet_buf[6..10], &[_]u8{ 1, 2, 3, 4 });
+    packet_buf[10] = 4;
+    @memcpy(packet_buf[11..15], &[_]u8{ 5, 6, 7, 8 });
+    // Missing versions list bytes.
+
+    _ = try sender.sendTo(packet_buf[0..15], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll while draining does not consume new packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(1, "enter-drain");
+    _ = conn.nextEvent();
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+    _ = try sender.sendTo(&[_]u8{0x40}, local_addr);
+
+    const before = conn.getStats();
+    try conn.poll();
+    const after = conn.getStats();
+
+    try std.testing.expectEqual(before.packets_received, after.packets_received);
+    try std.testing.expectEqual(before.packets_invalid, after.packets_invalid);
 }
 
 test "poll routes ACK frame into connection ack tracking" {
@@ -2447,6 +3400,10 @@ test "poll routes ACK frame into connection ack tracking" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    var sent_count: usize = 0;
+    while (sent_count < 8) : (sent_count += 1) {
+        conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true);
+    }
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -2482,6 +3439,58 @@ test "poll routes ACK frame into connection ack tracking" {
     try std.testing.expect(connected_event.? == .connected);
 
     try std.testing.expectEqual(@as(u64, 7), conn.internal_conn.?.largest_acked);
+}
+
+test "poll rejects Initial ACK for unsent Initial packet numbers" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    // Send only application-space packets in local bookkeeping.
+    conn.internal_conn.?.trackPacketSent(1200, true);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 6,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    const event = if (first.? == .closing) first else conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "poll routes connection close frame to closing event" {
@@ -2520,8 +3529,9 @@ test "poll routes connection close frame to closing event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    _ = conn.nextEvent(); // connected
-    const event = conn.nextEvent();
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    const event = if (first.? == .connected) conn.nextEvent() else first;
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .closing);
     try std.testing.expectEqual(@as(u64, 0x0a), event.?.closing.error_code);
@@ -2556,6 +3566,9 @@ test "draining transitions to closed and emits closed event" {
     try conn.poll();
     try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
 
+    // Force drain timer expiry for deterministic test progression.
+    conn.drain_deadline = time_mod.Instant.now().sub(1);
+
     // Second poll transitions to closed and emits closed event
     try conn.poll();
     try std.testing.expectEqual(types_mod.ConnectionState.closed, conn.getState());
@@ -2563,6 +3576,183 @@ test "draining transitions to closed and emits closed event" {
     const closed_event = conn.nextEvent();
     try std.testing.expect(closed_event != null);
     try std.testing.expect(closed_event.? == .closed);
+}
+
+test "close is idempotent while draining" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try conn.close(77, "first-close");
+    try conn.close(88, "second-close");
+
+    const closing = conn.nextEvent();
+    try std.testing.expect(closing != null);
+    try std.testing.expect(closing.? == .closing);
+    try std.testing.expectEqual(@as(u64, 77), closing.?.closing.error_code);
+    try std.testing.expectEqualStrings("first-close", closing.?.closing.reason);
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "closed event emits once after drain deadline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try conn.close(99, "close-once");
+    _ = conn.nextEvent(); // closing
+
+    conn.drain_deadline = time_mod.Instant.now().sub(1);
+    try conn.poll();
+
+    const closed = conn.nextEvent();
+    try std.testing.expect(closed != null);
+    try std.testing.expect(closed.? == .closed);
+    try std.testing.expect(conn.nextEvent() == null);
+
+    try std.testing.expectError(types_mod.QuicError.ConnectionClosed, conn.poll());
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "repeated malformed packets emit single closing event while draining" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [64]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 74,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x02; // ACK frame type only => malformed/truncated payload
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_count: usize = 0;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), closing_count);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "draining ignores version negotiation stimuli" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(321, "enter-drain");
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    try std.testing.expect(first.? == .closing);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "drain timeout closes even with queued inbound packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(222, "local-close");
+    _ = conn.nextEvent(); // consume closing
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 75,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    conn.drain_deadline = time_mod.Instant.now().sub(1);
+    try conn.poll();
+
+    try std.testing.expectEqual(types_mod.ConnectionState.closed, conn.getState());
+    const closed = conn.nextEvent();
+    try std.testing.expect(closed != null);
+    try std.testing.expect(closed.? == .closed);
+    try std.testing.expect(conn.nextEvent() == null);
 }
 
 test "poll routes STREAM frame into stream data and readable event" {
@@ -2573,6 +3763,9 @@ test "poll routes STREAM frame into stream data and readable event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -2598,7 +3791,6 @@ test "poll routes STREAM frame into stream data and readable event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    _ = conn.nextEvent(); // connected
     const event = conn.nextEvent();
     try std.testing.expect(event != null);
     try std.testing.expect(event.? == .stream_readable);
@@ -2612,6 +3804,883 @@ test "poll routes STREAM frame into stream data and readable event" {
     try std.testing.expectEqualStrings("hello-stream", read_buf[0..n]);
 }
 
+test "poll routes MAX_DATA frame and raises send budget" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
+
+    const before_max_data = conn.internal_conn.?.max_data_remote;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 37,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const max_data = frame_mod.MaxDataFrame{ .max_data = conn.internal_conn.?.max_data_remote + 2048 };
+    packet_len += try max_data.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    const after_max_data = conn.internal_conn.?.max_data_remote;
+    try std.testing.expect(after_max_data > before_max_data);
+}
+
+test "poll routes MAX_STREAMS frame and increases open-stream limit" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    conn.internal_conn.?.streams.setLocalOpenLimits(1, 0);
+    _ = try conn.openStream(true);
+    try std.testing.expectError(types_mod.QuicError.StreamLimitReached, conn.openStream(true));
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 38,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const max_streams = frame_mod.MaxStreamsFrame{ .max_streams = 3, .bidirectional = true };
+    packet_len += try max_streams.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    while (conn.nextEvent()) |ev| {
+        try std.testing.expect(ev != .closing);
+        try std.testing.expect(ev != .closed);
+    }
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+
+    _ = try conn.openStream(true);
+}
+
+test "poll routes MAX_STREAM_DATA frame and increases stream send credit" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const sid = try conn.openStream(true);
+    const stream = conn.internal_conn.?.getStream(sid).?;
+    stream.max_stream_data_remote = 4;
+
+    try std.testing.expectEqual(@as(usize, 4), try conn.streamWrite(sid, "abcdefgh", .no_finish));
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 39,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const max_stream_data = frame_mod.MaxStreamDataFrame{ .stream_id = sid, .max_stream_data = 16 };
+    packet_len += try max_stream_data.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    while (conn.nextEvent()) |ev| {
+        try std.testing.expect(ev != .closing);
+        try std.testing.expect(ev != .closed);
+    }
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+
+    try std.testing.expectEqual(@as(usize, 8), try conn.streamWrite(sid, "abcdefgh", .no_finish));
+}
+
+test "poll routes BLOCKED frames and updates peer blocked observations" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 40,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const data_blocked = frame_mod.DataBlockedFrame{ .max_data = 3000 };
+    packet_len += try data_blocked.encode(packet_buf[packet_len..]);
+
+    const stream_data_blocked = frame_mod.StreamDataBlockedFrame{ .stream_id = 4, .max_stream_data = 1200 };
+    packet_len += try stream_data_blocked.encode(packet_buf[packet_len..]);
+
+    const streams_blocked = frame_mod.StreamsBlockedFrame{ .max_streams = 9, .bidirectional = true };
+    packet_len += try streams_blocked.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    while (conn.nextEvent()) |ev| {
+        try std.testing.expect(ev != .closing);
+        try std.testing.expect(ev != .closed);
+    }
+
+    try std.testing.expectEqual(@as(u64, 3000), conn.internal_conn.?.peer_data_blocked_max);
+    try std.testing.expectEqual(@as(u64, 1200), conn.internal_conn.?.peer_stream_data_blocked_max);
+    try std.testing.expectEqual(@as(u64, 9), conn.internal_conn.?.peer_streams_blocked_bidi_max);
+}
+
+test "poll processes multiple frames in a single packet payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 36,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 4,
+        .offset = 0,
+        .data = "multi-frame",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_readable);
+    try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
+    try std.testing.expect(conn.nextEvent() == null);
+
+    var read_buf: [64]u8 = undefined;
+    const n = try conn.streamRead(4, &read_buf);
+    try std.testing.expectEqual(@as(usize, 11), n);
+    try std.testing.expectEqualStrings("multi-frame", read_buf[0..n]);
+}
+
+test "poll preserves earlier frame effects before later malformed frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 66,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 13,
+        .offset = 0,
+        .data = "ok",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    // Malformed ACK tail (truncated after type byte).
+    packet_buf[packet_len] = 0x02;
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream_readable = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 13) {
+            saw_stream_readable = true;
+        }
+        if (event == .closing) {
+            saw_closing = true;
+        }
+    }
+
+    try std.testing.expect(saw_stream_readable);
+    try std.testing.expect(saw_closing);
+
+    const info = try conn.getStreamInfo(13);
+    try std.testing.expectEqual(@as(types_mod.StreamId, 13), info.id);
+}
+
+test "poll stops frame loop on first malformed frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 67,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    // Malformed ACK first (truncated), should abort frame loop.
+    packet_buf[packet_len] = 0x02;
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 14,
+        .offset = 0,
+        .data = "late",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream_readable = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 14) {
+            saw_stream_readable = true;
+        }
+        if (event == .closing) {
+            saw_closing = true;
+        }
+    }
+
+    try std.testing.expect(!saw_stream_readable);
+    try std.testing.expect(saw_closing);
+    try std.testing.expectError(types_mod.QuicError.StreamNotFound, conn.getStreamInfo(14));
+}
+
+test "poll keeps path response side effect before malformed trailing frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 68,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const challenge = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try challenge.encode(packet_buf[packet_len..]);
+
+    // Malformed CONNECTION_CLOSE tail.
+    packet_buf[packet_len] = 0x1c;
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const pending = conn.internal_conn.?.popPathResponse();
+    try std.testing.expect(pending != null);
+    try std.testing.expectEqualSlices(u8, &challenge.data, &pending.?);
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_closing);
+}
+
+test "poll reassembles out-of-order stream frames" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 37,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const tail = frame_mod.StreamFrame{
+        .stream_id = 5,
+        .offset = 5,
+        .data = "world",
+        .fin = false,
+    };
+    packet_len += try tail.encode(packet_buf[packet_len..]);
+
+    const head = frame_mod.StreamFrame{
+        .stream_id = 5,
+        .offset = 0,
+        .data = "hello",
+        .fin = false,
+    };
+    packet_len += try head.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    // Drain non-stream events and verify stream becomes readable.
+    var saw_stream_readable = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 5) {
+            saw_stream_readable = true;
+        }
+    }
+    try std.testing.expect(saw_stream_readable);
+
+    var read_buf: [32]u8 = undefined;
+    const n = try conn.streamRead(5, &read_buf);
+    try std.testing.expectEqual(@as(usize, 10), n);
+    try std.testing.expectEqualStrings("helloworld", read_buf[0..n]);
+}
+
+test "poll rejects stream data beyond known final size" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 41,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const fin_frame = frame_mod.StreamFrame{
+        .stream_id = 7,
+        .offset = 0,
+        .data = "abc",
+        .fin = true,
+    };
+    packet_len += try fin_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    packet_len = try header.encode(&packet_buf);
+    const overflow_frame = frame_mod.StreamFrame{
+        .stream_id = 7,
+        .offset = 3,
+        .data = "x",
+        .fin = false,
+    };
+    packet_len += try overflow_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_event = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing_event != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing_event.?.closing.error_code,
+    );
+}
+
+test "poll rejects RESET_STREAM with inconsistent final size" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 42,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const data_frame = frame_mod.StreamFrame{
+        .stream_id = 9,
+        .offset = 0,
+        .data = "abcd",
+        .fin = false,
+    };
+    packet_len += try data_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    packet_len = try header.encode(&packet_buf);
+    const reset_frame = frame_mod.ResetStreamFrame{
+        .stream_id = 9,
+        .error_code = 0,
+        .final_size = 2,
+    };
+    packet_len += try reset_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_event = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing_event != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing_event.?.closing.error_code,
+    );
+}
+
+test "poll rejects overlapping out-of-order stream frames" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 43,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const frame_a = frame_mod.StreamFrame{
+        .stream_id = 11,
+        .offset = 5,
+        .data = "world",
+        .fin = false,
+    };
+    packet_len += try frame_a.encode(packet_buf[packet_len..]);
+
+    const frame_b = frame_mod.StreamFrame{
+        .stream_id = 11,
+        .offset = 7,
+        .data = "rld!",
+        .fin = false,
+    };
+    packet_len += try frame_b.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_event = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing_event != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing_event.?.closing.error_code,
+    );
+}
+
+test "poll processes ACK frame carrying ranges" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 38,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 2,
+        .ack_delay = 1,
+        .first_ack_range = 0,
+        .ack_ranges = &[_]frame_mod.AckFrame.AckRange{
+            .{ .gap = 0, .ack_range_length = 0 },
+        },
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects ACK for unsent packet number" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 39,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 5,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll rejects malformed ACK range encoding" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 40,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const malformed_ack = frame_mod.AckFrame{
+        .largest_acked = 3,
+        .ack_delay = 0,
+        .first_ack_range = 4,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try malformed_ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll rejects ACK frame with excessive acknowledged packet count" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // Track enough sent packets so largest_acked itself is plausible.
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        conn.internal_conn.?.trackPacketSent(1200, true);
+    }
+
+    var payload: [128]u8 = undefined;
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1500,
+        .ack_delay = 0,
+        .first_ack_range = 1500, // implies 1501 acked packets, above limit
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const payload_len = try ack.encode(&payload);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 58);
+}
+
+test "poll accepts ACK in handshake space when handshake packets were sent" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 59,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll rejects ACK in handshake space for unsent handshake packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var payload: [64]u8 = undefined;
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 5,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const payload_len = try ack.encode(&payload);
+
+    try expectProtocolViolationFromLongHeaderPayload(&conn, allocator, .handshake, payload[0..payload_len], 60);
+}
+
 test "poll routes RESET_STREAM frame to stream_closed event" {
     const allocator = std.testing.allocator;
 
@@ -2620,6 +4689,9 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -2644,12 +4716,22 @@ test "poll routes RESET_STREAM frame to stream_closed event" {
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
-    _ = conn.nextEvent(); // connected
-    const event = conn.nextEvent();
-    try std.testing.expect(event != null);
-    try std.testing.expect(event.? == .stream_closed);
-    try std.testing.expectEqual(@as(u64, 4), event.?.stream_closed.id);
-    try std.testing.expectEqual(@as(?u64, 99), event.?.stream_closed.error_code);
+    var stream_closed_event: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_closed) {
+            stream_closed_event = event;
+            break;
+        }
+    }
+    try std.testing.expect(stream_closed_event != null);
+    try std.testing.expectEqual(@as(u64, 4), stream_closed_event.?.stream_closed.id);
+    try std.testing.expectEqual(@as(?u64, 99), stream_closed_event.?.stream_closed.error_code);
+
+    var read_buf: [8]u8 = undefined;
+    try std.testing.expectError(types_mod.QuicError.StreamClosed, conn.streamRead(4, &read_buf));
+
+    const info = try conn.getStreamInfo(4);
+    try std.testing.expectEqual(types_mod.StreamState.recv_closed, info.state);
 }
 
 test "poll routes PATH_CHALLENGE frame and queues response token" {
@@ -2823,6 +4905,115 @@ test "applyPeerTransportParams rejects invalid peer parameters" {
         @as(u64, @intFromEnum(core_types.ErrorCode.transport_parameter_error)),
         event.?.closing.error_code,
     );
+}
+
+test "applyPeerTransportParams rejects ack_delay_exponent above limit" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.ack_delay_exponent = 21;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try expectTransportParamProtocolViolation(&conn, payload);
+}
+
+test "applyPeerTransportParams rejects max_ack_delay out of range" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.max_ack_delay = 16384;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try expectTransportParamProtocolViolation(&conn, payload);
+}
+
+test "applyPeerTransportParams rejects active_connection_id_limit below two" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.active_connection_id_limit = 1;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try expectTransportParamProtocolViolation(&conn, payload);
+}
+
+test "applyPeerTransportParams rejects duplicate transport parameter IDs" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    // Duplicate max_idle_timeout parameter encoding.
+    var payload = std.ArrayList(u8){};
+    defer payload.deinit(allocator);
+
+    var id_buf: [8]u8 = undefined;
+    var len_buf: [8]u8 = undefined;
+    var value_buf: [8]u8 = undefined;
+    const id_len = try varint.encode(@intFromEnum(transport_params_mod.TransportParamId.max_idle_timeout), &id_buf);
+    const value_len = try varint.encode(10, &value_buf);
+    const plen_len = try varint.encode(value_len, &len_buf);
+
+    try payload.appendSlice(allocator, id_buf[0..id_len]);
+    try payload.appendSlice(allocator, len_buf[0..plen_len]);
+    try payload.appendSlice(allocator, value_buf[0..value_len]);
+    try payload.appendSlice(allocator, id_buf[0..id_len]);
+    try payload.appendSlice(allocator, len_buf[0..plen_len]);
+    try payload.appendSlice(allocator, value_buf[0..value_len]);
+
+    try expectTransportParamProtocolViolation(&conn, payload.items);
 }
 
 test "applyPeerTransportParams updates stream open limits" {
@@ -3028,6 +5219,144 @@ test "poll ignores unknown frame type in application packet space" {
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
 }
 
+test "poll rejects truncated PATH_CHALLENGE frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // PATH_CHALLENGE requires 8 bytes of payload; 3 should fail decode.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x1a, 1, 2, 3 }, 61);
+}
+
+test "poll rejects truncated PATH_RESPONSE frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // PATH_RESPONSE requires 8 bytes of payload; 2 should fail decode.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x1b, 9, 9 }, 62);
+}
+
+test "poll rejects malformed CONNECTION_CLOSE payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // CONNECTION_CLOSE transport format:
+    // type, error_code varint, frame_type varint, reason_len varint, reason bytes
+    // reason_len=2 but only one reason byte follows.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x1c, 0x00, 0x00, 0x02, 'x' }, 63);
+}
+
+test "repeated CONNECTION_CLOSE frames emit single closing event while draining" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 64,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const close_frame = frame_mod.ConnectionCloseFrame{
+        .error_code = 0x0a,
+        .frame_type = null,
+        .reason = "peer-close",
+    };
+    packet_len += try close_frame.encode(packet_buf[packet_len..]);
+
+    // First close frame transitions to draining and emits closing.
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    // Repeated close stimulus while draining must not enqueue another closing event.
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_count: usize = 0;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), closing_count);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "draining ignores subsequent frame stimuli until close deadline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(100, "local-close");
+    _ = conn.nextEvent(); // closing
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 65,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    // Still draining; no new events emitted from incoming packet.
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
 test "poll rejects reserved frame type in application packet space" {
     const allocator = std.testing.allocator;
 
@@ -3064,6 +5393,605 @@ test "poll rejects reserved frame type in application packet space" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+}
+
+test "poll rejects short header with fixed bit cleared" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 33,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[0] &= 0xBF; // clear fixed bit
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll handles version negotiation packet with no mutual version" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("no mutual QUIC version", event.?.closing.reason);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "server ignores version negotiation packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 9, 1, 9 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 2, 8, 2, 8 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expect(conn.getState() != .draining);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_invalid);
+}
+
+test "client ignores version negotiation packet after establishment" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+    try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_invalid);
+}
+
+test "poll rejects spoofed version negotiation including current version" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ core_types.QUIC_VERSION_1, 0x00000002 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation", event.?.closing.reason);
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll rejects malformed version negotiation packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    packet_buf[0] = 0xC0; // long header + fixed bit
+    std.mem.writeInt(u32, packet_buf[1..5], 0, .big); // VN marker version
+    packet_buf[5] = 4; // DCID length
+    @memcpy(packet_buf[6..10], &[_]u8{ 1, 2, 3, 4 });
+    packet_buf[10] = 4; // SCID length
+    @memcpy(packet_buf[11..15], &[_]u8{ 5, 6, 7, 8 });
+    // No versions list bytes -> malformed VN packet.
+
+    _ = try sender.sendTo(packet_buf[0..15], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "poll rejects unsupported long header version" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = 0x00000002,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 73,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("unsupported version", event.?.closing.reason);
+}
+
+test "poll rejects unsupported long header version in server role" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 3, 5, 7 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 2, 4, 6, 8 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = 0x00000002,
+        .dest_conn_id = local_cid,
+        .src_conn_id = remote_cid,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 93,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("unsupported version", event.?.closing.reason);
+}
+
+test "poll rejects malformed version negotiation with fixed bit cleared" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{0x00000002},
+    };
+    const packet_len = try vn.encode(&packet_buf);
+    packet_buf[0] &= 0xBF; // clear fixed bit
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "unsupported version in later packet preserves earlier side effects" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    // First packet: valid stream side effect.
+    var short_buf: [256]u8 = undefined;
+    const short_header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 94,
+        .key_phase = false,
+    };
+    var short_len = try short_header.encode(&short_buf);
+    const stream = frame_mod.StreamFrame{
+        .stream_id = 31,
+        .offset = 0,
+        .data = "ok",
+        .fin = false,
+    };
+    short_len += try stream.encode(short_buf[short_len..]);
+
+    _ = try sender.sendTo(short_buf[0..short_len], local_addr);
+
+    // Second packet: unsupported version.
+    var long_buf: [256]u8 = undefined;
+    const bad_header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = 0x00000002,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 95,
+    };
+    var long_len = try bad_header.encode(&long_buf);
+    long_buf[long_len] = 0x01;
+    long_len += 1;
+
+    _ = try sender.sendTo(long_buf[0..long_len], local_addr);
+
+    try conn.poll();
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 31) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(saw_closing);
+}
+
+test "poll rejects truncated ACK frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{0x02}, 34);
+}
+
+test "poll rejects truncated RESET_STREAM frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // RESET_STREAM frame type + partial stream id varint only.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x04, 0x00 }, 35);
+}
+
+test "poll rejects truncated NEW_CONNECTION_ID frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // NEW_CONNECTION_ID frame type + sequence number only.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x18, 0x00 }, 36);
+}
+
+test "poll rejects malformed version negotiation with non-4-byte version list" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    packet_buf[0] = 0xC0;
+    std.mem.writeInt(u32, packet_buf[1..5], 0, .big);
+    packet_buf[5] = 4;
+    @memcpy(packet_buf[6..10], &[_]u8{ 1, 2, 3, 4 });
+    packet_buf[10] = 4;
+    @memcpy(packet_buf[11..15], &[_]u8{ 5, 6, 7, 8 });
+    packet_buf[15] = 0x00;
+    packet_buf[16] = 0x00;
+    packet_buf[17] = 0x02; // 3 bytes, invalid VN version list width
+
+    _ = try sender.sendTo(packet_buf[0..18], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation packet", event.?.closing.reason);
+}
+
+test "poll rejects truncated MAX_DATA varint payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x10, 0x40 }, 69);
+}
+
+test "poll rejects truncated RETIRE_CONNECTION_ID varint payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x19, 0x40 }, 70);
+}
+
+test "poll rejects STREAM frame with oversized length claim" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // STREAM frame: type=0x0e (OFF+LEN), stream=0, offset=0, len=5, data="ab".
+    try expectProtocolViolationFromShortHeaderPayload(
+        &conn,
+        allocator,
+        &[_]u8{ 0x0e, 0x00, 0x00, 0x05, 'a', 'b' },
+        71,
+    );
+}
+
+test "poll rejects long header with fixed bit cleared" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 4,
+        .packet_number = 37,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[0] &= 0xBF; // clear fixed bit
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
@@ -3111,6 +6039,322 @@ test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
     );
 }
 
+test "poll rejects HANDSHAKE_DONE frame in Handshake packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .handshake,
+        &[_]u8{0x1e}, // HANDSHAKE_DONE
+        76,
+    );
+}
+
+test "poll rejects STREAM frame in Handshake packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var payload: [64]u8 = undefined;
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 2,
+        .offset = 0,
+        .data = "hs-data",
+        .fin = false,
+    };
+    const payload_len = try stream_frame.encode(&payload);
+
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .handshake,
+        payload[0..payload_len],
+        77,
+    );
+}
+
+test "poll accepts ACK in Initial packet space for tracked Initial packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 78,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll accepts CRYPTO frame in Handshake packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 79,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const crypto_frame = frame_mod.CryptoFrame{ .offset = 0, .data = "hs" };
+    packet_len += try crypto_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll accepts legal handshake ACK then rejects illegal HANDSHAKE_DONE" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 80,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing_first = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing_first = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing_first);
+
+    packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE (illegal in handshake space)
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll preserves handshake ACK effect before illegal HANDSHAKE_DONE in same packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 20,
+        .packet_number = 87,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+    packet_buf[packet_len] = 0x1e; // illegal in handshake space
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.internal_conn.?.largest_acked >= 1);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll ignores trailing handshake ACK after first illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 20,
+        .packet_number = 88,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // illegal in handshake space
+    packet_len += 1;
+
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(@as(u64, 0), conn.internal_conn.?.largest_acked);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
 test "poll allows HANDSHAKE_DONE frame in application packet space" {
     const allocator = std.testing.allocator;
 
@@ -3142,6 +6386,107 @@ test "poll allows HANDSHAKE_DONE frame in application packet space" {
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects HANDSHAKE_DONE frame in application packet space for server" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 6, 6, 6, 6 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = local_cid,
+        .packet_number = 98,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll processes HANDSHAKE_DONE then STREAM in application packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 99,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 33,
+        .offset = 0,
+        .data = "hs-done-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 33) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(!saw_closing);
 }
 
 test "poll rejects CRYPTO frame in application packet space" {
@@ -3180,6 +6525,9 @@ test "poll rejects CRYPTO frame in application packet space" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
 }
 
 test "poll allows CRYPTO frame in Initial packet space" {
@@ -3218,6 +6566,73 @@ test "poll allows CRYPTO frame in Initial packet space" {
     try std.testing.expect(conn.nextEvent() == null);
 
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects malformed CRYPTO frame payload in initial space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    // CRYPTO frame with truncated length varint.
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .initial,
+        &[_]u8{ 0x06, 0x00, 0x40 },
+        96,
+    );
+}
+
+test "poll processes padding before stream frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 97,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x00; // PADDING
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 32,
+        .offset = 0,
+        .data = "pad-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 32) {
+            saw_stream = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_stream);
 }
 
 test "poll rejects MAX_DATA frame in Initial packet space" {
@@ -3260,6 +6675,122 @@ test "poll rejects MAX_DATA frame in Initial packet space" {
         second
     else
         null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll preserves initial ACK effect before later illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 85,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    const illegal = frame_mod.MaxDataFrame{ .max_data = 0 };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.internal_conn.?.largest_acked >= 1);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll ignores trailing initial ACK after first illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 86,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const illegal = frame_mod.MaxDataFrame{ .max_data = 0 };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(@as(u64, 0), conn.internal_conn.?.largest_acked);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
     try std.testing.expect(closing != null);
     try std.testing.expectEqual(
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
@@ -3354,6 +6885,203 @@ test "poll allows STREAM frame in zero_rtt packet space" {
     try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
 }
 
+test "poll allows mixed legal frames in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 32,
+        .packet_number = 81,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    const max_data = frame_mod.MaxDataFrame{ .max_data = 4096 };
+    packet_len += try max_data.encode(packet_buf[packet_len..]);
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 15,
+        .offset = 0,
+        .data = "zmix",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 15) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll preserves zero_rtt stream side effect before later illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 48,
+        .packet_number = 82,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 16,
+        .offset = 0,
+        .data = "ok-first",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    const illegal = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 16) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(saw_stream);
+    try std.testing.expect(saw_closing);
+
+    const info = try conn.getStreamInfo(16);
+    try std.testing.expectEqual(@as(types_mod.StreamId, 16), info.id);
+}
+
+test "poll ignores trailing legal zero_rtt frame after first illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .zero_rtt,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 48,
+        .packet_number = 83,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const illegal = frame_mod.PathChallengeFrame{ .data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 17,
+        .offset = 0,
+        .data = "late",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 17) saw_stream = true;
+        if (event == .closing) saw_closing = true;
+    }
+
+    try std.testing.expect(!saw_stream);
+    try std.testing.expect(saw_closing);
+    try std.testing.expectError(types_mod.QuicError.StreamNotFound, conn.getStreamInfo(17));
+}
+
+test "poll rejects ACK frame in zero_rtt packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var payload: [64]u8 = undefined;
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const payload_len = try ack.encode(&payload);
+
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .zero_rtt,
+        payload[0..payload_len],
+        84,
+    );
+}
+
 test "poll rejects NEW_TOKEN frame in Initial packet space" {
     const allocator = std.testing.allocator;
 
@@ -3399,6 +7127,481 @@ test "poll rejects NEW_TOKEN frame in Initial packet space" {
     );
 }
 
+test "poll accepts NEW_TOKEN frame in application packet space for client" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 46,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const new_token = frame_mod.NewTokenFrame{ .token = "retry-ticket-123" };
+    packet_len += try new_token.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    const token = conn.getLatestNewToken();
+    try std.testing.expect(token != null);
+    try std.testing.expectEqualStrings("retry-ticket-123", token.?);
+
+    conn.clearLatestNewToken();
+    try std.testing.expect(conn.getLatestNewToken() == null);
+}
+
+test "poll rejects NEW_TOKEN frame in application packet space for server" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = local_cid,
+        .packet_number = 47,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const new_token = frame_mod.NewTokenFrame{ .token = "client-must-not-send" };
+    packet_len += try new_token.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "server token validator rejects invalid Initial token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 3, 3, 7 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 7, 7, 5 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+
+    const expected_token: []const u8 = "valid-token";
+    conn.setTokenValidator(@ptrCast(@constCast(&expected_token)), tokenEqualsValidator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = local_cid,
+        .src_conn_id = remote_cid,
+        .token = "invalid-token",
+        .payload_len = 4,
+        .packet_number = 48,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.invalid_token)),
+        event.?.closing.error_code,
+    );
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+}
+
+test "poll detects stateless reset pattern on short header failure" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 7 });
+    try std.testing.expect(
+        try conn.internal_conn.?.onNewConnectionId(1, 0, peer_cid, [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19 }),
+    );
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 49,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    packet_buf[packet_len] = 0x1f; // reserved frame type to force frame processing failure
+    packet_len += 1;
+
+    const reset_token = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19 };
+    @memcpy(packet_buf[packet_len .. packet_len + reset_token.len], &reset_token);
+    packet_len += reset_token.len;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.no_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("stateless reset", event.?.closing.reason);
+}
+
+test "poll detects stateless reset before header decode succeeds" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{
+        1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const replacement_conn = try allocator.create(conn_internal.Connection);
+    replacement_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    replacement_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = replacement_conn;
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 7 });
+    try std.testing.expect(
+        try conn.internal_conn.?.onNewConnectionId(1, 0, peer_cid, [_]u8{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }),
+    );
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = [_]u8{0} ** 32;
+    packet_buf[0] = 0x43; // short header, pn_len=4 to force longer minimum header
+
+    // Keep packet length below required (1 + 20-byte DCID + 4-byte PN = 25)
+    // so short header decode fails while trailing bytes still carry reset token.
+    const reset_token = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    @memcpy(packet_buf[1..16], &[_]u8{0} ** 15);
+    @memcpy(packet_buf[16..32], &reset_token);
+
+    _ = try sender.sendTo(packet_buf[0..32], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.no_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("stateless reset", event.?.closing.reason);
+}
+
+test "client processes Retry packet and updates retry state" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const expectation = RetryIntegrityExpectation{
+        .token = "retry-token-from-server",
+        .retry_scid = retry_scid.slice(),
+    };
+    conn.setRetryIntegrityValidator(@ptrCast(@constCast(&expectation)), retryIntegrityValidator);
+
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = "retry-token-from-server",
+        .payload_len = 1,
+        .packet_number = 50,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+    const retry_token = conn.getRetryToken();
+    try std.testing.expect(retry_token != null);
+    try std.testing.expectEqualStrings("retry-token-from-server", retry_token.?);
+    try std.testing.expect(conn.internal_conn.?.remote_conn_id.eql(&retry_scid));
+
+    const retry_scid_slice = conn.getRetrySourceConnectionId();
+    try std.testing.expect(retry_scid_slice != null);
+    try std.testing.expectEqualSlices(u8, retry_scid.slice(), retry_scid_slice.?);
+}
+
+test "client rejects second Retry packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const expectation = RetryIntegrityExpectation{
+        .token = "retry-token",
+        .retry_scid = retry_scid.slice(),
+    };
+    conn.setRetryIntegrityValidator(@ptrCast(@constCast(&expectation)), retryIntegrityValidator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = "retry-token",
+        .payload_len = 1,
+        .packet_number = 54,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    try std.testing.expectEqual(types_mod.ConnectionState.connecting, conn.getState());
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "client rejects Retry packet when integrity validator fails" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const expectation = RetryIntegrityExpectation{
+        .token = "some-other-token",
+        .retry_scid = retry_scid.slice(),
+    };
+    conn.setRetryIntegrityValidator(@ptrCast(@constCast(&expectation)), retryIntegrityValidator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = "retry-token-from-server",
+        .payload_len = 1,
+        .packet_number = 53,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "client rejects Retry packet with empty token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const retry_scid = try core_types.ConnectionId.init(&[_]u8{ 8, 8, 8, 8 });
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = retry_scid,
+        .token = &.{},
+        .payload_len = 1,
+        .packet_number = 51,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.invalid_token)),
+        event.?.closing.error_code,
+    );
+}
+
+test "server rejects Retry packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshServer("secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.accept("127.0.0.1", 0);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 2, 2 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 3, 3, 4, 4 });
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    internal_conn.* = try conn_internal.Connection.initServer(allocator, .ssh, local_cid, remote_cid);
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = internal_conn;
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .retry,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = local_cid,
+        .src_conn_id = remote_cid,
+        .token = "retry-token",
+        .payload_len = 1,
+        .packet_number = 52,
+    };
+    const packet_len = try header.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
 test "poll rejects RETIRE_CONNECTION_ID frame in zero_rtt packet space" {
     const allocator = std.testing.allocator;
 
@@ -3441,7 +7644,7 @@ test "poll rejects RETIRE_CONNECTION_ID frame in zero_rtt packet space" {
     );
 }
 
-test "poll allows NEW_CONNECTION_ID frame type in application packet space" {
+test "poll routes NEW_CONNECTION_ID frame and tracks peer CID" {
     const allocator = std.testing.allocator;
 
     const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
@@ -3464,14 +7667,517 @@ test "poll allows NEW_CONNECTION_ID frame type in application packet space" {
         .key_phase = false,
     };
     var packet_len = try header.encode(&packet_buf);
-    packet_buf[packet_len] = 0x18; // NEW_CONNECTION_ID (payload parsing not implemented in route)
-    packet_len += 1;
+    const new_cid = try core_types.ConnectionId.init(&[_]u8{ 9, 8, 7, 6 });
+    const frame = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = new_cid,
+        .stateless_reset_token = [_]u8{7} ** 16,
+    };
+    packet_len += try frame.encode(packet_buf[packet_len..]);
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+    try std.testing.expectEqual(@as(usize, 1), conn.getPeerConnectionIdCount());
+
+    const info = conn.getPeerConnectionIdInfo(0);
+    try std.testing.expect(info != null);
+    try std.testing.expectEqual(@as(u64, 1), info.?.sequence_number);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 8, 7, 6 }, info.?.connection_id[0..info.?.connection_id_len]);
+}
+
+test "poll rejects invalid NEW_CONNECTION_ID retire_prior_to ordering" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 41,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const cid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const frame = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 2,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{1} ** 16,
+    };
+    packet_len += try frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll rejects NEW_CONNECTION_ID frames exceeding active_connection_id_limit" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var remote = conn.internal_conn.?.remote_params orelse core_types.TransportParameters{};
+    remote.active_connection_id_limit = 1;
+    conn.internal_conn.?.setRemoteParams(remote);
+
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 1 });
+    const cid2 = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 2 });
+
+    var payload: [192]u8 = undefined;
+    var payload_len: usize = 0;
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = cid1,
+        .stateless_reset_token = [_]u8{1} ** 16,
+    };
+    payload_len += try frame1.encode(payload[payload_len..]);
+
+    const frame2 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = cid2,
+        .stateless_reset_token = [_]u8{2} ** 16,
+    };
+    payload_len += try frame2.encode(payload[payload_len..]);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 52);
+}
+
+test "poll rejects NEW_CONNECTION_ID with duplicate stateless reset token" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var remote = conn.internal_conn.?.remote_params orelse core_types.TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.internal_conn.?.setRemoteParams(remote);
+
+    const token = [_]u8{9} ** 16;
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 8, 8, 8, 1 });
+    const cid2 = try core_types.ConnectionId.init(&[_]u8{ 8, 8, 8, 2 });
+
+    // First packet installs seq=1 with token.
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 53,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = cid1,
+        .stateless_reset_token = token,
+    };
+    packet_len += try frame1.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    // Second packet conflicts on reset token. Append trailing byte so trailing
+    // 16 bytes are not equal to token and won't be interpreted as stateless reset.
+    var payload: [192]u8 = undefined;
+    var payload_len: usize = 0;
+    const frame2 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = cid2,
+        .stateless_reset_token = token,
+    };
+    payload_len += try frame2.encode(payload[payload_len..]);
+    payload[payload_len] = 0x00;
+    payload_len += 1;
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 53);
+}
+
+test "poll rejects RETIRE_CONNECTION_ID sequence beyond observed range" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var payload: [32]u8 = undefined;
+    const frame = frame_mod.RetireConnectionIdFrame{ .sequence_number = 42 };
+    const payload_len = try frame.encode(&payload);
+
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, payload[0..payload_len], 54);
+}
+
+test "poll deduplicates retire queue for repeated stale NEW_CONNECTION_ID" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 55,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const fresh_cid = try core_types.ConnectionId.init(&[_]u8{ 6, 6, 6, 3 });
+    const fresh = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 3,
+        .retire_prior_to = 3,
+        .connection_id = fresh_cid,
+        .stateless_reset_token = [_]u8{3} ** 16,
+    };
+    packet_len += try fresh.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    packet_len = try header.encode(&packet_buf);
+    const stale_cid = try core_types.ConnectionId.init(&[_]u8{ 6, 6, 6, 1 });
+    const stale = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 1,
+        .connection_id = stale_cid,
+        .stateless_reset_token = [_]u8{4} ** 16,
+    };
+    packet_len += try stale.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    try std.testing.expectEqual(@as(?u64, 1), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, null), conn.popRetireConnectionId());
+}
+
+test "getPeerConnectionIdInfo returns null for out-of-range index" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), conn.getPeerConnectionIdCount());
+    try std.testing.expect(conn.getPeerConnectionIdInfo(0) == null);
+}
+
+test "poll queues RETIRE_CONNECTION_ID sequence and API can pop it" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    // First advertise seq=0.
+    var packet_buf_a: [256]u8 = undefined;
+    const header_a = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 42,
+        .key_phase = false,
+    };
+    var packet_len_a = try header_a.encode(&packet_buf_a);
+    const cid0 = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const frame0 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = cid0,
+        .stateless_reset_token = [_]u8{2} ** 16,
+    };
+    packet_len_a += try frame0.encode(packet_buf_a[packet_len_a..]);
+    _ = try sender.sendTo(packet_buf_a[0..packet_len_a], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    // Then advertise seq=1 with retire_prior_to=1 to retire seq=0.
+    var packet_buf_b: [256]u8 = undefined;
+    const header_b = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 43,
+        .key_phase = false,
+    };
+    var packet_len_b = try header_b.encode(&packet_buf_b);
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 1,
+        .connection_id = cid1,
+        .stateless_reset_token = [_]u8{3} ** 16,
+    };
+    packet_len_b += try frame1.encode(packet_buf_b[packet_len_b..]);
+    _ = try sender.sendTo(packet_buf_b[0..packet_len_b], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    const retire_seq = conn.popRetireConnectionId();
+    try std.testing.expect(retire_seq != null);
+    try std.testing.expectEqual(@as(u64, 0), retire_seq.?);
+    try std.testing.expect(conn.popRetireConnectionId() == null);
+}
+
+test "popRetireConnectionIdFrame encodes pending retire request" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf_a: [256]u8 = undefined;
+    const header_a = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 44,
+        .key_phase = false,
+    };
+    var packet_len_a = try header_a.encode(&packet_buf_a);
+
+    const cid0 = try core_types.ConnectionId.init(&[_]u8{ 3, 3, 3, 3 });
+    const frame0 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = cid0,
+        .stateless_reset_token = [_]u8{5} ** 16,
+    };
+    packet_len_a += try frame0.encode(packet_buf_a[packet_len_a..]);
+    _ = try sender.sendTo(packet_buf_a[0..packet_len_a], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    var packet_buf_b: [256]u8 = undefined;
+    const header_b = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 45,
+        .key_phase = false,
+    };
+    var packet_len_b = try header_b.encode(&packet_buf_b);
+
+    const cid1 = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const frame1 = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 1,
+        .connection_id = cid1,
+        .stateless_reset_token = [_]u8{6} ** 16,
+    };
+    packet_len_b += try frame1.encode(packet_buf_b[packet_len_b..]);
+
+    _ = try sender.sendTo(packet_buf_b[0..packet_len_b], local_addr);
+    try conn.poll();
+    while (conn.nextEvent()) |_| {}
+
+    var out: [32]u8 = undefined;
+    const encoded_len = try conn.popRetireConnectionIdFrame(&out);
+    try std.testing.expect(encoded_len != null);
+
+    const decoded = try frame_mod.RetireConnectionIdFrame.decode(out[0..encoded_len.?]);
+    try std.testing.expectEqual(@as(u64, 0), decoded.frame.sequence_number);
+    try std.testing.expect((try conn.popRetireConnectionIdFrame(&out)) == null);
+}
+
+test "queueNewConnectionId and encodeLatestNewConnectionIdFrame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+
+    const seq = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 9 }, [_]u8{8} ** 16);
+    try std.testing.expectEqual(@as(u64, 1), seq);
+    try conn.advanceLocalRetirePriorTo(1);
+
+    var out: [128]u8 = undefined;
+    const encoded_len = try conn.encodeLatestNewConnectionIdFrame(&out);
+    try std.testing.expect(encoded_len != null);
+
+    const decoded = try frame_mod.NewConnectionIdFrame.decode(out[0..encoded_len.?]);
+    try std.testing.expectEqual(@as(u64, 1), decoded.frame.sequence_number);
+    try std.testing.expectEqual(@as(u64, 1), decoded.frame.retire_prior_to);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9, 9, 9 }, decoded.frame.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &([_]u8{8} ** 16), &decoded.frame.stateless_reset_token);
+}
+
+test "popNewConnectionIdFrame drains pending NEW_CONNECTION_ID adverts in order" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+
+    const seq1 = try conn.queueNewConnectionId(&[_]u8{ 7, 7, 7, 1 }, [_]u8{1} ** 16);
+    const seq2 = try conn.queueNewConnectionId(&[_]u8{ 7, 7, 7, 2 }, [_]u8{2} ** 16);
+    try std.testing.expectEqual(@as(u64, 1), seq1);
+    try std.testing.expectEqual(@as(u64, 2), seq2);
+
+    var out: [128]u8 = undefined;
+
+    const len1 = try conn.popNewConnectionIdFrame(&out);
+    try std.testing.expect(len1 != null);
+    const decoded1 = try frame_mod.NewConnectionIdFrame.decode(out[0..len1.?]);
+    try std.testing.expectEqual(@as(u64, 1), decoded1.frame.sequence_number);
+
+    const len2 = try conn.popNewConnectionIdFrame(&out);
+    try std.testing.expect(len2 != null);
+    const decoded2 = try frame_mod.NewConnectionIdFrame.decode(out[0..len2.?]);
+    try std.testing.expectEqual(@as(u64, 2), decoded2.frame.sequence_number);
+
+    try std.testing.expect((try conn.popNewConnectionIdFrame(&out)) == null);
+}
+
+test "popCidControlFrames coalesces RETIRE and NEW_CONNECTION_ID" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid0 = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const peer_cid1 = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    try std.testing.expect(try conn.internal_conn.?.onNewConnectionId(0, 0, peer_cid0, [_]u8{3} ** 16));
+    try std.testing.expect(try conn.internal_conn.?.onNewConnectionId(1, 1, peer_cid1, [_]u8{4} ** 16));
+
+    _ = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 9 }, [_]u8{8} ** 16);
+
+    var out: [256]u8 = undefined;
+    const total_len = try conn.popCidControlFrames(&out);
+    try std.testing.expect(total_len != null);
+
+    const retire = try frame_mod.RetireConnectionIdFrame.decode(out[0..total_len.?]);
+    try std.testing.expectEqual(@as(u64, 0), retire.frame.sequence_number);
+
+    const new_cid = try frame_mod.NewConnectionIdFrame.decode(out[retire.consumed..total_len.?]);
+    try std.testing.expectEqual(@as(u64, 1), new_cid.frame.sequence_number);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9, 9, 9 }, new_cid.frame.connection_id.slice());
+
+    try std.testing.expect((try conn.popCidControlFrames(&out)) == null);
+}
+
+test "popAllCidControlFrames drains pending CID payloads into array" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid0 = try core_types.ConnectionId.init(&[_]u8{ 1, 1, 1, 1 });
+    const peer_cid1 = try core_types.ConnectionId.init(&[_]u8{ 2, 2, 2, 2 });
+    try std.testing.expect(try conn.internal_conn.?.onNewConnectionId(0, 0, peer_cid0, [_]u8{3} ** 16));
+    try std.testing.expect(try conn.internal_conn.?.onNewConnectionId(1, 1, peer_cid1, [_]u8{4} ** 16));
+
+    _ = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 1 }, [_]u8{7} ** 16);
+    _ = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 2 }, [_]u8{8} ** 16);
+
+    var buf1: [256]u8 = undefined;
+    var buf2: [256]u8 = undefined;
+    var out_frames = [_][]u8{ buf1[0..], buf2[0..] };
+
+    const filled = try conn.popAllCidControlFrames(out_frames[0..]);
+    try std.testing.expectEqual(@as(usize, 2), filled);
+
+    const first_retire = try frame_mod.RetireConnectionIdFrame.decode(out_frames[0]);
+    try std.testing.expectEqual(@as(u64, 0), first_retire.frame.sequence_number);
+    const first_new = try frame_mod.NewConnectionIdFrame.decode(out_frames[0][first_retire.consumed..]);
+    try std.testing.expectEqual(@as(u64, 1), first_new.frame.sequence_number);
+
+    const second_new = try frame_mod.NewConnectionIdFrame.decode(out_frames[1]);
+    try std.testing.expectEqual(@as(u64, 2), second_new.frame.sequence_number);
 }
 
 test "packet-space frame legality matrix baseline" {
@@ -3505,4 +8211,48 @@ test "packet-space frame legality matrix baseline" {
     try conn.validateFrameAllowedInPacketSpace(0x2b, .application); // unknown, non-reserved
     try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x06, .application));
     try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x1f, .application));
+}
+
+test "connecting-state frame legality matrix baseline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    conn.state = .connecting;
+
+    const connecting_allowed = [_]u64{ 0x00, 0x01, 0x02, 0x03, 0x06, 0x1c, 0x1d };
+    for (connecting_allowed) |ft| {
+        try conn.validateFrameAllowedInState(ft);
+    }
+
+    const connecting_disallowed = [_]u64{ 0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x08, 0x0f };
+    for (connecting_disallowed) |ft| {
+        try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInState(ft));
+    }
+}
+
+test "connecting-state legality composes with packet-space rules" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    conn.state = .connecting;
+
+    // STREAM is legal in application space, but connecting-state policy rejects it.
+    try conn.validateFrameAllowedInPacketSpace(0x08, .application);
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInState(0x08));
+
+    // MAX_DATA is legal in application space, but connecting-state policy rejects it.
+    try conn.validateFrameAllowedInPacketSpace(0x10, .application);
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInState(0x10));
+
+    // PING and CONNECTION_CLOSE remain legal while connecting.
+    try conn.validateFrameAllowedInPacketSpace(0x01, .application);
+    try conn.validateFrameAllowedInState(0x01);
+    try conn.validateFrameAllowedInPacketSpace(0x1d, .application);
+    try conn.validateFrameAllowedInState(0x1d);
 }

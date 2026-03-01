@@ -10,6 +10,8 @@ const PacketNumber = types.PacketNumber;
 pub const PacketError = error{
     InvalidPacketType,
     InvalidVersion,
+    FixedBitNotSet,
+    ReservedBitsNotZero,
     BufferTooSmall,
     UnexpectedEof,
     InvalidPacketNumber,
@@ -174,8 +176,8 @@ pub const LongHeader = struct {
         @memcpy(buf[pos..][0..self.src_conn_id.len], self.src_conn_id.slice());
         pos += self.src_conn_id.len;
 
-        // Token (for Initial packets)
-        if (self.packet_type == .initial) {
+        // Token (for Initial and Retry packets)
+        if (self.packet_type == .initial or self.packet_type == .retry) {
             const token_len = try varint.encode(self.token.len, buf[pos..]);
             pos += token_len;
             if (pos + self.token.len > buf.len) return error.BufferTooSmall;
@@ -208,6 +210,9 @@ pub const LongHeader = struct {
         // Check long header bit
         if ((first_byte & 0x80) == 0) return error.InvalidPacketType;
 
+        // Fixed bit MUST be set.
+        if ((first_byte & 0x40) == 0) return error.FixedBitNotSet;
+
         // Extract packet type and packet number length
         const type_bits = (first_byte >> 4) & 0x03;
         const pn_len: u8 = @intCast((first_byte & 0x03) + 1);
@@ -218,6 +223,11 @@ pub const LongHeader = struct {
             0b11 => .retry,
             else => unreachable,
         };
+
+        // Reserved bits MUST be zero for non-Retry long header packets.
+        if (packet_type != .retry and (first_byte & 0x0C) != 0) {
+            return error.ReservedBitsNotZero;
+        }
 
         // Version
         if (pos + 4 > buf.len) return error.UnexpectedEof;
@@ -240,9 +250,9 @@ pub const LongHeader = struct {
         const src_conn_id = try ConnectionId.init(buf[pos..][0..scid_len]);
         pos += scid_len;
 
-        // Token (for Initial packets)
+        // Token (for Initial and Retry packets)
         var token: []const u8 = &.{};
-        if (packet_type == .initial) {
+        if (packet_type == .initial or packet_type == .retry) {
             const token_len_result = try varint.decode(buf[pos..]);
             pos += token_len_result.len;
             const token_len = token_len_result.value;
@@ -324,6 +334,12 @@ pub const ShortHeader = struct {
         // Check short header bit
         if ((first_byte & 0x80) != 0) return error.InvalidPacketType;
 
+        // Fixed bit MUST be set.
+        if ((first_byte & 0x40) == 0) return error.FixedBitNotSet;
+
+        // Reserved bits MUST be zero.
+        if ((first_byte & 0x18) != 0) return error.ReservedBitsNotZero;
+
         // Extract key phase and packet number length bits
         const key_phase = (first_byte & 0x04) != 0;
         const pn_len: u8 = @intCast((first_byte & 0x03) + 1);
@@ -345,6 +361,106 @@ pub const ShortHeader = struct {
         };
 
         return .{ .header = header, .consumed = pos };
+    }
+};
+
+/// Version Negotiation packet format (RFC 9000, Section 17.2.1)
+pub const VersionNegotiationPacket = struct {
+    dest_conn_id: ConnectionId,
+    src_conn_id: ConnectionId,
+    supported_versions: []const u32,
+
+    pub fn encode(self: VersionNegotiationPacket, buf: []u8) PacketError!usize {
+        var pos: usize = 0;
+
+        if (buf.len < 7) return error.BufferTooSmall;
+        if (self.supported_versions.len == 0) return error.InvalidVersion;
+
+        // Long header + fixed bit set, rest randomizable; keep deterministic for tests.
+        buf[pos] = 0xC0;
+        pos += 1;
+
+        // Version Negotiation packets carry version 0.
+        std.mem.writeInt(u32, buf[pos..][0..4], 0, .big);
+        pos += 4;
+
+        if (pos + 1 + self.dest_conn_id.len > buf.len) return error.BufferTooSmall;
+        buf[pos] = self.dest_conn_id.len;
+        pos += 1;
+        @memcpy(buf[pos..][0..self.dest_conn_id.len], self.dest_conn_id.slice());
+        pos += self.dest_conn_id.len;
+
+        if (pos + 1 + self.src_conn_id.len > buf.len) return error.BufferTooSmall;
+        buf[pos] = self.src_conn_id.len;
+        pos += 1;
+        @memcpy(buf[pos..][0..self.src_conn_id.len], self.src_conn_id.slice());
+        pos += self.src_conn_id.len;
+
+        if (pos + (self.supported_versions.len * 4) > buf.len) return error.BufferTooSmall;
+        for (self.supported_versions) |version| {
+            std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
+            pos += 4;
+        }
+
+        return pos;
+    }
+
+    pub fn decode(
+        buf: []const u8,
+        versions_out: []u32,
+    ) PacketError!struct { packet: VersionNegotiationPacket, consumed: usize } {
+        var pos: usize = 0;
+        if (buf.len < 7) return error.UnexpectedEof;
+
+        const first_byte = buf[pos];
+        pos += 1;
+
+        if ((first_byte & 0x80) == 0) return error.InvalidPacketType;
+        if ((first_byte & 0x40) == 0) return error.FixedBitNotSet;
+
+        const version = std.mem.readInt(u32, buf[pos..][0..4], .big);
+        pos += 4;
+        if (version != 0) return error.InvalidVersion;
+
+        if (pos + 1 > buf.len) return error.UnexpectedEof;
+        const dcid_len = buf[pos];
+        pos += 1;
+        if (pos + dcid_len > buf.len) return error.UnexpectedEof;
+        const dest_conn_id = try ConnectionId.init(buf[pos..][0..dcid_len]);
+        pos += dcid_len;
+
+        if (pos + 1 > buf.len) return error.UnexpectedEof;
+        const scid_len = buf[pos];
+        pos += 1;
+        if (pos + scid_len > buf.len) return error.UnexpectedEof;
+        const src_conn_id = try ConnectionId.init(buf[pos..][0..scid_len]);
+        pos += scid_len;
+
+        const versions_bytes = buf[pos..];
+        if (versions_bytes.len == 0 or (versions_bytes.len % 4) != 0) {
+            return error.InvalidVersion;
+        }
+
+        const version_count = versions_bytes.len / 4;
+        if (version_count > versions_out.len) return error.BufferTooSmall;
+
+        var i: usize = 0;
+        while (i < version_count) : (i += 1) {
+            const off = i * 4;
+            versions_out[i] = (@as(u32, versions_bytes[off]) << 24) |
+                (@as(u32, versions_bytes[off + 1]) << 16) |
+                (@as(u32, versions_bytes[off + 2]) << 8) |
+                @as(u32, versions_bytes[off + 3]);
+        }
+
+        return .{
+            .packet = .{
+                .dest_conn_id = dest_conn_id,
+                .src_conn_id = src_conn_id,
+                .supported_versions = versions_out[0..version_count],
+            },
+            .consumed = buf.len,
+        };
     }
 };
 
@@ -398,6 +514,29 @@ test "long header initial packet encode/decode" {
     try std.testing.expect(result.header.dest_conn_id.eql(&dcid));
     try std.testing.expect(result.header.src_conn_id.eql(&scid));
     try std.testing.expectEqual(@as(u64, 42), result.header.packet_number);
+}
+
+test "long header retry packet encodes and decodes token" {
+    var buf: [256]u8 = undefined;
+
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    const header = LongHeader{
+        .packet_type = .retry,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = "retry-token",
+        .payload_len = 1,
+        .packet_number = 7,
+    };
+
+    const encoded_len = try header.encode(&buf);
+    const result = try LongHeader.decode(buf[0..encoded_len]);
+
+    try std.testing.expectEqual(PacketType.retry, result.header.packet_type);
+    try std.testing.expectEqualStrings("retry-token", result.header.token);
 }
 
 test "short header packet encode/decode" {
@@ -456,6 +595,163 @@ test "packet decode malformed corpus" {
 
     try std.testing.expectError(error.UnexpectedEof, ShortHeader.decode(&[_]u8{0x40}, 8));
     try std.testing.expectError(error.UnexpectedEof, ShortHeader.decode(&[_]u8{ 0x41, 0xAA }, 8));
+}
+
+test "long header decode rejects unset fixed bit" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var buf: [128]u8 = undefined;
+    const header = LongHeader{
+        .packet_type = .initial,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = &.{},
+        .payload_len = 1,
+        .packet_number = 1,
+    };
+    const len = try header.encode(&buf);
+    buf[0] &= 0xBF; // clear fixed bit
+
+    try std.testing.expectError(error.FixedBitNotSet, LongHeader.decode(buf[0..len]));
+}
+
+test "short header decode rejects reserved bits" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+
+    var buf: [64]u8 = undefined;
+    const header = ShortHeader{
+        .dest_conn_id = dcid,
+        .packet_number = 1,
+        .key_phase = false,
+    };
+    const len = try header.encode(&buf);
+    buf[0] |= 0x18; // set reserved bits
+
+    try std.testing.expectError(error.ReservedBitsNotZero, ShortHeader.decode(buf[0..len], dcid.len));
+}
+
+test "version negotiation packet encode/decode" {
+    var buf: [128]u8 = undefined;
+
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 9, 8, 7, 6 });
+
+    const packet = VersionNegotiationPacket{
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .supported_versions = &[_]u32{ 0x00000002, types.QUIC_VERSION_1 },
+    };
+
+    const len = try packet.encode(&buf);
+    var versions: [4]u32 = undefined;
+    const decoded = try VersionNegotiationPacket.decode(buf[0..len], &versions);
+
+    try std.testing.expect(decoded.packet.dest_conn_id.eql(&dcid));
+    try std.testing.expect(decoded.packet.src_conn_id.eql(&scid));
+    try std.testing.expectEqual(@as(usize, 2), decoded.packet.supported_versions.len);
+    try std.testing.expectEqual(@as(u32, 0x00000002), decoded.packet.supported_versions[0]);
+    try std.testing.expectEqual(@as(u32, types.QUIC_VERSION_1), decoded.packet.supported_versions[1]);
+}
+
+test "packet number decode reconstruction window edges" {
+    // 1-byte truncated decode: candidate is too low, so decoder lifts to next window.
+    const lifted = try PacketNumberUtil.decode(&[_]u8{0x00}, 0x2FE);
+    try std.testing.expectEqual(@as(u64, 0x300), lifted);
+
+    // 1-byte truncated decode: candidate is too high, so decoder drops to previous window.
+    const lowered = try PacketNumberUtil.decode(&[_]u8{0xFF}, 0x200);
+    try std.testing.expectEqual(@as(u64, 0x1FF), lowered);
+
+    // Mid-window candidate should remain unchanged.
+    const stable = try PacketNumberUtil.decode(&[_]u8{0x21}, 0x200);
+    try std.testing.expectEqual(@as(u64, 0x221), stable);
+}
+
+test "long header decode rejects reserved bits for non-retry" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var buf: [128]u8 = undefined;
+    const header = LongHeader{
+        .packet_type = .initial,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = &.{},
+        .payload_len = 1,
+        .packet_number = 1,
+    };
+    const len = try header.encode(&buf);
+    buf[0] |= 0x0C; // set reserved bits
+
+    try std.testing.expectError(error.ReservedBitsNotZero, LongHeader.decode(buf[0..len]));
+}
+
+test "long header retry decode tolerates reserved bits" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var buf: [128]u8 = undefined;
+    const header = LongHeader{
+        .packet_type = .retry,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = "r",
+        .payload_len = 1,
+        .packet_number = 1,
+    };
+    const len = try header.encode(&buf);
+    buf[0] |= 0x0C; // reserved bits set
+
+    const decoded = try LongHeader.decode(buf[0..len]);
+    try std.testing.expectEqual(PacketType.retry, decoded.header.packet_type);
+}
+
+test "short header decode rejects unset fixed bit" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+
+    var buf: [64]u8 = undefined;
+    const header = ShortHeader{
+        .dest_conn_id = dcid,
+        .packet_number = 7,
+        .key_phase = false,
+    };
+    const len = try header.encode(&buf);
+    buf[0] &= 0xBF; // clear fixed bit
+
+    try std.testing.expectError(error.FixedBitNotSet, ShortHeader.decode(buf[0..len], dcid.len));
+}
+
+test "version negotiation decode rejects invalid wire forms" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var buf: [128]u8 = undefined;
+    const vn = VersionNegotiationPacket{
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+
+    const len = try vn.encode(&buf);
+
+    // Fixed bit cleared.
+    var fixed_off = buf;
+    fixed_off[0] &= 0xBF;
+    var versions: [4]u32 = undefined;
+    try std.testing.expectError(error.FixedBitNotSet, VersionNegotiationPacket.decode(fixed_off[0..len], &versions));
+
+    // Non-zero version field.
+    var wrong_version = buf;
+    std.mem.writeInt(u32, wrong_version[1..5], types.QUIC_VERSION_1, .big);
+    try std.testing.expectError(error.InvalidVersion, VersionNegotiationPacket.decode(wrong_version[0..len], &versions));
+
+    // Output buffer too small for advertised version list.
+    var small_versions: [1]u32 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, VersionNegotiationPacket.decode(buf[0..len], &small_versions));
 }
 
 test "packet decode fuzz smoke" {

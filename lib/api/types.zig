@@ -108,6 +108,9 @@ pub const ConnectionStats = struct {
     /// Total packets received
     packets_received: u64 = 0,
 
+    /// Total packets rejected as invalid/malformed
+    packets_invalid: u64 = 0,
+
     /// Total bytes sent
     bytes_sent: u64 = 0,
 
@@ -190,6 +193,14 @@ pub const StreamFinish = enum {
     finish,
 };
 
+/// Peer-advertised connection ID metadata.
+pub const PeerConnectionIdInfo = struct {
+    sequence_number: u64,
+    connection_id: [20]u8,
+    connection_id_len: u8,
+    stateless_reset_token: [16]u8,
+};
+
 /// Negotiation mode used by the connection.
 pub const NegotiationMode = enum {
     tls,
@@ -267,6 +278,7 @@ test "ConnectionStats initialization" {
     const stats = ConnectionStats{};
 
     try std.testing.expectEqual(@as(u64, 0), stats.packets_sent);
+    try std.testing.expectEqual(@as(u64, 0), stats.packets_invalid);
     try std.testing.expectEqual(@as(u64, 0), stats.bytes_sent);
 }
 

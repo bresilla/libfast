@@ -1,5 +1,68 @@
 # Changelog
 
+## [0.0.12] - 2026-03-01
+
+### <!-- 0 -->⛰️  Features
+
+- Track connection uptime in stats and fuzz decode matrix
+- Enrich connection stats with recovery counters
+- Route handshake_done and decode crypto frames
+- Expose invalid packet stats and regressions
+- Decode crypto and padding frames in receive loop
+- Enforce long-header version policy and VN behavior
+- Make draining timeout-based and idempotent
+- Add version negotiation path and bit validation
+- Tighten stream EOF and reset read semantics
+- Harden stream overlap conflict policy
+- Add out-of-order stream reassembly and final-size checks
+- Add packet-space ACK validation and PTO tuning
+- Enforce packet-space-aware ACK recovery
+- Decode ACK delay using peer transport params
+- Process full ACK packet sets in recovery
+- Apply ACK range hints to recovery updates
+- Validate ACK range encoding invariants
+- Reject ACKs for unsent packet numbers
+- Parse ACK ranges in receive path
+- Detect stateless reset on header decode failure
+- Harden retry state and expose retry scid
+- Add retry integrity validation hook
+- Process Retry packets in client receive flow
+- Enforce token policy and stateless reset handling
+- Add batch drain helper for CID control payloads
+- Coalesce pending CID control frames into one payload
+- Add queued NEW_CONNECTION_ID frame pop API
+- Expose peer CID inventory read API
+- Reject duplicate stateless reset tokens across peer CIDs
+- Enforce active_connection_id_limit for peer CIDs
+- Support monotonic retire_prior_to in NEW_CONNECTION_ID adverts
+- Queue and encode local NEW_CONNECTION_ID advertisements
+- Add helper to encode pending RETIRE_CONNECTION_ID frame
+- Expose pending RETIRE_CONNECTION_ID pop API
+- Decode and track NEW_CONNECTION_ID and RETIRE_CONNECTION_ID
+- Decode and track BLOCKED family frame signals
+- Apply MAX_STREAMS and MAX_STREAM_DATA frame updates
+- Handle MAX_DATA frame updates at runtime
+- Process multiple frames per received packet
+
+### <!-- 6 -->🧪 Testing
+
+- Verify invalid-packet counters on retry and VN paths
+- Stress version handling under mixed packet flows
+- Extend connecting and packet-space legality matrix
+- Add initial and handshake mixed-ordering regressions
+- Expand zero-rtt legality and mixed ordering coverage
+- Expand handshake packet-space legality coverage
+- Stress draining state under repeated stimuli
+- Broaden frame decode boundary corpus
+- Extend packet decode edge-case coverage
+- Harden transport-params and close-state regressions
+- Expand malformed varint boundary coverage
+- Stress mixed-frame failure determinism
+- Harden close and path malformed regressions
+- Add ACK space and CID stress scenarios
+- Stress CID edge cases and retire dedup
+- Expand malformed packet negative corpus
+
 ## [0.0.11] - 2026-02-28
 
 ### <!-- 0 -->⛰️  Features

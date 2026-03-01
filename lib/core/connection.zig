@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const frame = @import("frame.zig");
 const stream = @import("stream.zig");
 const packet = @import("../core/packet.zig");
 const loss_detection = @import("loss_detection.zig");
@@ -12,9 +13,23 @@ const QuicMode = types.QuicMode;
 const TransportParameters = types.TransportParameters;
 const StreamManager = stream.StreamManager;
 const StreamId = types.StreamId;
+const MAX_ACK_PACKETS_PER_FRAME: usize = 1024;
+pub const RecoverySpace = loss_detection.PacketNumberSpace;
 
 /// QUIC Connection
 pub const Connection = struct {
+    pub const PeerConnectionIdEntry = struct {
+        sequence_number: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [16]u8,
+    };
+
+    pub const LocalConnectionIdEntry = struct {
+        sequence_number: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [16]u8,
+    };
+
     pub const RetransmissionRequest = struct {
         packet_number: u64,
         size: usize,
@@ -68,6 +83,24 @@ pub const Connection = struct {
     data_sent: u64,
     data_received: u64,
 
+    /// Peer blocked signaling observations
+    peer_data_blocked_max: u64,
+    peer_stream_data_blocked_max: u64,
+    peer_streams_blocked_bidi_max: u64,
+    peer_streams_blocked_uni_max: u64,
+
+    /// Peer-issued connection IDs and retire signaling
+    peer_connection_ids: std.ArrayList(PeerConnectionIdEntry),
+    peer_retire_prior_to: u64,
+    peer_max_cid_sequence: u64,
+    pending_retire_connection_ids: std.ArrayList(u64),
+
+    /// Local NEW_CONNECTION_ID advertisement state
+    local_connection_ids: std.ArrayList(LocalConnectionIdEntry),
+    local_next_cid_sequence: u64,
+    local_retire_prior_to: u64,
+    pending_new_connection_ids: std.ArrayList(u64),
+
     /// Allocator
     allocator: std.mem.Allocator,
 
@@ -113,8 +146,27 @@ pub const Connection = struct {
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
             .data_received = 0,
+            .peer_data_blocked_max = 0,
+            .peer_stream_data_blocked_max = 0,
+            .peer_streams_blocked_bidi_max = 0,
+            .peer_streams_blocked_uni_max = 0,
+            .peer_connection_ids = .{},
+            .peer_retire_prior_to = 0,
+            .peer_max_cid_sequence = 0,
+            .pending_retire_connection_ids = .{},
+            .local_connection_ids = .{},
+            .local_next_cid_sequence = 0,
+            .local_retire_prior_to = 0,
+            .pending_new_connection_ids = .{},
             .allocator = allocator,
         };
+
+        try conn.local_connection_ids.append(allocator, .{
+            .sequence_number = 0,
+            .connection_id = local_conn_id,
+            .stateless_reset_token = [_]u8{0} ** 16,
+        });
+        conn.local_next_cid_sequence = 1;
 
         // SSH/QUIC reserves stream 0 for global/auth traffic.
         // Channel streams begin at 4 for client-initiated bidirectional streams.
@@ -165,8 +217,27 @@ pub const Connection = struct {
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
             .data_received = 0,
+            .peer_data_blocked_max = 0,
+            .peer_stream_data_blocked_max = 0,
+            .peer_streams_blocked_bidi_max = 0,
+            .peer_streams_blocked_uni_max = 0,
+            .peer_connection_ids = .{},
+            .peer_retire_prior_to = 0,
+            .peer_max_cid_sequence = 0,
+            .pending_retire_connection_ids = .{},
+            .local_connection_ids = .{},
+            .local_next_cid_sequence = 0,
+            .local_retire_prior_to = 0,
+            .pending_new_connection_ids = .{},
             .allocator = allocator,
         };
+
+        try conn.local_connection_ids.append(allocator, .{
+            .sequence_number = 0,
+            .connection_id = local_conn_id,
+            .stateless_reset_token = [_]u8{0} ** 16,
+        });
+        conn.local_next_cid_sequence = 1;
 
         // SSH/QUIC reserves stream 0 and maps server-initiated channels to 5, 9, 13...
         if (mode == .ssh) {
@@ -188,6 +259,10 @@ pub const Connection = struct {
         self.loss_detection.deinit();
         self.retransmission_queue.deinit(self.allocator);
         self.pending_path_responses.deinit(self.allocator);
+        self.peer_connection_ids.deinit(self.allocator);
+        self.pending_retire_connection_ids.deinit(self.allocator);
+        self.local_connection_ids.deinit(self.allocator);
+        self.pending_new_connection_ids.deinit(self.allocator);
     }
 
     /// Open a new stream
@@ -362,17 +437,315 @@ pub const Connection = struct {
         );
     }
 
+    /// Apply peer MAX_DATA update (monotonic increase only).
+    pub fn onMaxData(self: *Connection, new_max_data: u64) void {
+        if (new_max_data > self.max_data_remote) {
+            self.max_data_remote = new_max_data;
+        }
+    }
+
+    pub fn onMaxStreams(self: *Connection, bidirectional: bool, max_streams: u64) void {
+        self.streams.onMaxStreams(bidirectional, max_streams);
+    }
+
+    pub fn onMaxStreamData(self: *Connection, stream_id: StreamId, max_stream_data: u64) void {
+        self.streams.onMaxStreamData(stream_id, max_stream_data);
+    }
+
+    pub fn onDataBlocked(self: *Connection, max_data: u64) void {
+        if (max_data > self.peer_data_blocked_max) {
+            self.peer_data_blocked_max = max_data;
+        }
+    }
+
+    pub fn onStreamDataBlocked(self: *Connection, max_stream_data: u64) void {
+        if (max_stream_data > self.peer_stream_data_blocked_max) {
+            self.peer_stream_data_blocked_max = max_stream_data;
+        }
+    }
+
+    pub fn onStreamsBlocked(self: *Connection, bidirectional: bool, max_streams: u64) void {
+        if (bidirectional) {
+            if (max_streams > self.peer_streams_blocked_bidi_max) {
+                self.peer_streams_blocked_bidi_max = max_streams;
+            }
+            return;
+        }
+
+        if (max_streams > self.peer_streams_blocked_uni_max) {
+            self.peer_streams_blocked_uni_max = max_streams;
+        }
+    }
+
+    pub fn onNewConnectionId(
+        self: *Connection,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [16]u8,
+    ) Error!bool {
+        if (retire_prior_to > sequence_number) {
+            return false;
+        }
+
+        if (sequence_number > self.peer_max_cid_sequence) {
+            self.peer_max_cid_sequence = sequence_number;
+        }
+
+        if (retire_prior_to > self.peer_retire_prior_to) {
+            self.peer_retire_prior_to = retire_prior_to;
+
+            var i: usize = 0;
+            while (i < self.peer_connection_ids.items.len) {
+                const cid = self.peer_connection_ids.items[i];
+                if (cid.sequence_number < retire_prior_to) {
+                    try self.enqueuePendingRetireConnectionId(cid.sequence_number);
+                    _ = self.peer_connection_ids.orderedRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
+        if (sequence_number < self.peer_retire_prior_to) {
+            try self.enqueuePendingRetireConnectionId(sequence_number);
+            return true;
+        }
+
+        for (self.peer_connection_ids.items) |cid| {
+            if (std.mem.eql(u8, &cid.stateless_reset_token, &stateless_reset_token) and cid.sequence_number != sequence_number) {
+                return false;
+            }
+
+            if (cid.sequence_number == sequence_number) {
+                if (!cid.connection_id.eql(&connection_id)) return false;
+                if (!std.mem.eql(u8, &cid.stateless_reset_token, &stateless_reset_token)) return false;
+                return true;
+            }
+        }
+
+        try self.peer_connection_ids.append(self.allocator, .{
+            .sequence_number = sequence_number,
+            .connection_id = connection_id,
+            .stateless_reset_token = stateless_reset_token,
+        });
+
+        if (self.remote_params) |params| {
+            if (self.peer_connection_ids.items.len > params.active_connection_id_limit) {
+                _ = self.peer_connection_ids.pop();
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    fn enqueuePendingRetireConnectionId(self: *Connection, sequence_number: u64) Error!void {
+        for (self.pending_retire_connection_ids.items) |existing| {
+            if (existing == sequence_number) {
+                return;
+            }
+        }
+
+        try self.pending_retire_connection_ids.append(self.allocator, sequence_number);
+    }
+
+    pub fn onRetireConnectionId(self: *Connection, sequence_number: u64) bool {
+        if (sequence_number > self.peer_max_cid_sequence) {
+            return false;
+        }
+
+        var i: usize = 0;
+        while (i < self.peer_connection_ids.items.len) {
+            if (self.peer_connection_ids.items[i].sequence_number == sequence_number) {
+                _ = self.peer_connection_ids.orderedRemove(i);
+                break;
+            }
+            i += 1;
+        }
+
+        return true;
+    }
+
+    pub fn popRetireConnectionId(self: *Connection) ?u64 {
+        if (self.pending_retire_connection_ids.items.len == 0) {
+            return null;
+        }
+
+        return self.pending_retire_connection_ids.orderedRemove(0);
+    }
+
+    pub fn hasPendingRetireConnectionId(self: *const Connection) bool {
+        return self.pending_retire_connection_ids.items.len > 0;
+    }
+
+    pub fn queueNewConnectionId(self: *Connection, connection_id: ConnectionId, stateless_reset_token: [16]u8) Error!u64 {
+        const sequence_number = self.local_next_cid_sequence;
+        self.local_next_cid_sequence += 1;
+
+        try self.local_connection_ids.append(self.allocator, .{
+            .sequence_number = sequence_number,
+            .connection_id = connection_id,
+            .stateless_reset_token = stateless_reset_token,
+        });
+        try self.pending_new_connection_ids.append(self.allocator, sequence_number);
+
+        return sequence_number;
+    }
+
+    pub fn latestLocalConnectionId(self: *const Connection) ?LocalConnectionIdEntry {
+        if (self.local_connection_ids.items.len == 0) return null;
+        return self.local_connection_ids.items[self.local_connection_ids.items.len - 1];
+    }
+
+    pub fn popPendingNewConnectionId(self: *Connection) ?LocalConnectionIdEntry {
+        if (self.pending_new_connection_ids.items.len == 0) {
+            return null;
+        }
+
+        const sequence_number = self.pending_new_connection_ids.orderedRemove(0);
+        for (self.local_connection_ids.items) |entry| {
+            if (entry.sequence_number == sequence_number) {
+                return entry;
+            }
+        }
+
+        return null;
+    }
+
+    pub fn hasPendingNewConnectionId(self: *const Connection) bool {
+        return self.pending_new_connection_ids.items.len > 0;
+    }
+
+    pub fn localRetirePriorTo(self: *const Connection) u64 {
+        return self.local_retire_prior_to;
+    }
+
+    pub fn advanceLocalRetirePriorTo(self: *Connection, sequence_number: u64) void {
+        if (sequence_number <= self.local_retire_prior_to) {
+            return;
+        }
+
+        if (sequence_number > self.local_next_cid_sequence) {
+            return;
+        }
+
+        self.local_retire_prior_to = sequence_number;
+    }
+
     /// Process received ACK
     pub fn processAck(self: *Connection, largest_acked: u64) void {
         self.processAckDetailed(largest_acked, 0);
     }
 
+    /// Returns whether ACKed packet number is plausible for packets sent so far.
+    pub fn canAcknowledgePacket(self: *const Connection, largest_acked: u64) bool {
+        return self.canAcknowledgePacketInSpace(.application, largest_acked);
+    }
+
+    /// Returns whether ACKed packet number is plausible in a specific packet number space.
+    pub fn canAcknowledgePacketInSpace(
+        self: *const Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+    ) bool {
+        if (self.loss_detection.maxObservedPacketNumber(space)) |max_seen| {
+            return largest_acked <= max_seen;
+        }
+        return false;
+    }
+
+    /// Decode peer ACK Delay field into microseconds.
+    ///
+    /// ACK delay is encoded by peer using its advertised ack_delay_exponent and
+    /// bounded by its max_ack_delay transport parameter.
+    pub fn normalizePeerAckDelay(self: *const Connection, encoded_ack_delay: u64) u64 {
+        const params = self.remote_params orelse self.local_params;
+        const shift: u6 = @intCast(@min(params.ack_delay_exponent, 20));
+
+        var scaled = encoded_ack_delay;
+        var i: u6 = 0;
+        while (i < shift) : (i += 1) {
+            scaled = std.math.mul(u64, scaled, 2) catch std.math.maxInt(u64);
+        }
+
+        const max_ack_delay_us = params.max_ack_delay * time.Duration.MILLISECOND;
+        return @min(scaled, max_ack_delay_us);
+    }
+
+    /// Validate ACK ranges against sent packet number space and processing limits.
+    pub fn validateAckFrame(
+        self: *const Connection,
+        largest_acked: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) bool {
+        return self.validateAckFrameInSpace(.application, largest_acked, first_ack_range, ack_ranges);
+    }
+
+    pub fn validateAckFrameInSpace(
+        self: *const Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) bool {
+        if (!self.canAcknowledgePacketInSpace(space, largest_acked)) {
+            return false;
+        }
+
+        if (first_ack_range > largest_acked) {
+            return false;
+        }
+
+        var total_acked: usize = @intCast(first_ack_range + 1);
+        if (total_acked > MAX_ACK_PACKETS_PER_FRAME) {
+            return false;
+        }
+
+        var current_smallest = largest_acked - first_ack_range;
+        for (ack_ranges) |range| {
+            const step = range.gap + 2;
+            if (current_smallest < step) {
+                return false;
+            }
+
+            const next_largest = current_smallest - step;
+            if (!self.canAcknowledgePacketInSpace(space, next_largest)) {
+                return false;
+            }
+
+            if (range.ack_range_length > next_largest) {
+                return false;
+            }
+
+            const range_packets: usize = @intCast(range.ack_range_length + 1);
+            total_acked += range_packets;
+            if (total_acked > MAX_ACK_PACKETS_PER_FRAME) {
+                return false;
+            }
+
+            current_smallest = next_largest - range.ack_range_length;
+        }
+
+        return true;
+    }
+
     /// Process received ACK with delay (microseconds), update RTT and congestion state.
     pub fn processAckDetailed(self: *Connection, largest_acked: u64, ack_delay: u64) void {
+        self.processAckDetailedInSpace(.application, largest_acked, ack_delay);
+    }
+
+    pub fn processAckDetailedInSpace(
+        self: *Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+        ack_delay: u64,
+    ) void {
         const now = time.Instant.now();
 
         var ack_result = self.loss_detection.onAckReceived(
-            .application,
+            space,
             largest_acked,
             ack_delay,
             now,
@@ -382,13 +755,22 @@ pub const Connection = struct {
             }
             return;
         };
+        defer ack_result.acked_packets.deinit(self.allocator);
         defer ack_result.lost_packets.deinit(self.allocator);
 
-        if (ack_result.acked_packet) |acked| {
+        self.applyAckResult(&ack_result, now);
+
+        if (largest_acked > self.largest_acked) {
+            self.largest_acked = largest_acked;
+        }
+    }
+
+    fn applyAckResult(self: *Connection, ack_result: *const loss_detection.AckResult, now: time.Instant) void {
+        for (ack_result.acked_packets.items) |acked| {
             if (acked.in_flight) {
                 self.congestion_controller.onPacketAcked(acked.size, acked.packet_number);
                 self.pto_count = 0;
-                self.next_pto_at = now.add(self.loss_detection.getPto());
+                self.next_pto_at = now.add(self.currentPtoDuration());
             }
         }
 
@@ -416,25 +798,121 @@ pub const Connection = struct {
                 }
             }
         }
+    }
+
+    /// Process received ACK with parsed range metadata.
+    ///
+    /// This currently forwards to the largest-acked recovery path while
+    /// preserving a stable API surface for full range-driven recovery.
+    pub fn processAckDetailedWithRanges(
+        self: *Connection,
+        largest_acked: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) void {
+        self.processAckDetailedWithRangesInSpace(.application, largest_acked, ack_delay, first_ack_range, ack_ranges);
+    }
+
+    pub fn processAckDetailedWithRangesInSpace(
+        self: *Connection,
+        space: RecoverySpace,
+        largest_acked: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_ranges: []const frame.AckFrame.AckRange,
+    ) void {
+        if (!self.validateAckFrameInSpace(space, largest_acked, first_ack_range, ack_ranges)) {
+            return;
+        }
+
+        var acknowledged_numbers: [MAX_ACK_PACKETS_PER_FRAME]u64 = undefined;
+        var count: usize = 0;
+
+        var current_smallest = largest_acked - first_ack_range;
+
+        var pn = current_smallest;
+        while (pn <= largest_acked) : (pn += 1) {
+            acknowledged_numbers[count] = pn;
+            count += 1;
+        }
+
+        for (ack_ranges) |range| {
+            const next_largest = current_smallest - (range.gap + 2);
+            const next_smallest = next_largest - range.ack_range_length;
+
+            pn = next_smallest;
+            while (pn <= next_largest) : (pn += 1) {
+                acknowledged_numbers[count] = pn;
+                count += 1;
+            }
+
+            current_smallest = next_smallest;
+        }
+
+        const now = time.Instant.now();
+        var ack_result = self.loss_detection.onAckReceivedWithPacketNumbers(
+            space,
+            largest_acked,
+            ack_delay,
+            now,
+            acknowledged_numbers[0..count],
+        ) catch {
+            if (largest_acked > self.largest_acked) {
+                self.largest_acked = largest_acked;
+            }
+            return;
+        };
+        defer ack_result.acked_packets.deinit(self.allocator);
+        defer ack_result.lost_packets.deinit(self.allocator);
+
+        self.applyAckResult(&ack_result, now);
 
         if (largest_acked > self.largest_acked) {
             self.largest_acked = largest_acked;
         }
     }
 
+    fn currentPtoDuration(self: *const Connection) u64 {
+        var pto = self.loss_detection.getPto();
+
+        // Apply peer max_ack_delay once transport parameters are available.
+        if (self.remote_params) |params| {
+            pto += params.max_ack_delay * time.Duration.MILLISECOND;
+        }
+
+        return pto;
+    }
+
+    /// Drain timeout derived from recovery timing (RFC-style 3 PTOs).
+    pub fn drainTimeoutDuration(self: *const Connection) u64 {
+        const base = self.currentPtoDuration();
+        const derived = std.math.mul(u64, base, 3) catch std.math.maxInt(u64);
+        return @min(@max(derived, 50 * time.Duration.MILLISECOND), 30 * time.Duration.SECOND);
+    }
+
     /// Track a sent packet for RTT/loss/congestion accounting.
     pub fn trackPacketSent(self: *Connection, packet_size: usize, ack_eliciting: bool) void {
+        self.trackPacketSentInSpace(.application, packet_size, ack_eliciting);
+    }
+
+    pub fn trackPacketSentInSpace(
+        self: *Connection,
+        space: RecoverySpace,
+        packet_size: usize,
+        ack_eliciting: bool,
+    ) void {
         const pn = self.nextPacketNumber();
         const now = time.Instant.now();
         const sent = loss_detection.SentPacket.init(pn, now, packet_size, ack_eliciting);
 
-        self.loss_detection.onPacketSent(.application, sent) catch {};
+        self.loss_detection.onPacketSent(space, sent) catch {};
         if (sent.in_flight) {
             self.congestion_controller.onPacketSent(packet_size);
         }
 
         if (ack_eliciting) {
-            self.next_pto_at = now.add(self.loss_detection.getPto());
+            self.next_pto_at = now.add(self.currentPtoDuration());
         }
     }
 
@@ -453,7 +931,7 @@ pub const Connection = struct {
 
             self.pto_count += 1;
 
-            const base_pto = self.loss_detection.getPto();
+            const base_pto = self.currentPtoDuration();
             const shift: u6 = @intCast(@min(self.pto_count, 20));
             const backoff = (@as(u64, 1) << shift);
             self.next_pto_at = now.add(base_pto * backoff);
@@ -720,6 +1198,301 @@ test "connection send budget follows max_data updates monotonically" {
     try std.testing.expectEqual(@as(u64, 0), conn.availableSendBudget());
 }
 
+test "connection applies MAX_DATA updates monotonically" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.max_data_remote = 1000;
+    conn.onMaxData(900);
+    try std.testing.expectEqual(@as(u64, 1000), conn.max_data_remote);
+
+    conn.onMaxData(2000);
+    try std.testing.expectEqual(@as(u64, 2000), conn.max_data_remote);
+}
+
+test "connection applies MAX_STREAMS updates" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.streams.setLocalOpenLimits(1, 1);
+    conn.onMaxStreams(true, 4);
+    try std.testing.expectEqual(@as(u64, 4), conn.streams.max_local_streams_bidi);
+}
+
+test "connection applies MAX_STREAM_DATA updates" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    const sid = try conn.openStream(true);
+    const before = conn.getStream(sid).?.max_stream_data_remote;
+    conn.onMaxStreamData(sid, before + 5000);
+    try std.testing.expectEqual(before + 5000, conn.getStream(sid).?.max_stream_data_remote);
+}
+
+test "connection tracks peer blocked frame observations" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.onDataBlocked(1000);
+    conn.onDataBlocked(900);
+    try std.testing.expectEqual(@as(u64, 1000), conn.peer_data_blocked_max);
+
+    conn.onStreamDataBlocked(512);
+    conn.onStreamDataBlocked(256);
+    try std.testing.expectEqual(@as(u64, 512), conn.peer_stream_data_blocked_max);
+
+    conn.onStreamsBlocked(true, 3);
+    conn.onStreamsBlocked(true, 2);
+    conn.onStreamsBlocked(false, 5);
+    conn.onStreamsBlocked(false, 4);
+    try std.testing.expectEqual(@as(u64, 3), conn.peer_streams_blocked_bidi_max);
+    try std.testing.expectEqual(@as(u64, 5), conn.peer_streams_blocked_uni_max);
+}
+
+test "connection tracks NEW_CONNECTION_ID and retire_prior_to" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid0 = try ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    const cid1 = try ConnectionId.init(&[_]u8{ 20, 21, 22, 23 });
+
+    try std.testing.expect(try conn.onNewConnectionId(0, 0, cid0, [_]u8{1} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, cid1, [_]u8{2} ** 16));
+
+    // seq 0 is now retired by retire_prior_to=1
+    const retired = conn.popRetireConnectionId();
+    try std.testing.expect(retired != null);
+    try std.testing.expectEqual(@as(u64, 0), retired.?);
+}
+
+test "connection rejects invalid NEW_CONNECTION_ID retire ordering" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid = try ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    try std.testing.expect(!(try conn.onNewConnectionId(1, 2, cid, [_]u8{1} ** 16)));
+}
+
+test "connection validates RETIRE_CONNECTION_ID sequence bounds" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid = try ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    try std.testing.expect(try conn.onNewConnectionId(3, 0, cid, [_]u8{1} ** 16));
+
+    try std.testing.expect(conn.onRetireConnectionId(3));
+    try std.testing.expect(!conn.onRetireConnectionId(9));
+}
+
+test "connection enforces peer active_connection_id_limit" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 1;
+    conn.setRemoteParams(remote);
+
+    const cid1 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 1 });
+    const cid2 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 2 });
+
+    try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, [_]u8{1} ** 16));
+    try std.testing.expect(!(try conn.onNewConnectionId(2, 0, cid2, [_]u8{2} ** 16)));
+    try std.testing.expectEqual(@as(usize, 1), conn.peer_connection_ids.items.len);
+}
+
+test "connection rejects duplicate stateless reset token across peer CIDs" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.setRemoteParams(remote);
+
+    const token = [_]u8{9} ** 16;
+    const cid1 = try ConnectionId.init(&[_]u8{ 8, 8, 8, 1 });
+    const cid2 = try ConnectionId.init(&[_]u8{ 8, 8, 8, 2 });
+
+    try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, token));
+    try std.testing.expect(!(try conn.onNewConnectionId(2, 0, cid2, token)));
+    try std.testing.expectEqual(@as(usize, 1), conn.peer_connection_ids.items.len);
+}
+
+test "connection deduplicates pending retire IDs from repeated retire_prior_to" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.setRemoteParams(remote);
+
+    const cid0 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 0 });
+    const cid1 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 1 });
+    const cid2 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 2 });
+    const cid3 = try ConnectionId.init(&[_]u8{ 7, 7, 7, 3 });
+
+    try std.testing.expect(try conn.onNewConnectionId(0, 0, cid0, [_]u8{1} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 0, cid1, [_]u8{2} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(2, 2, cid2, [_]u8{3} ** 16));
+
+    // Repeating retire_prior_to boundary should not duplicate retire queue entries.
+    try std.testing.expect(try conn.onNewConnectionId(3, 2, cid3, [_]u8{4} ** 16));
+
+    try std.testing.expectEqual(@as(?u64, 0), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, 1), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, null), conn.popRetireConnectionId());
+}
+
+test "connection deduplicates retire queue for sequence below retire_prior_to" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var remote = TransportParameters{};
+    remote.active_connection_id_limit = 8;
+    conn.setRemoteParams(remote);
+
+    const cid3 = try ConnectionId.init(&[_]u8{ 8, 8, 8, 3 });
+    try std.testing.expect(try conn.onNewConnectionId(3, 3, cid3, [_]u8{5} ** 16));
+
+    const stale_cid = try ConnectionId.init(&[_]u8{ 8, 8, 8, 1 });
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, stale_cid, [_]u8{6} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, stale_cid, [_]u8{6} ** 16));
+
+    try std.testing.expectEqual(@as(?u64, 1), conn.popRetireConnectionId());
+    try std.testing.expectEqual(@as(?u64, null), conn.popRetireConnectionId());
+}
+
+test "connection queues local NEW_CONNECTION_ID entries" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid1 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const seq1 = try conn.queueNewConnectionId(cid1, [_]u8{4} ** 16);
+    try std.testing.expectEqual(@as(u64, 1), seq1);
+
+    const latest = conn.latestLocalConnectionId();
+    try std.testing.expect(latest != null);
+    try std.testing.expectEqual(@as(u64, 1), latest.?.sequence_number);
+    try std.testing.expect(latest.?.connection_id.eql(&cid1));
+
+    const pending = conn.popPendingNewConnectionId();
+    try std.testing.expect(pending != null);
+    try std.testing.expectEqual(@as(u64, 1), pending.?.sequence_number);
+    try std.testing.expect(conn.popPendingNewConnectionId() == null);
+}
+
+test "connection local retire_prior_to advances monotonically" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.advanceLocalRetirePriorTo(0);
+    try std.testing.expectEqual(@as(u64, 0), conn.localRetirePriorTo());
+
+    // Cannot advance past advertised local sequence horizon.
+    conn.advanceLocalRetirePriorTo(2);
+    try std.testing.expectEqual(@as(u64, 0), conn.localRetirePriorTo());
+
+    _ = try conn.queueNewConnectionId(try ConnectionId.init(&[_]u8{ 9, 9, 9, 9 }), [_]u8{1} ** 16);
+    conn.advanceLocalRetirePriorTo(1);
+    try std.testing.expectEqual(@as(u64, 1), conn.localRetirePriorTo());
+
+    conn.advanceLocalRetirePriorTo(1);
+    try std.testing.expectEqual(@as(u64, 1), conn.localRetirePriorTo());
+}
+
+test "connection pending CID flags reflect queue state" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    try std.testing.expect(!conn.hasPendingRetireConnectionId());
+    try std.testing.expect(!conn.hasPendingNewConnectionId());
+
+    const cid0 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 1 });
+    const cid1 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 2 });
+    try std.testing.expect(try conn.onNewConnectionId(0, 0, cid0, [_]u8{1} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, cid1, [_]u8{2} ** 16));
+    try std.testing.expect(conn.hasPendingRetireConnectionId());
+
+    _ = conn.popRetireConnectionId();
+    try std.testing.expect(!conn.hasPendingRetireConnectionId());
+
+    _ = try conn.queueNewConnectionId(try ConnectionId.init(&[_]u8{ 7, 7, 7, 7 }), [_]u8{3} ** 16);
+    try std.testing.expect(conn.hasPendingNewConnectionId());
+
+    _ = conn.popPendingNewConnectionId();
+    try std.testing.expect(!conn.hasPendingNewConnectionId());
+}
+
 test "connection applies remote stream limits" {
     const allocator = std.testing.allocator;
 
@@ -823,6 +1596,161 @@ test "connection ack integrates congestion accounting" {
 
     try std.testing.expect(conn.largest_acked >= 2);
     try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
+}
+
+test "connection ack plausibility tracks sent packet numbers" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    try std.testing.expect(!conn.canAcknowledgePacket(0));
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+
+    try std.testing.expect(conn.canAcknowledgePacket(0));
+    try std.testing.expect(conn.canAcknowledgePacket(1));
+    try std.testing.expect(!conn.canAcknowledgePacket(2));
+}
+
+test "connection validates ACK frame ranges against sent space" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+
+    const valid_ranges = [_]frame.AckFrame.AckRange{.{ .gap = 0, .ack_range_length = 0 }};
+    try std.testing.expect(conn.validateAckFrame(2, 0, &valid_ranges));
+
+    const invalid_unsent = [_]frame.AckFrame.AckRange{};
+    try std.testing.expect(!conn.validateAckFrame(3, 0, &invalid_unsent));
+}
+
+test "connection validates ACK frame in packet-number space" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSentInSpace(.initial, 1200, true); // pn 0 in Initial
+
+    const no_ranges = [_]frame.AckFrame.AckRange{};
+    try std.testing.expect(conn.validateAckFrameInSpace(.initial, 0, 0, &no_ranges));
+    try std.testing.expect(!conn.validateAckFrameInSpace(.application, 0, 0, &no_ranges));
+}
+
+test "connection rejects ACK frame with excessive acknowledged span" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        conn.trackPacketSent(1200, true);
+    }
+
+    const no_ranges = [_]frame.AckFrame.AckRange{};
+    try std.testing.expect(!conn.validateAckFrame(1500, 1500, &no_ranges));
+}
+
+test "connection normalizes peer ACK delay with exponent and max" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var params = types.TransportParameters{};
+    params.ack_delay_exponent = 4;
+    params.max_ack_delay = 10; // milliseconds
+    conn.remote_params = params;
+
+    // encoded_ack_delay=100 => 100 * 2^4 = 1600us
+    try std.testing.expectEqual(@as(u64, 1600), conn.normalizePeerAckDelay(100));
+
+    // Large encoded value is clamped by max_ack_delay (10ms => 10000us)
+    try std.testing.expectEqual(@as(u64, 10 * time.Duration.MILLISECOND), conn.normalizePeerAckDelay(10_000));
+}
+
+test "connection PTO includes peer max_ack_delay" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    var params = types.TransportParameters{};
+    params.max_ack_delay = 25; // milliseconds
+    conn.remote_params = params;
+
+    const base_pto = conn.loss_detection.getPto();
+    try std.testing.expectEqual(
+        base_pto + (25 * time.Duration.MILLISECOND),
+        conn.currentPtoDuration(),
+    );
+}
+
+test "connection drain timeout derives from PTO" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const timeout = conn.drainTimeoutDuration();
+    try std.testing.expect(timeout >= 50 * time.Duration.MILLISECOND);
+    try std.testing.expect(timeout <= 30 * time.Duration.SECOND);
+}
+
+test "connection ack with ranges keeps recovery path stable" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+    conn.trackPacketSent(1200, true); // pn 2
+
+    const ack_ranges = [_]frame.AckFrame.AckRange{
+        .{ .gap = 0, .ack_range_length = 0 },
+    };
+    conn.processAckDetailedWithRanges(2, 0, 0, &ack_ranges);
+
+    try std.testing.expect(conn.largest_acked >= 2);
+    try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 2400);
 }
 
 test "connection schedules retransmission for lost packets" {
