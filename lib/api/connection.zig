@@ -434,8 +434,8 @@ pub const QuicConnection = struct {
         return (frame_type & 0x1f) == 0x1f;
     }
 
-    fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!void {
-        if (payload.len == 0) return;
+    fn routeFrame(self: *QuicConnection, payload: []const u8, packet_space: PacketSpace) types_mod.QuicError!usize {
+        if (payload.len == 0) return 0;
 
         const frame_type_result = varint.decode(payload) catch {
             return types_mod.QuicError.InvalidPacket;
@@ -464,14 +464,15 @@ pub const QuicConnection = struct {
             };
 
             try self.events.append(self.allocator, .{ .stream_readable = decoded.frame.stream_id });
-            return;
+            return decoded.consumed;
         }
 
         switch (frame_type) {
             0x01 => {
-                _ = frame_mod.PingFrame.decode(payload) catch {
+                const decoded = frame_mod.PingFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
                 };
+                return decoded.consumed;
             },
             0x02, 0x03 => {
                 const decoded = frame_mod.AckFrame.decode(payload) catch {
@@ -480,6 +481,7 @@ pub const QuicConnection = struct {
                 if (self.internal_conn) |conn| {
                     conn.processAckDetailed(decoded.frame.largest_acked, decoded.frame.ack_delay);
                 }
+                return decoded.consumed;
             },
             0x1c, 0x1d => {
                 const decoded = frame_mod.ConnectionCloseFrame.decode(payload) catch {
@@ -487,6 +489,7 @@ pub const QuicConnection = struct {
                 };
 
                 try self.enterDraining(decoded.frame.error_code, decoded.frame.reason);
+                return decoded.consumed;
             },
             0x04 => {
                 const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
@@ -507,6 +510,7 @@ pub const QuicConnection = struct {
                         .error_code = decoded.frame.error_code,
                     },
                 });
+                return decoded.consumed;
             },
             0x05 => {
                 const decoded = frame_mod.StopSendingFrame.decode(payload) catch {
@@ -518,6 +522,7 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.StreamError;
                 };
                 stream.reset(decoded.frame.error_code);
+                return decoded.consumed;
             },
             0x1a => {
                 const decoded = frame_mod.PathChallengeFrame.decode(payload) catch {
@@ -528,6 +533,7 @@ pub const QuicConnection = struct {
                 conn.onPathChallenge(decoded.frame.data) catch {
                     return types_mod.QuicError.OutOfMemory;
                 };
+                return decoded.consumed;
             },
             0x1b => {
                 const decoded = frame_mod.PathResponseFrame.decode(payload) catch {
@@ -536,9 +542,11 @@ pub const QuicConnection = struct {
 
                 const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
                 _ = conn.onPathResponse(decoded.frame.data);
+                return decoded.consumed;
             },
             else => {
                 // Unknown/unhandled frame type in this slice: ignore.
+                return payload.len;
             },
         }
     }
@@ -926,21 +934,36 @@ pub const QuicConnection = struct {
 
             try self.transitionToEstablished();
 
-            self.routeFrame(packet[header.consumed..], header.packet_space) catch |err| {
-                self.packets_invalid += 1;
-                if (err == types_mod.QuicError.ProtocolViolation) {
-                    try self.queueProtocolViolation("frame not allowed in current context");
+            var frame_offset = header.consumed;
+            while (frame_offset < packet.len) {
+                const consumed = self.routeFrame(packet[frame_offset..], header.packet_space) catch |err| {
+                    self.packets_invalid += 1;
+                    if (err == types_mod.QuicError.ProtocolViolation) {
+                        try self.queueProtocolViolation("frame not allowed in current context");
+                        return;
+                    }
+
+                    if (err == types_mod.QuicError.FlowControlError) {
+                        try self.queueFlowControlError("stream flow control exceeded");
+                        return;
+                    }
+
+                    try self.queueProtocolViolation("invalid frame payload");
+                    return;
+                };
+
+                if (consumed == 0 or consumed > (packet.len - frame_offset)) {
+                    self.packets_invalid += 1;
+                    try self.queueProtocolViolation("invalid frame length");
                     return;
                 }
 
-                if (err == types_mod.QuicError.FlowControlError) {
-                    try self.queueFlowControlError("stream flow control exceeded");
+                frame_offset += consumed;
+
+                if (self.state == .draining or self.state == .closed) {
                     return;
                 }
-
-                try self.queueProtocolViolation("invalid frame payload");
-                return;
-            };
+            }
         }
     }
 
@@ -2610,6 +2633,57 @@ test "poll routes STREAM frame into stream data and readable event" {
     const n = try conn.streamRead(4, &read_buf);
     try std.testing.expectEqual(@as(usize, 12), n);
     try std.testing.expectEqualStrings("hello-stream", read_buf[0..n]);
+}
+
+test "poll processes multiple frames in a single packet payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 36,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 4,
+        .offset = 0,
+        .data = "multi-frame",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .stream_readable);
+    try std.testing.expectEqual(@as(u64, 4), event.?.stream_readable);
+    try std.testing.expect(conn.nextEvent() == null);
+
+    var read_buf: [64]u8 = undefined;
+    const n = try conn.streamRead(4, &read_buf);
+    try std.testing.expectEqual(@as(usize, 11), n);
+    try std.testing.expectEqualStrings("multi-frame", read_buf[0..n]);
 }
 
 test "poll routes RESET_STREAM frame to stream_closed event" {
