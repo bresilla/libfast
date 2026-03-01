@@ -69,6 +69,7 @@ pub const QuicConnection = struct {
     // Basic packet visibility counters
     packets_received: u64,
     packets_invalid: u64,
+    created_at: time_mod.Instant,
 
     // Negotiated protocol metadata
     negotiated_alpn: ?[]const u8,
@@ -123,6 +124,7 @@ pub const QuicConnection = struct {
             .remote_addr = null,
             .packets_received = 0,
             .packets_invalid = 0,
+            .created_at = time_mod.Instant.now(),
             .negotiated_alpn = null,
             .tls_server_hello_applied = false,
             .close_reason_buf = [_]u8{0} ** CLOSE_REASON_MAX_LEN,
@@ -1524,6 +1526,8 @@ pub const QuicConnection = struct {
         var stats = types_mod.ConnectionStats{};
         stats.packets_received = self.packets_received;
         stats.packets_invalid = self.packets_invalid;
+        const elapsed_us = time_mod.Instant.now().durationSince(self.created_at);
+        stats.duration_ms = @divFloor(elapsed_us, time_mod.Duration.MILLISECOND);
 
         if (self.internal_conn) |conn| {
             stats.packets_sent = conn.next_packet_number;
@@ -3037,6 +3041,19 @@ test "Get connection stats" {
     const stats = conn.getStats();
     try std.testing.expectEqual(@as(u64, 0), stats.packets_sent);
     try std.testing.expectEqual(@as(u64, 0), stats.bytes_received);
+    try std.testing.expect(stats.duration_ms <= 1000);
+}
+
+test "Get connection stats duration reflects elapsed runtime" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    conn.created_at = time_mod.Instant.now().sub(2500); // 2.5ms ago
+    const stats = conn.getStats();
+    try std.testing.expect(stats.duration_ms >= 2);
 }
 
 test "Get connection stats reflects active connection counters" {

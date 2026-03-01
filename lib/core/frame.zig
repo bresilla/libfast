@@ -1368,10 +1368,12 @@ test "frame decode fuzz smoke" {
         }
 
         switch (frame_type) {
+            0x00 => _ = PaddingFrame.decode(sample) catch continue,
             0x01 => _ = PingFrame.decode(sample) catch continue,
             0x02, 0x03 => _ = AckFrame.decode(sample) catch continue,
             0x04 => _ = ResetStreamFrame.decode(sample) catch continue,
             0x05 => _ = StopSendingFrame.decode(sample) catch continue,
+            0x06 => _ = CryptoFrame.decode(sample) catch continue,
             0x10 => _ = MaxDataFrame.decode(sample) catch continue,
             0x11 => _ = MaxStreamDataFrame.decode(sample) catch continue,
             0x12, 0x13 => _ = MaxStreamsFrame.decode(sample) catch continue,
@@ -1383,6 +1385,7 @@ test "frame decode fuzz smoke" {
             0x1a => _ = PathChallengeFrame.decode(sample) catch continue,
             0x1b => _ = PathResponseFrame.decode(sample) catch continue,
             0x1c, 0x1d => _ = ConnectionCloseFrame.decode(sample) catch continue,
+            0x1e => _ = HandshakeDoneFrame.decode(sample) catch continue,
             else => {},
         }
     }
