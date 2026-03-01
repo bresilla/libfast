@@ -40,7 +40,13 @@ pub const Frame = union(enum) {
 };
 
 /// PADDING frame (0x00)
-pub const PaddingFrame = struct {};
+pub const PaddingFrame = struct {
+    pub fn decode(buf: []const u8) FrameError!struct { frame: PaddingFrame, consumed: usize } {
+        const type_result = try varint.decode(buf);
+        if (type_result.value != 0x00) return error.InvalidFrameType;
+        return .{ .frame = PaddingFrame{}, .consumed = type_result.len };
+    }
+};
 
 /// PING frame (0x01)
 pub const PingFrame = struct {
@@ -299,6 +305,29 @@ pub const CryptoFrame = struct {
         @memcpy(buf[pos..][0..self.data.len], self.data);
         pos += self.data.len;
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: CryptoFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x06) return error.InvalidFrameType;
+
+        const offset_result = try varint.decode(buf[pos..]);
+        pos += offset_result.len;
+
+        const len_result = try varint.decode(buf[pos..]);
+        pos += len_result.len;
+
+        if (pos + len_result.value > buf.len) return error.UnexpectedEof;
+        const data = buf[pos .. pos + len_result.value];
+        pos += len_result.value;
+
+        return .{
+            .frame = .{ .offset = offset_result.value, .data = data },
+            .consumed = pos,
+        };
     }
 };
 
@@ -886,6 +915,16 @@ test "crypto frame encode" {
 
     const encoded_len = try frame.encode(&buf);
     try std.testing.expect(encoded_len > 0);
+
+    const decoded = try CryptoFrame.decode(buf[0..encoded_len]);
+    try std.testing.expectEqual(frame.offset, decoded.frame.offset);
+    try std.testing.expectEqualStrings(frame.data, decoded.frame.data);
+    try std.testing.expectEqual(encoded_len, decoded.consumed);
+}
+
+test "padding frame decode" {
+    const decoded = try PaddingFrame.decode(&[_]u8{0x00});
+    try std.testing.expectEqual(@as(usize, 1), decoded.consumed);
 }
 
 test "ack frame encode" {
@@ -1284,6 +1323,7 @@ test "connection close decode rejects truncated reason bytes" {
 }
 
 test "frame decode malformed corpus" {
+    try std.testing.expectError(error.UnexpectedEof, CryptoFrame.decode(&[_]u8{ 0x06, 0x00, 0x40 }));
     try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
     try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
     try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(&[_]u8{0x1c}));

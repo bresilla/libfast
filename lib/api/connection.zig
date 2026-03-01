@@ -699,8 +699,20 @@ pub const QuicConnection = struct {
         }
 
         switch (frame_type) {
+            0x00 => {
+                const decoded = frame_mod.PaddingFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+                return decoded.consumed;
+            },
             0x01 => {
                 const decoded = frame_mod.PingFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+                return decoded.consumed;
+            },
+            0x06 => {
+                const decoded = frame_mod.CryptoFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 return decoded.consumed;
@@ -6297,6 +6309,73 @@ test "poll allows CRYPTO frame in Initial packet space" {
     try std.testing.expect(conn.nextEvent() == null);
 
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects malformed CRYPTO frame payload in initial space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    // CRYPTO frame with truncated length varint.
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .initial,
+        &[_]u8{ 0x06, 0x00, 0x40 },
+        96,
+    );
+}
+
+test "poll processes padding before stream frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 97,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x00; // PADDING
+    packet_len += 1;
+
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 32,
+        .offset = 0,
+        .data = "pad-stream",
+        .fin = false,
+    };
+    packet_len += try stream_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_stream = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .stream_readable and event.stream_readable == 32) {
+            saw_stream = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_stream);
 }
 
 test "poll rejects MAX_DATA frame in Initial packet space" {
