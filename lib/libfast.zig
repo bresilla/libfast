@@ -122,5 +122,6 @@ test {
     _ = @import("api/config.zig");
     _ = @import("api/types.zig");
     _ = @import("api/connection.zig");
+    _ = @import("api/connection_frame_legality_test.zig");
     _ = @import("api/stream.zig");
 }
