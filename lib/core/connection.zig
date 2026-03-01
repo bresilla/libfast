@@ -21,6 +21,12 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     };
 
+    pub const LocalConnectionIdEntry = struct {
+        sequence_number: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [16]u8,
+    };
+
     pub const RetransmissionRequest = struct {
         packet_number: u64,
         size: usize,
@@ -86,6 +92,10 @@ pub const Connection = struct {
     peer_max_cid_sequence: u64,
     pending_retire_connection_ids: std.ArrayList(u64),
 
+    /// Local NEW_CONNECTION_ID advertisement state
+    local_connection_ids: std.ArrayList(LocalConnectionIdEntry),
+    local_next_cid_sequence: u64,
+
     /// Allocator
     allocator: std.mem.Allocator,
 
@@ -139,8 +149,17 @@ pub const Connection = struct {
             .peer_retire_prior_to = 0,
             .peer_max_cid_sequence = 0,
             .pending_retire_connection_ids = .{},
+            .local_connection_ids = .{},
+            .local_next_cid_sequence = 0,
             .allocator = allocator,
         };
+
+        try conn.local_connection_ids.append(allocator, .{
+            .sequence_number = 0,
+            .connection_id = local_conn_id,
+            .stateless_reset_token = [_]u8{0} ** 16,
+        });
+        conn.local_next_cid_sequence = 1;
 
         // SSH/QUIC reserves stream 0 for global/auth traffic.
         // Channel streams begin at 4 for client-initiated bidirectional streams.
@@ -199,8 +218,17 @@ pub const Connection = struct {
             .peer_retire_prior_to = 0,
             .peer_max_cid_sequence = 0,
             .pending_retire_connection_ids = .{},
+            .local_connection_ids = .{},
+            .local_next_cid_sequence = 0,
             .allocator = allocator,
         };
+
+        try conn.local_connection_ids.append(allocator, .{
+            .sequence_number = 0,
+            .connection_id = local_conn_id,
+            .stateless_reset_token = [_]u8{0} ** 16,
+        });
+        conn.local_next_cid_sequence = 1;
 
         // SSH/QUIC reserves stream 0 and maps server-initiated channels to 5, 9, 13...
         if (mode == .ssh) {
@@ -224,6 +252,7 @@ pub const Connection = struct {
         self.pending_path_responses.deinit(self.allocator);
         self.peer_connection_ids.deinit(self.allocator);
         self.pending_retire_connection_ids.deinit(self.allocator);
+        self.local_connection_ids.deinit(self.allocator);
     }
 
     /// Open a new stream
@@ -513,6 +542,24 @@ pub const Connection = struct {
         }
 
         return self.pending_retire_connection_ids.orderedRemove(0);
+    }
+
+    pub fn queueNewConnectionId(self: *Connection, connection_id: ConnectionId, stateless_reset_token: [16]u8) Error!u64 {
+        const sequence_number = self.local_next_cid_sequence;
+        self.local_next_cid_sequence += 1;
+
+        try self.local_connection_ids.append(self.allocator, .{
+            .sequence_number = sequence_number,
+            .connection_id = connection_id,
+            .stateless_reset_token = stateless_reset_token,
+        });
+
+        return sequence_number;
+    }
+
+    pub fn latestLocalConnectionId(self: *const Connection) ?LocalConnectionIdEntry {
+        if (self.local_connection_ids.items.len == 0) return null;
+        return self.local_connection_ids.items[self.local_connection_ids.items.len - 1];
     }
 
     /// Process received ACK
@@ -993,6 +1040,25 @@ test "connection validates RETIRE_CONNECTION_ID sequence bounds" {
 
     try std.testing.expect(conn.onRetireConnectionId(3));
     try std.testing.expect(!conn.onRetireConnectionId(9));
+}
+
+test "connection queues local NEW_CONNECTION_ID entries" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid1 = try ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const seq1 = try conn.queueNewConnectionId(cid1, [_]u8{4} ** 16);
+    try std.testing.expectEqual(@as(u64, 1), seq1);
+
+    const latest = conn.latestLocalConnectionId();
+    try std.testing.expect(latest != null);
+    try std.testing.expectEqual(@as(u64, 1), latest.?.sequence_number);
+    try std.testing.expect(latest.?.connection_id.eql(&cid1));
 }
 
 test "connection applies remote stream limits" {

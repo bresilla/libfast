@@ -1262,6 +1262,40 @@ pub const QuicConnection = struct {
         return len;
     }
 
+    /// Queue a local connection ID for NEW_CONNECTION_ID advertisement.
+    pub fn queueNewConnectionId(
+        self: *QuicConnection,
+        connection_id_bytes: []const u8,
+        stateless_reset_token: [16]u8,
+    ) types_mod.QuicError!u64 {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        const connection_id = core_types.ConnectionId.init(connection_id_bytes) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+
+        return conn.queueNewConnectionId(connection_id, stateless_reset_token) catch {
+            return types_mod.QuicError.OutOfMemory;
+        };
+    }
+
+    /// Encode latest queued NEW_CONNECTION_ID advertisement frame.
+    pub fn encodeLatestNewConnectionIdFrame(self: *QuicConnection, out: []u8) types_mod.QuicError!?usize {
+        const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+        const latest = conn.latestLocalConnectionId() orelse return null;
+
+        const frame = frame_mod.NewConnectionIdFrame{
+            .sequence_number = latest.sequence_number,
+            .retire_prior_to = 0,
+            .connection_id = latest.connection_id,
+            .stateless_reset_token = latest.stateless_reset_token,
+        };
+
+        const len = frame.encode(out) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+        return len;
+    }
+
     /// Returns a point-in-time negotiation snapshot.
     pub fn getNegotiationSnapshot(self: *const QuicConnection) ?types_mod.NegotiationSnapshot {
         const conn = self.internal_conn orelse return null;
@@ -4002,6 +4036,31 @@ test "popRetireConnectionIdFrame encodes pending retire request" {
     const decoded = try frame_mod.RetireConnectionIdFrame.decode(out[0..encoded_len.?]);
     try std.testing.expectEqual(@as(u64, 0), decoded.frame.sequence_number);
     try std.testing.expect((try conn.popRetireConnectionIdFrame(&out)) == null);
+}
+
+test "queueNewConnectionId and encodeLatestNewConnectionIdFrame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+
+    const seq = try conn.queueNewConnectionId(&[_]u8{ 9, 9, 9, 9 }, [_]u8{8} ** 16);
+    try std.testing.expectEqual(@as(u64, 1), seq);
+
+    var out: [128]u8 = undefined;
+    const encoded_len = try conn.encodeLatestNewConnectionIdFrame(&out);
+    try std.testing.expect(encoded_len != null);
+
+    const decoded = try frame_mod.NewConnectionIdFrame.decode(out[0..encoded_len.?]);
+    try std.testing.expectEqual(@as(u64, 1), decoded.frame.sequence_number);
+    try std.testing.expectEqual(@as(u64, 0), decoded.frame.retire_prior_to);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9, 9, 9 }, decoded.frame.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &([_]u8{8} ** 16), &decoded.frame.stateless_reset_token);
 }
 
 test "packet-space frame legality matrix baseline" {
