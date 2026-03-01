@@ -1526,8 +1526,11 @@ pub const QuicConnection = struct {
         stats.packets_invalid = self.packets_invalid;
 
         if (self.internal_conn) |conn| {
+            stats.packets_sent = conn.next_packet_number;
             stats.bytes_sent = conn.data_sent;
             stats.bytes_received = conn.data_received;
+            stats.active_streams = @intCast(conn.streams.streams.count());
+            stats.rtt = conn.loss_detection.getSmoothedRtt();
         }
 
         return stats;
@@ -3034,6 +3037,39 @@ test "Get connection stats" {
     const stats = conn.getStats();
     try std.testing.expectEqual(@as(u64, 0), stats.packets_sent);
     try std.testing.expectEqual(@as(u64, 0), stats.bytes_received);
+}
+
+test "Get connection stats reflects active connection counters" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // Populate send/recovery counters.
+    conn.internal_conn.?.trackPacketSent(1200, true);
+    conn.internal_conn.?.trackPacketSent(800, true);
+    conn.internal_conn.?.data_sent = 2000;
+    conn.internal_conn.?.data_received = 1500;
+    conn.packets_received = 3;
+    conn.packets_invalid = 1;
+
+    _ = try conn.openStream(true);
+    _ = conn.nextEvent();
+
+    const stats = conn.getStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.packets_sent);
+    try std.testing.expectEqual(@as(u64, 3), stats.packets_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.packets_invalid);
+    try std.testing.expectEqual(@as(u64, 2000), stats.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 1500), stats.bytes_received);
+    try std.testing.expect(stats.active_streams >= 1);
+    try std.testing.expect(stats.rtt > 0);
 }
 
 test "Event queue" {
