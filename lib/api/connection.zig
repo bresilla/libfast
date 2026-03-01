@@ -5924,6 +5924,121 @@ test "poll accepts legal handshake ACK then rejects illegal HANDSHAKE_DONE" {
     );
 }
 
+test "poll preserves handshake ACK effect before illegal HANDSHAKE_DONE in same packet" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 20,
+        .packet_number = 87,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+    packet_buf[packet_len] = 0x1e; // illegal in handshake space
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.internal_conn.?.largest_acked >= 1);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll ignores trailing handshake ACK after first illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 20,
+        .packet_number = 88,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // illegal in handshake space
+    packet_len += 1;
+
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(@as(u64, 0), conn.internal_conn.?.largest_acked);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
 test "poll allows HANDSHAKE_DONE frame in application packet space" {
     const allocator = std.testing.allocator;
 
@@ -6073,6 +6188,122 @@ test "poll rejects MAX_DATA frame in Initial packet space" {
         second
     else
         null;
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll preserves initial ACK effect before later illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 85,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    const illegal = frame_mod.MaxDataFrame{ .max_data = 0 };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.internal_conn.?.largest_acked >= 1);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
+test "poll ignores trailing initial ACK after first illegal frame" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 24,
+        .packet_number = 86,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const illegal = frame_mod.MaxDataFrame{ .max_data = 0 };
+    packet_len += try illegal.encode(packet_buf[packet_len..]);
+
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expectEqual(@as(u64, 0), conn.internal_conn.?.largest_acked);
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
     try std.testing.expect(closing != null);
     try std.testing.expectEqual(
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
