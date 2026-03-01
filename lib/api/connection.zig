@@ -1243,6 +1243,26 @@ pub const QuicConnection = struct {
         return self.buildNegotiationResult();
     }
 
+    /// Returns number of currently tracked peer-issued connection IDs.
+    pub fn getPeerConnectionIdCount(self: *const QuicConnection) usize {
+        const conn = self.internal_conn orelse return 0;
+        return conn.peer_connection_ids.items.len;
+    }
+
+    /// Returns peer connection ID metadata by index.
+    pub fn getPeerConnectionIdInfo(self: *const QuicConnection, index: usize) ?types_mod.PeerConnectionIdInfo {
+        const conn = self.internal_conn orelse return null;
+        if (index >= conn.peer_connection_ids.items.len) return null;
+
+        const entry = conn.peer_connection_ids.items[index];
+        return .{
+            .sequence_number = entry.sequence_number,
+            .connection_id = entry.connection_id.data,
+            .connection_id_len = entry.connection_id.len,
+            .stateless_reset_token = entry.stateless_reset_token,
+        };
+    }
+
     /// Pop next pending RETIRE_CONNECTION_ID sequence requested by peer CID updates.
     pub fn popRetireConnectionId(self: *QuicConnection) ?u64 {
         const conn = self.internal_conn orelse return null;
@@ -3868,8 +3888,12 @@ test "poll routes NEW_CONNECTION_ID frame and tracks peer CID" {
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
-    try std.testing.expectEqual(@as(usize, 1), conn.internal_conn.?.peer_connection_ids.items.len);
-    try std.testing.expectEqual(@as(u64, 1), conn.internal_conn.?.peer_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(usize, 1), conn.getPeerConnectionIdCount());
+
+    const info = conn.getPeerConnectionIdInfo(0);
+    try std.testing.expect(info != null);
+    try std.testing.expectEqual(@as(u64, 1), info.?.sequence_number);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 8, 7, 6 }, info.?.connection_id[0..info.?.connection_id_len]);
 }
 
 test "poll rejects invalid NEW_CONNECTION_ID retire_prior_to ordering" {
@@ -3914,6 +3938,22 @@ test "poll rejects invalid NEW_CONNECTION_ID retire_prior_to ordering" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+}
+
+test "getPeerConnectionIdInfo returns null for out-of-range index" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), conn.getPeerConnectionIdCount());
+    try std.testing.expect(conn.getPeerConnectionIdInfo(0) == null);
 }
 
 test "poll queues RETIRE_CONNECTION_ID sequence and API can pop it" {

@@ -190,6 +190,14 @@ pub const StreamFinish = enum {
     finish,
 };
 
+/// Peer-advertised connection ID metadata.
+pub const PeerConnectionIdInfo = struct {
+    sequence_number: u64,
+    connection_id: [20]u8,
+    connection_id_len: u8,
+    stateless_reset_token: [16]u8,
+};
+
 /// Negotiation mode used by the connection.
 pub const NegotiationMode = enum {
     tls,
