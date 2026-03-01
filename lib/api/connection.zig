@@ -7722,3 +7722,47 @@ test "packet-space frame legality matrix baseline" {
     try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x06, .application));
     try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInPacketSpace(0x1f, .application));
 }
+
+test "connecting-state frame legality matrix baseline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    conn.state = .connecting;
+
+    const connecting_allowed = [_]u64{ 0x00, 0x01, 0x02, 0x03, 0x06, 0x1c, 0x1d };
+    for (connecting_allowed) |ft| {
+        try conn.validateFrameAllowedInState(ft);
+    }
+
+    const connecting_disallowed = [_]u64{ 0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x08, 0x0f };
+    for (connecting_disallowed) |ft| {
+        try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInState(ft));
+    }
+}
+
+test "connecting-state legality composes with packet-space rules" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    conn.state = .connecting;
+
+    // STREAM is legal in application space, but connecting-state policy rejects it.
+    try conn.validateFrameAllowedInPacketSpace(0x08, .application);
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInState(0x08));
+
+    // MAX_DATA is legal in application space, but connecting-state policy rejects it.
+    try conn.validateFrameAllowedInPacketSpace(0x10, .application);
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.validateFrameAllowedInState(0x10));
+
+    // PING and CONNECTION_CLOSE remain legal while connecting.
+    try conn.validateFrameAllowedInPacketSpace(0x01, .application);
+    try conn.validateFrameAllowedInState(0x01);
+    try conn.validateFrameAllowedInPacketSpace(0x1d, .application);
+    try conn.validateFrameAllowedInState(0x1d);
+}
