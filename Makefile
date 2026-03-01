@@ -1,4 +1,4 @@
-.PHONY: build test test-dual-mode ci install
+.PHONY: build test test-dual-mode interop-live ci install
 
 build:
 	zig build -Doptimize=ReleaseFast
@@ -8,6 +8,9 @@ test:
 
 test-dual-mode:
 	zig build test-dual-mode-regression --summary all
+
+interop-live:
+	./tools/lsquic_live_interop.sh
 
 ci:
 	zig build test-dual-mode-regression --summary all
