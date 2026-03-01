@@ -5723,6 +5723,207 @@ test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
     );
 }
 
+test "poll rejects HANDSHAKE_DONE frame in Handshake packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .handshake,
+        &[_]u8{0x1e}, // HANDSHAKE_DONE
+        76,
+    );
+}
+
+test "poll rejects STREAM frame in Handshake packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var payload: [64]u8 = undefined;
+    const stream_frame = frame_mod.StreamFrame{
+        .stream_id = 2,
+        .offset = 0,
+        .data = "hs-data",
+        .fin = false,
+    };
+    const payload_len = try stream_frame.encode(&payload);
+
+    try expectProtocolViolationFromLongHeaderPayload(
+        &conn,
+        allocator,
+        .handshake,
+        payload[0..payload_len],
+        77,
+    );
+}
+
+test "poll accepts ACK in Initial packet space for tracked Initial packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSentInSpace(.initial, 1200, true); // pn 1
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .initial,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 78,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll accepts CRYPTO frame in Handshake packet space" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 79,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const crypto_frame = frame_mod.CryptoFrame{ .offset = 0, .data = "hs" };
+    packet_len += try crypto_frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing);
+}
+
+test "poll accepts legal handshake ACK then rejects illegal HANDSHAKE_DONE" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.trackPacketSentInSpace(.handshake, 1200, true); // pn 0
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.LongHeader{
+        .packet_type = .handshake,
+        .version = core_types.QUIC_VERSION_1,
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .token = &.{},
+        .payload_len = 8,
+        .packet_number = 80,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var saw_closing_first = false;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            saw_closing_first = true;
+            break;
+        }
+    }
+    try std.testing.expect(!saw_closing_first);
+
+    packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x1e; // HANDSHAKE_DONE (illegal in handshake space)
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
+    );
+}
+
 test "poll allows HANDSHAKE_DONE frame in application packet space" {
     const allocator = std.testing.allocator;
 
