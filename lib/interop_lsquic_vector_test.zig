@@ -263,6 +263,149 @@ test "interop lsquic short-header truncation matrix" {
     }
 }
 
+test "interop lsquic-style short header generation vectors" {
+    const dcid = try core_types.ConnectionId.init(&[_]u8{ 0x08, 0x07, 0x06, 0x05 });
+
+    const vectors = [_]struct {
+        packet_number: u64,
+        key_phase: bool,
+        expected: []const u8,
+    }{
+        .{
+            .packet_number = 0x00,
+            .key_phase = false,
+            .expected = &[_]u8{ 0x40, 0x08, 0x07, 0x06, 0x05, 0x00 },
+        },
+        .{
+            .packet_number = 0x09,
+            .key_phase = true,
+            .expected = &[_]u8{ 0x44, 0x08, 0x07, 0x06, 0x05, 0x09 },
+        },
+        .{
+            .packet_number = 0x1234,
+            .key_phase = false,
+            .expected = &[_]u8{ 0x41, 0x08, 0x07, 0x06, 0x05, 0x12, 0x34 },
+        },
+        .{
+            .packet_number = 0x01020304,
+            .key_phase = false,
+            .expected = &[_]u8{ 0x43, 0x08, 0x07, 0x06, 0x05, 0x01, 0x02, 0x03, 0x04 },
+        },
+    };
+
+    for (vectors) |vector| {
+        var buf: [64]u8 = undefined;
+        const header = packet_mod.ShortHeader{
+            .dest_conn_id = dcid,
+            .packet_number = vector.packet_number,
+            .key_phase = vector.key_phase,
+        };
+        const len = try header.encode(&buf);
+        try std.testing.expectEqual(vector.expected.len, len);
+        try std.testing.expectEqualSlices(u8, vector.expected, buf[0..len]);
+    }
+}
+
+test "interop lsquic-style long header generation vectors" {
+    const dcid = try core_types.ConnectionId.init(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    const scid = try core_types.ConnectionId.init(&[_]u8{ 0x05, 0x06, 0x07, 0x08 });
+
+    const vectors = [_]struct {
+        packet_number: u64,
+        expected: []const u8,
+    }{
+        .{
+            .packet_number = 0x09,
+            .expected = &[_]u8{
+                0xC0,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                0x04,
+                0x01,
+                0x02,
+                0x03,
+                0x04,
+                0x04,
+                0x05,
+                0x06,
+                0x07,
+                0x08,
+                0x00,
+                0x04,
+                0x09,
+            },
+        },
+        .{
+            .packet_number = 0x1234,
+            .expected = &[_]u8{
+                0xC1,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                0x04,
+                0x01,
+                0x02,
+                0x03,
+                0x04,
+                0x04,
+                0x05,
+                0x06,
+                0x07,
+                0x08,
+                0x00,
+                0x04,
+                0x12,
+                0x34,
+            },
+        },
+        .{
+            .packet_number = 0x01020304,
+            .expected = &[_]u8{
+                0xC3,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                0x04,
+                0x01,
+                0x02,
+                0x03,
+                0x04,
+                0x04,
+                0x05,
+                0x06,
+                0x07,
+                0x08,
+                0x00,
+                0x04,
+                0x01,
+                0x02,
+                0x03,
+                0x04,
+            },
+        },
+    };
+
+    for (vectors) |vector| {
+        var buf: [96]u8 = undefined;
+        const header = packet_mod.LongHeader{
+            .packet_type = .initial,
+            .version = core_types.QUIC_VERSION_1,
+            .dest_conn_id = dcid,
+            .src_conn_id = scid,
+            .token = &.{},
+            .payload_len = 4,
+            .packet_number = vector.packet_number,
+        };
+        const len = try header.encode(&buf);
+        try std.testing.expectEqual(vector.expected.len, len);
+        try std.testing.expectEqualSlices(u8, vector.expected, buf[0..len]);
+    }
+}
+
 test "interop lsquic control-frame truncation matrix" {
     var token_buf: [128]u8 = undefined;
     const token = frame_mod.NewTokenFrame{ .token = "token-material-123" };
