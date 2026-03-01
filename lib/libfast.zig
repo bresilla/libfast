@@ -119,6 +119,7 @@ pub fn newTlsServer(
 test {
     std.testing.refAllDecls(@This());
     _ = @import("integration_test.zig");
+    _ = @import("interop_lsquic_vector_test.zig");
     _ = @import("api/config.zig");
     _ = @import("api/types.zig");
     _ = @import("api/connection.zig");
