@@ -4581,6 +4581,144 @@ test "poll ignores unknown frame type in application packet space" {
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
 }
 
+test "poll rejects truncated PATH_CHALLENGE frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // PATH_CHALLENGE requires 8 bytes of payload; 3 should fail decode.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x1a, 1, 2, 3 }, 61);
+}
+
+test "poll rejects truncated PATH_RESPONSE frame payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // PATH_RESPONSE requires 8 bytes of payload; 2 should fail decode.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x1b, 9, 9 }, 62);
+}
+
+test "poll rejects malformed CONNECTION_CLOSE payload" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    // CONNECTION_CLOSE transport format:
+    // type, error_code varint, frame_type varint, reason_len varint, reason bytes
+    // reason_len=2 but only one reason byte follows.
+    try expectProtocolViolationFromShortHeaderPayload(&conn, allocator, &[_]u8{ 0x1c, 0x00, 0x00, 0x02, 'x' }, 63);
+}
+
+test "repeated CONNECTION_CLOSE frames emit single closing event while draining" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 64,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const close_frame = frame_mod.ConnectionCloseFrame{
+        .error_code = 0x0a,
+        .frame_type = null,
+        .reason = "peer-close",
+    };
+    packet_len += try close_frame.encode(packet_buf[packet_len..]);
+
+    // First close frame transitions to draining and emits closing.
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    // Repeated close stimulus while draining must not enqueue another closing event.
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_count: usize = 0;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), closing_count);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "draining ignores subsequent frame stimuli until close deadline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(100, "local-close");
+    _ = conn.nextEvent(); // closing
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 65,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    // Still draining; no new events emitted from incoming packet.
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
 test "poll rejects reserved frame type in application packet space" {
     const allocator = std.testing.allocator;
 
