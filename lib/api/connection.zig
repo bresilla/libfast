@@ -343,6 +343,27 @@ pub const QuicConnection = struct {
         return false;
     }
 
+    fn detectStatelessResetRaw(self: *QuicConnection, packet: []const u8) bool {
+        if (packet.len < 17) {
+            return false;
+        }
+
+        // Stateless reset is carried in a packet that appears as a short header.
+        if ((packet[0] & 0x80) != 0) {
+            return false;
+        }
+
+        const conn = self.internal_conn orelse return false;
+        const token = packet[packet.len - 16 .. packet.len];
+        for (conn.peer_connection_ids.items) |entry| {
+            if (std.mem.eql(u8, token, &entry.stateless_reset_token)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     fn queueTlsFailure(self: *QuicConnection, stage: TlsFailureStage, err: anyerror) types_mod.QuicError!void {
         if (self.state == .closed) {
             return;
@@ -1165,6 +1186,12 @@ pub const QuicConnection = struct {
 
             const header = self.decodePacketHeader(packet) catch {
                 self.packets_invalid += 1;
+
+                if (self.detectStatelessResetRaw(packet)) {
+                    try self.enterDraining(@intFromEnum(core_types.ErrorCode.no_error), "stateless reset");
+                    return;
+                }
+
                 try self.queueProtocolViolation("invalid packet header");
                 return;
             };
@@ -4298,6 +4325,63 @@ test "poll detects stateless reset pattern on short header failure" {
     packet_len += reset_token.len;
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.no_error)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("stateless reset", event.?.closing.reason);
+}
+
+test "poll detects stateless reset before header decode succeeds" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{
+        1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 9, 9, 9, 9 });
+    const replacement_conn = try allocator.create(conn_internal.Connection);
+    replacement_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    replacement_conn.markEstablished();
+
+    if (conn.internal_conn) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    conn.internal_conn = replacement_conn;
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    const peer_cid = try core_types.ConnectionId.init(&[_]u8{ 7, 7, 7, 7 });
+    try std.testing.expect(
+        try conn.internal_conn.?.onNewConnectionId(1, 0, peer_cid, [_]u8{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }),
+    );
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = [_]u8{0} ** 32;
+    packet_buf[0] = 0x43; // short header, pn_len=4 to force longer minimum header
+
+    // Keep packet length below required (1 + 20-byte DCID + 4-byte PN = 25)
+    // so short header decode fails while trailing bytes still carry reset token.
+    const reset_token = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    @memcpy(packet_buf[1..16], &[_]u8{0} ** 15);
+    @memcpy(packet_buf[16..32], &reset_token);
+
+    _ = try sender.sendTo(packet_buf[0..32], local_addr);
     try conn.poll();
 
     const event = conn.nextEvent();
