@@ -697,9 +697,28 @@ pub const Connection = struct {
         first_ack_range: u64,
         ack_ranges: []const frame.AckFrame.AckRange,
     ) void {
-        _ = first_ack_range;
-        _ = ack_ranges;
+        if (first_ack_range > largest_acked) {
+            return;
+        }
+
         self.processAckDetailed(largest_acked, ack_delay);
+
+        var current_smallest: u64 = largest_acked - first_ack_range;
+        for (ack_ranges) |range| {
+            const step = range.gap + 2;
+            if (current_smallest < step) {
+                break;
+            }
+
+            const next_largest = current_smallest - step;
+            self.processAckDetailed(next_largest, ack_delay);
+
+            if (range.ack_range_length > next_largest) {
+                break;
+            }
+
+            current_smallest = next_largest - range.ack_range_length;
+        }
     }
 
     /// Track a sent packet for RTT/loss/congestion accounting.
@@ -1381,12 +1400,12 @@ test "connection ack with ranges keeps recovery path stable" {
     conn.trackPacketSent(1200, true); // pn 2
 
     const ack_ranges = [_]frame.AckFrame.AckRange{
-        .{ .gap = 1, .ack_range_length = 0 },
+        .{ .gap = 0, .ack_range_length = 0 },
     };
     conn.processAckDetailedWithRanges(2, 0, 0, &ack_ranges);
 
     try std.testing.expect(conn.largest_acked >= 2);
-    try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
+    try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 2400);
 }
 
 test "connection schedules retransmission for lost packets" {
