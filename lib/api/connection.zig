@@ -3486,6 +3486,125 @@ test "closed event emits once after drain deadline" {
     try std.testing.expect(conn.nextEvent() == null);
 }
 
+test "repeated malformed packets emit single closing event while draining" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [64]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 74,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x02; // ACK frame type only => malformed/truncated payload
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    var closing_count: usize = 0;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), closing_count);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "draining ignores version negotiation stimuli" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(321, "enter-drain");
+    const first = conn.nextEvent();
+    try std.testing.expect(first != null);
+    try std.testing.expect(first.? == .closing);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    try std.testing.expect(conn.nextEvent() == null);
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+}
+
+test "drain timeout closes even with queued inbound packets" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    try conn.close(222, "local-close");
+    _ = conn.nextEvent(); // consume closing
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [32]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 75,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+
+    conn.drain_deadline = time_mod.Instant.now().sub(1);
+    try conn.poll();
+
+    try std.testing.expectEqual(types_mod.ConnectionState.closed, conn.getState());
+    const closed = conn.nextEvent();
+    try std.testing.expect(closed != null);
+    try std.testing.expect(closed.? == .closed);
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
 test "poll routes STREAM frame into stream data and readable event" {
     const allocator = std.testing.allocator;
 
