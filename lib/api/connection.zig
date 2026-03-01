@@ -1836,6 +1836,25 @@ fn applyPeerTransportParamsWithLimits(conn: *QuicConnection, allocator: std.mem.
     try conn.applyPeerTransportParams(encoded);
 }
 
+fn expectTransportParamProtocolViolation(conn: *QuicConnection, encoded_params: []const u8) !void {
+    try std.testing.expectError(types_mod.QuicError.ProtocolViolation, conn.applyPeerTransportParams(encoded_params));
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.transport_parameter_error)),
+        closing.?.closing.error_code,
+    );
+}
+
 fn buildTlsServerHelloForTests(
     allocator: std.mem.Allocator,
     alpn: []const u8,
@@ -2506,6 +2525,47 @@ test "processTlsServerHello rejects invalid transport params extension payload" 
     try std.testing.expectError(
         types_mod.QuicError.HandshakeFailed,
         conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+}
+
+test "processTlsServerHello rejects transport params protocol violation values" {
+    const allocator = std.testing.allocator;
+
+    var config = config_mod.QuicConfig.tlsClient("example.com");
+    var tls_cfg = config.tls_config.?;
+    tls_cfg.alpn_protocols = &[_][]const u8{"h3"};
+    config.tls_config = tls_cfg;
+
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+    try conn.connect("127.0.0.1", 4433);
+
+    var server_params = transport_params_mod.TransportParams.defaultServer();
+    server_params.ack_delay_exponent = 21; // Protocol violation per RFC bounds.
+    const encoded_server_params = try server_params.encode(allocator);
+    defer allocator.free(encoded_server_params);
+
+    const server_hello_bytes = try buildTlsServerHelloForTests(allocator, "h3", encoded_server_params);
+    defer allocator.free(server_hello_bytes);
+
+    try std.testing.expectError(
+        types_mod.QuicError.HandshakeFailed,
+        conn.processTlsServerHello(server_hello_bytes, "test-shared-secret-from-ecdhe"),
+    );
+    try std.testing.expectEqual(types_mod.ConnectionState.draining, conn.getState());
+
+    var closing: ?types_mod.ConnectionEvent = null;
+    while (conn.nextEvent()) |event| {
+        if (event == .closing) {
+            closing = event;
+            break;
+        }
+    }
+
+    try std.testing.expect(closing != null);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        closing.?.closing.error_code,
     );
 }
 
@@ -3392,6 +3452,37 @@ test "close is idempotent while draining" {
     try std.testing.expect(closing.? == .closing);
     try std.testing.expectEqual(@as(u64, 77), closing.?.closing.error_code);
     try std.testing.expectEqualStrings("first-close", closing.?.closing.reason);
+    try std.testing.expect(conn.nextEvent() == null);
+}
+
+test "closed event emits once after drain deadline" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    try conn.close(99, "close-once");
+    _ = conn.nextEvent(); // closing
+
+    conn.drain_deadline = time_mod.Instant.now().sub(1);
+    try conn.poll();
+
+    const closed = conn.nextEvent();
+    try std.testing.expect(closed != null);
+    try std.testing.expect(closed.? == .closed);
+    try std.testing.expect(conn.nextEvent() == null);
+
+    try std.testing.expectError(types_mod.QuicError.ConnectionClosed, conn.poll());
     try std.testing.expect(conn.nextEvent() == null);
 }
 
@@ -4545,6 +4636,115 @@ test "applyPeerTransportParams rejects invalid peer parameters" {
         @as(u64, @intFromEnum(core_types.ErrorCode.transport_parameter_error)),
         event.?.closing.error_code,
     );
+}
+
+test "applyPeerTransportParams rejects ack_delay_exponent above limit" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.ack_delay_exponent = 21;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try expectTransportParamProtocolViolation(&conn, payload);
+}
+
+test "applyPeerTransportParams rejects max_ack_delay out of range" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.max_ack_delay = 16384;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try expectTransportParamProtocolViolation(&conn, payload);
+}
+
+test "applyPeerTransportParams rejects active_connection_id_limit below two" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    var encoded = transport_params_mod.TransportParams.init();
+    encoded.active_connection_id_limit = 1;
+    const payload = try encoded.encode(allocator);
+    defer allocator.free(payload);
+
+    try expectTransportParamProtocolViolation(&conn, payload);
+}
+
+test "applyPeerTransportParams rejects duplicate transport parameter IDs" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("example.com", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    const internal_conn = try allocator.create(conn_internal.Connection);
+    const local_cid = try core_types.ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try core_types.ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+    internal_conn.* = try conn_internal.Connection.initClient(allocator, .ssh, local_cid, remote_cid);
+    internal_conn.markEstablished();
+
+    conn.internal_conn = internal_conn;
+    conn.state = .established;
+
+    // Duplicate max_idle_timeout parameter encoding.
+    var payload = std.ArrayList(u8){};
+    defer payload.deinit(allocator);
+
+    var id_buf: [8]u8 = undefined;
+    var len_buf: [8]u8 = undefined;
+    var value_buf: [8]u8 = undefined;
+    const id_len = try varint.encode(@intFromEnum(transport_params_mod.TransportParamId.max_idle_timeout), &id_buf);
+    const value_len = try varint.encode(10, &value_buf);
+    const plen_len = try varint.encode(value_len, &len_buf);
+
+    try payload.appendSlice(allocator, id_buf[0..id_len]);
+    try payload.appendSlice(allocator, len_buf[0..plen_len]);
+    try payload.appendSlice(allocator, value_buf[0..value_len]);
+    try payload.appendSlice(allocator, id_buf[0..id_len]);
+    try payload.appendSlice(allocator, len_buf[0..plen_len]);
+    try payload.appendSlice(allocator, value_buf[0..value_len]);
+
+    try expectTransportParamProtocolViolation(&conn, payload.items);
 }
 
 test "applyPeerTransportParams updates stream open limits" {
