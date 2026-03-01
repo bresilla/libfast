@@ -545,6 +545,39 @@ pub const QuicConnection = struct {
                 conn.onStreamsBlocked(decoded.frame.bidirectional, decoded.frame.max_streams);
                 return decoded.consumed;
             },
+            0x18 => {
+                const decoded = frame_mod.NewConnectionIdFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                const ok = conn.onNewConnectionId(
+                    decoded.frame.sequence_number,
+                    decoded.frame.retire_prior_to,
+                    decoded.frame.connection_id,
+                    decoded.frame.stateless_reset_token,
+                ) catch {
+                    return types_mod.QuicError.OutOfMemory;
+                };
+
+                if (!ok) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                return decoded.consumed;
+            },
+            0x19 => {
+                const decoded = frame_mod.RetireConnectionIdFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                if (!conn.onRetireConnectionId(decoded.frame.sequence_number)) {
+                    return types_mod.QuicError.ProtocolViolation;
+                }
+
+                return decoded.consumed;
+            },
             0x04 => {
                 const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
@@ -3739,7 +3772,7 @@ test "poll rejects RETIRE_CONNECTION_ID frame in zero_rtt packet space" {
     );
 }
 
-test "poll allows NEW_CONNECTION_ID frame type in application packet space" {
+test "poll routes NEW_CONNECTION_ID frame and tracks peer CID" {
     const allocator = std.testing.allocator;
 
     const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
@@ -3762,14 +3795,66 @@ test "poll allows NEW_CONNECTION_ID frame type in application packet space" {
         .key_phase = false,
     };
     var packet_len = try header.encode(&packet_buf);
-    packet_buf[packet_len] = 0x18; // NEW_CONNECTION_ID (payload parsing not implemented in route)
-    packet_len += 1;
+    const new_cid = try core_types.ConnectionId.init(&[_]u8{ 9, 8, 7, 6 });
+    const frame = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = new_cid,
+        .stateless_reset_token = [_]u8{7} ** 16,
+    };
+    packet_len += try frame.encode(packet_buf[packet_len..]);
 
     _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
     try conn.poll();
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+    try std.testing.expectEqual(@as(usize, 1), conn.internal_conn.?.peer_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 1), conn.internal_conn.?.peer_connection_ids.items[0].sequence_number);
+}
+
+test "poll rejects invalid NEW_CONNECTION_ID retire_prior_to ordering" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 41,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    const cid = try core_types.ConnectionId.init(&[_]u8{ 4, 4, 4, 4 });
+    const frame = frame_mod.NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 2,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{1} ** 16,
+    };
+    packet_len += try frame.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "packet-space frame legality matrix baseline" {

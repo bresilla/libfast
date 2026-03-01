@@ -592,6 +592,45 @@ pub const NewConnectionIdFrame = struct {
 
         return pos;
     }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: NewConnectionIdFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x18) return error.InvalidFrameType;
+
+        const sequence_result = try varint.decode(buf[pos..]);
+        pos += sequence_result.len;
+
+        const retire_prior_to_result = try varint.decode(buf[pos..]);
+        pos += retire_prior_to_result.len;
+
+        if (pos + 1 > buf.len) return error.UnexpectedEof;
+        const cid_len = buf[pos];
+        pos += 1;
+        if (cid_len == 0 or cid_len > 20) return error.InvalidData;
+
+        if (pos + cid_len + 16 > buf.len) return error.UnexpectedEof;
+        const connection_id = ConnectionId.init(buf[pos .. pos + cid_len]) catch {
+            return error.InvalidData;
+        };
+        pos += cid_len;
+
+        var stateless_reset_token: [16]u8 = undefined;
+        @memcpy(&stateless_reset_token, buf[pos..][0..16]);
+        pos += 16;
+
+        return .{
+            .frame = .{
+                .sequence_number = sequence_result.value,
+                .retire_prior_to = retire_prior_to_result.value,
+                .connection_id = connection_id,
+                .stateless_reset_token = stateless_reset_token,
+            },
+            .consumed = pos,
+        };
+    }
 };
 
 /// RETIRE_CONNECTION_ID frame (0x19)
@@ -603,6 +642,22 @@ pub const RetireConnectionIdFrame = struct {
         pos += try varint.encode(0x19, buf[pos..]);
         pos += try varint.encode(self.sequence_number, buf[pos..]);
         return pos;
+    }
+
+    pub fn decode(buf: []const u8) FrameError!struct { frame: RetireConnectionIdFrame, consumed: usize } {
+        var pos: usize = 0;
+
+        const type_result = try varint.decode(buf[pos..]);
+        pos += type_result.len;
+        if (type_result.value != 0x19) return error.InvalidFrameType;
+
+        const sequence_result = try varint.decode(buf[pos..]);
+        pos += sequence_result.len;
+
+        return .{
+            .frame = .{ .sequence_number = sequence_result.value },
+            .consumed = pos,
+        };
     }
 };
 
@@ -949,6 +1004,35 @@ test "streams blocked frame encode/decode uni" {
     try std.testing.expectEqual(len, decoded.consumed);
 }
 
+test "new connection id frame encode/decode" {
+    var buf: [128]u8 = undefined;
+    const cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const frame = NewConnectionIdFrame{
+        .sequence_number = 3,
+        .retire_prior_to = 2,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{9} ** 16,
+    };
+    const len = try frame.encode(&buf);
+
+    const decoded = try NewConnectionIdFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(frame.sequence_number, decoded.frame.sequence_number);
+    try std.testing.expectEqual(frame.retire_prior_to, decoded.frame.retire_prior_to);
+    try std.testing.expect(frame.connection_id.eql(&decoded.frame.connection_id));
+    try std.testing.expectEqualSlices(u8, &frame.stateless_reset_token, &decoded.frame.stateless_reset_token);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
+test "retire connection id frame encode/decode" {
+    var buf: [32]u8 = undefined;
+    const frame = RetireConnectionIdFrame{ .sequence_number = 7 };
+    const len = try frame.encode(&buf);
+
+    const decoded = try RetireConnectionIdFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(frame.sequence_number, decoded.frame.sequence_number);
+    try std.testing.expectEqual(len, decoded.consumed);
+}
+
 test "frame decode malformed corpus" {
     try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
     try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
@@ -987,6 +1071,8 @@ test "frame decode fuzz smoke" {
             0x14 => _ = DataBlockedFrame.decode(sample) catch continue,
             0x15 => _ = StreamDataBlockedFrame.decode(sample) catch continue,
             0x16, 0x17 => _ = StreamsBlockedFrame.decode(sample) catch continue,
+            0x18 => _ = NewConnectionIdFrame.decode(sample) catch continue,
+            0x19 => _ = RetireConnectionIdFrame.decode(sample) catch continue,
             0x1a => _ = PathChallengeFrame.decode(sample) catch continue,
             0x1b => _ = PathResponseFrame.decode(sample) catch continue,
             0x1c, 0x1d => _ = ConnectionCloseFrame.decode(sample) catch continue,

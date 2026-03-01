@@ -15,6 +15,12 @@ const StreamId = types.StreamId;
 
 /// QUIC Connection
 pub const Connection = struct {
+    pub const PeerConnectionIdEntry = struct {
+        sequence_number: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [16]u8,
+    };
+
     pub const RetransmissionRequest = struct {
         packet_number: u64,
         size: usize,
@@ -74,6 +80,12 @@ pub const Connection = struct {
     peer_streams_blocked_bidi_max: u64,
     peer_streams_blocked_uni_max: u64,
 
+    /// Peer-issued connection IDs and retire signaling
+    peer_connection_ids: std.ArrayList(PeerConnectionIdEntry),
+    peer_retire_prior_to: u64,
+    peer_max_cid_sequence: u64,
+    pending_retire_connection_ids: std.ArrayList(u64),
+
     /// Allocator
     allocator: std.mem.Allocator,
 
@@ -123,6 +135,10 @@ pub const Connection = struct {
             .peer_stream_data_blocked_max = 0,
             .peer_streams_blocked_bidi_max = 0,
             .peer_streams_blocked_uni_max = 0,
+            .peer_connection_ids = .{},
+            .peer_retire_prior_to = 0,
+            .peer_max_cid_sequence = 0,
+            .pending_retire_connection_ids = .{},
             .allocator = allocator,
         };
 
@@ -179,6 +195,10 @@ pub const Connection = struct {
             .peer_stream_data_blocked_max = 0,
             .peer_streams_blocked_bidi_max = 0,
             .peer_streams_blocked_uni_max = 0,
+            .peer_connection_ids = .{},
+            .peer_retire_prior_to = 0,
+            .peer_max_cid_sequence = 0,
+            .pending_retire_connection_ids = .{},
             .allocator = allocator,
         };
 
@@ -202,6 +222,8 @@ pub const Connection = struct {
         self.loss_detection.deinit();
         self.retransmission_queue.deinit(self.allocator);
         self.pending_path_responses.deinit(self.allocator);
+        self.peer_connection_ids.deinit(self.allocator);
+        self.pending_retire_connection_ids.deinit(self.allocator);
     }
 
     /// Open a new stream
@@ -414,6 +436,83 @@ pub const Connection = struct {
         if (max_streams > self.peer_streams_blocked_uni_max) {
             self.peer_streams_blocked_uni_max = max_streams;
         }
+    }
+
+    pub fn onNewConnectionId(
+        self: *Connection,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        connection_id: ConnectionId,
+        stateless_reset_token: [16]u8,
+    ) Error!bool {
+        if (retire_prior_to > sequence_number) {
+            return false;
+        }
+
+        if (sequence_number > self.peer_max_cid_sequence) {
+            self.peer_max_cid_sequence = sequence_number;
+        }
+
+        if (retire_prior_to > self.peer_retire_prior_to) {
+            self.peer_retire_prior_to = retire_prior_to;
+
+            var i: usize = 0;
+            while (i < self.peer_connection_ids.items.len) {
+                const cid = self.peer_connection_ids.items[i];
+                if (cid.sequence_number < retire_prior_to) {
+                    try self.pending_retire_connection_ids.append(self.allocator, cid.sequence_number);
+                    _ = self.peer_connection_ids.orderedRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
+        if (sequence_number < self.peer_retire_prior_to) {
+            try self.pending_retire_connection_ids.append(self.allocator, sequence_number);
+            return true;
+        }
+
+        for (self.peer_connection_ids.items) |cid| {
+            if (cid.sequence_number == sequence_number) {
+                if (!cid.connection_id.eql(&connection_id)) return false;
+                if (!std.mem.eql(u8, &cid.stateless_reset_token, &stateless_reset_token)) return false;
+                return true;
+            }
+        }
+
+        try self.peer_connection_ids.append(self.allocator, .{
+            .sequence_number = sequence_number,
+            .connection_id = connection_id,
+            .stateless_reset_token = stateless_reset_token,
+        });
+
+        return true;
+    }
+
+    pub fn onRetireConnectionId(self: *Connection, sequence_number: u64) bool {
+        if (sequence_number > self.peer_max_cid_sequence) {
+            return false;
+        }
+
+        var i: usize = 0;
+        while (i < self.peer_connection_ids.items.len) {
+            if (self.peer_connection_ids.items[i].sequence_number == sequence_number) {
+                _ = self.peer_connection_ids.orderedRemove(i);
+                break;
+            }
+            i += 1;
+        }
+
+        return true;
+    }
+
+    pub fn popRetireConnectionId(self: *Connection) ?u64 {
+        if (self.pending_retire_connection_ids.items.len == 0) {
+            return null;
+        }
+
+        return self.pending_retire_connection_ids.orderedRemove(0);
     }
 
     /// Process received ACK
@@ -844,6 +943,56 @@ test "connection tracks peer blocked frame observations" {
     conn.onStreamsBlocked(false, 4);
     try std.testing.expectEqual(@as(u64, 3), conn.peer_streams_blocked_bidi_max);
     try std.testing.expectEqual(@as(u64, 5), conn.peer_streams_blocked_uni_max);
+}
+
+test "connection tracks NEW_CONNECTION_ID and retire_prior_to" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid0 = try ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    const cid1 = try ConnectionId.init(&[_]u8{ 20, 21, 22, 23 });
+
+    try std.testing.expect(try conn.onNewConnectionId(0, 0, cid0, [_]u8{1} ** 16));
+    try std.testing.expect(try conn.onNewConnectionId(1, 1, cid1, [_]u8{2} ** 16));
+
+    // seq 0 is now retired by retire_prior_to=1
+    const retired = conn.popRetireConnectionId();
+    try std.testing.expect(retired != null);
+    try std.testing.expectEqual(@as(u64, 0), retired.?);
+}
+
+test "connection rejects invalid NEW_CONNECTION_ID retire ordering" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid = try ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    try std.testing.expect(!(try conn.onNewConnectionId(1, 2, cid, [_]u8{1} ** 16)));
+}
+
+test "connection validates RETIRE_CONNECTION_ID sequence bounds" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const cid = try ConnectionId.init(&[_]u8{ 10, 11, 12, 13 });
+    try std.testing.expect(try conn.onNewConnectionId(3, 0, cid, [_]u8{1} ** 16));
+
+    try std.testing.expect(conn.onRetireConnectionId(3));
+    try std.testing.expect(!conn.onRetireConnectionId(9));
 }
 
 test "connection applies remote stream limits" {
