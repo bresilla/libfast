@@ -68,6 +68,12 @@ pub const Connection = struct {
     data_sent: u64,
     data_received: u64,
 
+    /// Peer blocked signaling observations
+    peer_data_blocked_max: u64,
+    peer_stream_data_blocked_max: u64,
+    peer_streams_blocked_bidi_max: u64,
+    peer_streams_blocked_uni_max: u64,
+
     /// Allocator
     allocator: std.mem.Allocator,
 
@@ -113,6 +119,10 @@ pub const Connection = struct {
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
             .data_received = 0,
+            .peer_data_blocked_max = 0,
+            .peer_stream_data_blocked_max = 0,
+            .peer_streams_blocked_bidi_max = 0,
+            .peer_streams_blocked_uni_max = 0,
             .allocator = allocator,
         };
 
@@ -165,6 +175,10 @@ pub const Connection = struct {
             .max_data_remote = params.initial_max_data,
             .data_sent = 0,
             .data_received = 0,
+            .peer_data_blocked_max = 0,
+            .peer_stream_data_blocked_max = 0,
+            .peer_streams_blocked_bidi_max = 0,
+            .peer_streams_blocked_uni_max = 0,
             .allocator = allocator,
         };
 
@@ -375,6 +389,31 @@ pub const Connection = struct {
 
     pub fn onMaxStreamData(self: *Connection, stream_id: StreamId, max_stream_data: u64) void {
         self.streams.onMaxStreamData(stream_id, max_stream_data);
+    }
+
+    pub fn onDataBlocked(self: *Connection, max_data: u64) void {
+        if (max_data > self.peer_data_blocked_max) {
+            self.peer_data_blocked_max = max_data;
+        }
+    }
+
+    pub fn onStreamDataBlocked(self: *Connection, max_stream_data: u64) void {
+        if (max_stream_data > self.peer_stream_data_blocked_max) {
+            self.peer_stream_data_blocked_max = max_stream_data;
+        }
+    }
+
+    pub fn onStreamsBlocked(self: *Connection, bidirectional: bool, max_streams: u64) void {
+        if (bidirectional) {
+            if (max_streams > self.peer_streams_blocked_bidi_max) {
+                self.peer_streams_blocked_bidi_max = max_streams;
+            }
+            return;
+        }
+
+        if (max_streams > self.peer_streams_blocked_uni_max) {
+            self.peer_streams_blocked_uni_max = max_streams;
+        }
     }
 
     /// Process received ACK
@@ -780,6 +819,31 @@ test "connection applies MAX_STREAM_DATA updates" {
     const before = conn.getStream(sid).?.max_stream_data_remote;
     conn.onMaxStreamData(sid, before + 5000);
     try std.testing.expectEqual(before + 5000, conn.getStream(sid).?.max_stream_data_remote);
+}
+
+test "connection tracks peer blocked frame observations" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.onDataBlocked(1000);
+    conn.onDataBlocked(900);
+    try std.testing.expectEqual(@as(u64, 1000), conn.peer_data_blocked_max);
+
+    conn.onStreamDataBlocked(512);
+    conn.onStreamDataBlocked(256);
+    try std.testing.expectEqual(@as(u64, 512), conn.peer_stream_data_blocked_max);
+
+    conn.onStreamsBlocked(true, 3);
+    conn.onStreamsBlocked(true, 2);
+    conn.onStreamsBlocked(false, 5);
+    conn.onStreamsBlocked(false, 4);
+    try std.testing.expectEqual(@as(u64, 3), conn.peer_streams_blocked_bidi_max);
+    try std.testing.expectEqual(@as(u64, 5), conn.peer_streams_blocked_uni_max);
 }
 
 test "connection applies remote stream limits" {

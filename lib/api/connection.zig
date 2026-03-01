@@ -518,6 +518,33 @@ pub const QuicConnection = struct {
                 conn.onMaxStreams(decoded.frame.bidirectional, decoded.frame.max_streams);
                 return decoded.consumed;
             },
+            0x14 => {
+                const decoded = frame_mod.DataBlockedFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onDataBlocked(decoded.frame.max_data);
+                return decoded.consumed;
+            },
+            0x15 => {
+                const decoded = frame_mod.StreamDataBlockedFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onStreamDataBlocked(decoded.frame.max_stream_data);
+                return decoded.consumed;
+            },
+            0x16, 0x17 => {
+                const decoded = frame_mod.StreamsBlockedFrame.decode(payload) catch {
+                    return types_mod.QuicError.InvalidPacket;
+                };
+
+                const conn = self.internal_conn orelse return types_mod.QuicError.InvalidState;
+                conn.onStreamsBlocked(decoded.frame.bidirectional, decoded.frame.max_streams);
+                return decoded.consumed;
+            },
             0x04 => {
                 const decoded = frame_mod.ResetStreamFrame.decode(payload) catch {
                     return types_mod.QuicError.InvalidPacket;
@@ -2784,6 +2811,52 @@ test "poll routes MAX_STREAM_DATA frame and increases stream send credit" {
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
 
     try std.testing.expectEqual(@as(usize, 8), try conn.streamWrite(sid, "abcdefgh", .no_finish));
+}
+
+test "poll routes BLOCKED frames and updates peer blocked observations" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 40,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+
+    const data_blocked = frame_mod.DataBlockedFrame{ .max_data = 3000 };
+    packet_len += try data_blocked.encode(packet_buf[packet_len..]);
+
+    const stream_data_blocked = frame_mod.StreamDataBlockedFrame{ .stream_id = 4, .max_stream_data = 1200 };
+    packet_len += try stream_data_blocked.encode(packet_buf[packet_len..]);
+
+    const streams_blocked = frame_mod.StreamsBlockedFrame{ .max_streams = 9, .bidirectional = true };
+    packet_len += try streams_blocked.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    while (conn.nextEvent()) |ev| {
+        try std.testing.expect(ev != .closing);
+        try std.testing.expect(ev != .closed);
+    }
+
+    try std.testing.expectEqual(@as(u64, 3000), conn.internal_conn.?.peer_data_blocked_max);
+    try std.testing.expectEqual(@as(u64, 1200), conn.internal_conn.?.peer_stream_data_blocked_max);
+    try std.testing.expectEqual(@as(u64, 9), conn.internal_conn.?.peer_streams_blocked_bidi_max);
 }
 
 test "poll processes multiple frames in a single packet payload" {
