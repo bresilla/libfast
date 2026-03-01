@@ -16,6 +16,8 @@ const time_mod = @import("../utils/time.zig");
 
 const DEFAULT_SHORT_HEADER_DCID_LEN: u8 = 8;
 const CLOSE_REASON_MAX_LEN: usize = 256;
+const MAX_VN_VERSIONS: usize = 16;
+const LOCAL_SUPPORTED_VERSIONS = [_]u32{core_types.QUIC_VERSION_1};
 
 const PacketSpace = enum {
     initial,
@@ -362,6 +364,47 @@ pub const QuicConnection = struct {
         }
 
         return false;
+    }
+
+    fn selectMutualVersion(peer_versions: []const u32) ?u32 {
+        for (LOCAL_SUPPORTED_VERSIONS) |local| {
+            for (peer_versions) |peer| {
+                if (peer == local) return local;
+            }
+        }
+        return null;
+    }
+
+    fn handleVersionNegotiationPacket(self: *QuicConnection, packet: []const u8) types_mod.QuicError!bool {
+        if (packet.len < 5) return false;
+        if ((packet[0] & 0x80) == 0) return false;
+
+        const version = std.mem.readInt(u32, packet[1..5], .big);
+        if (version != 0) return false;
+
+        var versions: [MAX_VN_VERSIONS]u32 = undefined;
+        const decoded = packet_mod.VersionNegotiationPacket.decode(packet, &versions) catch {
+            return types_mod.QuicError.InvalidPacket;
+        };
+
+        // Policy: only client in connecting state reacts to VN packets.
+        if (self.config.role != .client or self.state != .connecting) {
+            return true;
+        }
+
+        const mutual = selectMutualVersion(decoded.packet.supported_versions);
+        if (mutual == null) {
+            try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), "no mutual QUIC version");
+            return true;
+        }
+
+        // VN packets advertising the currently attempted version are invalid.
+        if (mutual.? == core_types.QUIC_VERSION_1) {
+            try self.enterDraining(@intFromEnum(core_types.ErrorCode.protocol_violation), "invalid version negotiation");
+            return true;
+        }
+
+        return true;
     }
 
     fn recoverySpaceForPacketSpace(packet_space: PacketSpace) ?conn_internal.RecoverySpace {
@@ -1219,6 +1262,16 @@ pub const QuicConnection = struct {
 
             if (self.internal_conn) |conn| {
                 conn.updateDataReceived(packet.len);
+            }
+
+            const vn_handled = self.handleVersionNegotiationPacket(packet) catch {
+                self.packets_invalid += 1;
+                try self.queueProtocolViolation("invalid version negotiation packet");
+                return;
+            };
+
+            if (vn_handled) {
+                return;
             }
 
             const header = self.decodePacketHeader(packet) catch {
@@ -4320,6 +4373,110 @@ test "poll rejects reserved frame type in application packet space" {
         @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
         event.?.closing.error_code,
     );
+}
+
+test "poll rejects short header with fixed bit cleared" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 33,
+        .key_phase = false,
+    };
+    var packet_len = try header.encode(&packet_buf);
+    packet_buf[0] &= 0xBF; // clear fixed bit
+    packet_buf[packet_len] = 0x01; // PING
+    packet_len += 1;
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+}
+
+test "poll handles version negotiation packet with no mutual version" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("no mutual QUIC version", event.?.closing.reason);
+}
+
+test "poll rejects spoofed version negotiation including current version" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [256]u8 = undefined;
+    const vn = packet_mod.VersionNegotiationPacket{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .src_conn_id = conn.internal_conn.?.remote_conn_id,
+        .supported_versions = &[_]u32{ core_types.QUIC_VERSION_1, 0x00000002 },
+    };
+    const packet_len = try vn.encode(&packet_buf);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
+    try std.testing.expectEqualStrings("invalid version negotiation", event.?.closing.reason);
 }
 
 test "poll rejects HANDSHAKE_DONE frame in Initial packet space" {
