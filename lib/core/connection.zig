@@ -626,6 +626,11 @@ pub const Connection = struct {
         self.processAckDetailed(largest_acked, 0);
     }
 
+    /// Returns whether ACKed packet number is plausible for packets sent so far.
+    pub fn canAcknowledgePacket(self: *const Connection, largest_acked: u64) bool {
+        return largest_acked < self.next_packet_number;
+    }
+
     /// Process received ACK with delay (microseconds), update RTT and congestion state.
     pub fn processAckDetailed(self: *Connection, largest_acked: u64, ack_delay: u64) void {
         const now = time.Instant.now();
@@ -1339,6 +1344,26 @@ test "connection ack integrates congestion accounting" {
 
     try std.testing.expect(conn.largest_acked >= 2);
     try std.testing.expect(conn.congestion_controller.getBytesInFlight() < 3600);
+}
+
+test "connection ack plausibility tracks sent packet numbers" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    try std.testing.expect(!conn.canAcknowledgePacket(0));
+
+    conn.trackPacketSent(1200, true); // pn 0
+    conn.trackPacketSent(1200, true); // pn 1
+
+    try std.testing.expect(conn.canAcknowledgePacket(0));
+    try std.testing.expect(conn.canAcknowledgePacket(1));
+    try std.testing.expect(!conn.canAcknowledgePacket(2));
 }
 
 test "connection ack with ranges keeps recovery path stable" {

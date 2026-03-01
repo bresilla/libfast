@@ -641,6 +641,10 @@ pub const QuicConnection = struct {
                     return types_mod.QuicError.InvalidPacket;
                 };
                 if (self.internal_conn) |conn| {
+                    if (!conn.canAcknowledgePacket(decoded.frame.largest_acked)) {
+                        return types_mod.QuicError.ProtocolViolation;
+                    }
+
                     conn.processAckDetailedWithRanges(
                         decoded.frame.largest_acked,
                         decoded.frame.ack_delay,
@@ -2979,6 +2983,10 @@ test "poll routes ACK frame into connection ack tracking" {
     defer conn.deinit();
 
     try conn.connect("127.0.0.1", 4433);
+    var sent_count: usize = 0;
+    while (sent_count < 8) : (sent_count += 1) {
+        conn.internal_conn.?.trackPacketSent(1200, true);
+    }
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -3155,6 +3163,15 @@ test "poll routes MAX_DATA frame and raises send budget" {
     conn.internal_conn.?.markEstablished();
     conn.state = .established;
     try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
 
     const before_max_data = conn.internal_conn.?.max_data_remote;
 
@@ -3376,6 +3393,9 @@ test "poll processes ACK frame carrying ranges" {
     conn.internal_conn.?.markEstablished();
     conn.state = .established;
     try applyDefaultPeerTransportParams(&conn, allocator);
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 0
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 1
+    conn.internal_conn.?.trackPacketSent(1200, true); // pn 2
 
     var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
     defer sender.close();
@@ -3391,7 +3411,7 @@ test "poll processes ACK frame carrying ranges" {
 
     var packet_len = try header.encode(&packet_buf);
     const ack = frame_mod.AckFrame{
-        .largest_acked = 10,
+        .largest_acked = 2,
         .ack_delay = 1,
         .first_ack_range = 0,
         .ack_ranges = &[_]frame_mod.AckFrame.AckRange{
@@ -3405,6 +3425,51 @@ test "poll processes ACK frame carrying ranges" {
 
     try std.testing.expect(conn.nextEvent() == null);
     try std.testing.expectEqual(types_mod.ConnectionState.established, conn.getState());
+}
+
+test "poll rejects ACK for unsent packet number" {
+    const allocator = std.testing.allocator;
+
+    const config = config_mod.QuicConfig.sshClient("127.0.0.1", "secret");
+    var conn = try QuicConnection.init(allocator, config);
+    defer conn.deinit();
+
+    try conn.connect("127.0.0.1", 4433);
+    conn.internal_conn.?.markEstablished();
+    conn.state = .established;
+    try applyDefaultPeerTransportParams(&conn, allocator);
+
+    var sender = try udp_mod.UdpSocket.bindAny(allocator, 0);
+    defer sender.close();
+
+    const local_addr = try conn.socket.?.getLocalAddress();
+
+    var packet_buf: [512]u8 = undefined;
+    const header = packet_mod.ShortHeader{
+        .dest_conn_id = conn.internal_conn.?.local_conn_id,
+        .packet_number = 39,
+        .key_phase = false,
+    };
+
+    var packet_len = try header.encode(&packet_buf);
+    const ack = frame_mod.AckFrame{
+        .largest_acked = 5,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+    };
+    packet_len += try ack.encode(packet_buf[packet_len..]);
+
+    _ = try sender.sendTo(packet_buf[0..packet_len], local_addr);
+    try conn.poll();
+
+    const event = conn.nextEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .closing);
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(core_types.ErrorCode.protocol_violation)),
+        event.?.closing.error_code,
+    );
 }
 
 test "poll routes RESET_STREAM frame to stream_closed event" {
