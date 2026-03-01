@@ -1162,6 +1162,127 @@ test "new token frame encode/decode" {
     try std.testing.expectEqual(len, decoded.consumed);
 }
 
+test "stream frame decode without LEN consumes remaining payload" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+
+    // STREAM frame type with FIN=0, LEN=0, OFF=0 -> 0x08
+    pos += try varint.encode(0x08, buf[pos..]);
+    pos += try varint.encode(7, buf[pos..]); // stream id
+    @memcpy(buf[pos..][0..5], "hello");
+    pos += 5;
+
+    const decoded = try StreamFrame.decode(buf[0..pos]);
+    try std.testing.expectEqual(@as(u64, 7), decoded.frame.stream_id);
+    try std.testing.expectEqual(@as(u64, 0), decoded.frame.offset);
+    try std.testing.expectEqualStrings("hello", decoded.frame.data);
+    try std.testing.expectEqual(pos, decoded.consumed);
+}
+
+test "stream frame decode rejects oversized length claim" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+
+    // STREAM with LEN flag set
+    pos += try varint.encode(0x0a, buf[pos..]);
+    pos += try varint.encode(1, buf[pos..]); // stream id
+    pos += try varint.encode(5, buf[pos..]); // claimed data len
+    @memcpy(buf[pos..][0..2], "ab");
+    pos += 2;
+
+    try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(buf[0..pos]));
+}
+
+test "ack frame decode rejects truncated ECN counts" {
+    var buf: [64]u8 = undefined;
+    const frame = AckFrame{
+        .largest_acked = 10,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = AckFrame.EcnCounts{
+            .ect0_count = 1,
+            .ect1_count = 2,
+            .ecn_ce_count = 3,
+        },
+    };
+
+    const len = try frame.encode(&buf);
+    // Drop trailing CE count varint.
+    try std.testing.expectError(error.UnexpectedEof, AckFrame.decode(buf[0 .. len - 1]));
+}
+
+test "ack frame decode reports ack range output overflow" {
+    var buf: [128]u8 = undefined;
+    const frame = AckFrame{
+        .largest_acked = 50,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = &[_]AckFrame.AckRange{
+            .{ .gap = 0, .ack_range_length = 0 },
+            .{ .gap = 0, .ack_range_length = 0 },
+        },
+        .ecn_counts = null,
+    };
+
+    const len = try frame.encode(&buf);
+    var ranges: [1]AckFrame.AckRange = undefined;
+    try std.testing.expectError(error.BufferTooSmall, AckFrame.decodeWithAckRanges(buf[0..len], &ranges));
+}
+
+test "new connection id decode rejects invalid cid lengths" {
+    var buf: [128]u8 = undefined;
+    const cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const frame = NewConnectionIdFrame{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{0xaa} ** 16,
+    };
+    const len = try frame.encode(&buf);
+
+    // Zero CID length
+    var zero_len = buf;
+    const cid_len_index = len - (cid.len + 16) - 1;
+    zero_len[cid_len_index] = 0;
+    try std.testing.expectError(error.InvalidData, NewConnectionIdFrame.decode(zero_len[0..len]));
+
+    // CID length > 20
+    var oversized_len = buf;
+    oversized_len[cid_len_index] = 21;
+    try std.testing.expectError(error.InvalidData, NewConnectionIdFrame.decode(oversized_len[0..len]));
+}
+
+test "new connection id decode rejects truncated reset token" {
+    var buf: [128]u8 = undefined;
+    const cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const frame = NewConnectionIdFrame{
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{0xbb} ** 16,
+    };
+
+    const len = try frame.encode(&buf);
+    try std.testing.expectError(error.UnexpectedEof, NewConnectionIdFrame.decode(buf[0 .. len - 3]));
+}
+
+test "connection close decode rejects truncated reason length varint" {
+    // 0x1d, error_code=0, reason_len starts with 2-byte varint prefix but truncated.
+    try std.testing.expectError(
+        error.UnexpectedEof,
+        ConnectionCloseFrame.decode(&[_]u8{ 0x1d, 0x00, 0x40 }),
+    );
+}
+
+test "connection close decode rejects truncated reason bytes" {
+    // 0x1d, error_code=0, reason_len=3, but only 1 reason byte.
+    try std.testing.expectError(
+        error.UnexpectedEof,
+        ConnectionCloseFrame.decode(&[_]u8{ 0x1d, 0x00, 0x03, 'x' }),
+    );
+}
+
 test "frame decode malformed corpus" {
     try std.testing.expectError(error.UnexpectedEof, StreamFrame.decode(&[_]u8{0x0f}));
     try std.testing.expectError(error.InvalidFrameType, AckFrame.decode(&[_]u8{0x01}));
