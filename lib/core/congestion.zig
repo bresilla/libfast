@@ -445,3 +445,52 @@ test "Congestion avoidance growth is single-step per ACK event" {
     try std.testing.expectEqual(cwnd1 + mtu, cc.congestion_window);
     try std.testing.expectEqual(@as(u64, 0), cc.acked_bytes_in_window);
 }
+
+test "Newer loss packet starts new recovery epoch" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    // Grow cwnd before losses so halving effects are visible.
+    cc.onPacketAcked(12000, 1);
+    try std.testing.expectEqual(@as(u64, 24000), cc.congestion_window);
+
+    // First recovery epoch at packet 20.
+    cc.onPacketsLost(0, 20);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    try std.testing.expectEqual(@as(?u64, 20), cc.recovery_end_packet);
+    try std.testing.expectEqual(@as(u64, 12000), cc.congestion_window);
+
+    // Same/older losses are ignored during recovery.
+    cc.onPacketsLost(0, 20);
+    try std.testing.expectEqual(@as(?u64, 20), cc.recovery_end_packet);
+    try std.testing.expectEqual(@as(u64, 12000), cc.congestion_window);
+
+    // Newer loss packet starts a new recovery epoch and halves again.
+    cc.onPacketsLost(0, 25);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    try std.testing.expectEqual(@as(?u64, 25), cc.recovery_end_packet);
+    try std.testing.expectEqual(@as(u64, 6000), cc.congestion_window);
+    try std.testing.expectEqual(@as(u64, 6000), cc.ssthresh);
+}
+
+test "Congestion accounting saturates bytes_in_flight on over-ack and over-loss" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    cc.onPacketSent(1500);
+    try std.testing.expectEqual(@as(u64, 1500), cc.bytes_in_flight);
+
+    // ACK more than in-flight should saturate at zero.
+    cc.onPacketAcked(5000, 1);
+    try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
+
+    cc.onPacketSent(1000);
+    try std.testing.expectEqual(@as(u64, 1000), cc.bytes_in_flight);
+
+    // Loss accounting also saturates at zero.
+    cc.onPacketsLost(9000, 2);
+    try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
+
+    // Minimum threshold enforcement still holds after saturation path.
+    try std.testing.expect(cc.ssthresh >= 2 * mtu);
+}
