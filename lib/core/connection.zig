@@ -1872,6 +1872,48 @@ test "connection schedules retransmission for lost packets" {
     try std.testing.expect(!retransmit.?.is_probe);
 }
 
+test "replaying ACK advances loss frontier without requeueing already lost packet" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(900, true); // pn 0
+    conn.trackPacketSent(1000, true); // pn 1
+    conn.trackPacketSent(1100, true); // pn 2
+    conn.trackPacketSent(1200, true); // pn 3
+    conn.trackPacketSent(1300, true); // pn 4
+
+    // First ACK induces loss-driven retransmission scheduling.
+    conn.processAckDetailed(4, 0);
+
+    var first_count: usize = 0;
+    var saw_zero = false;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        if (req.packet_number == 0) saw_zero = true;
+        first_count += 1;
+    }
+    try std.testing.expect(first_count > 0);
+    try std.testing.expect(saw_zero);
+
+    // Replaying identical ACK should not enqueue duplicates.
+    conn.processAckDetailed(4, 0);
+
+    var replay_count: usize = 0;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        // Packet #0 was already scheduled in first round.
+        try std.testing.expect(req.packet_number != 0);
+        replay_count += 1;
+    }
+    try std.testing.expect(replay_count > 0);
+}
+
 test "connection schedules PTO probe" {
     const allocator = std.testing.allocator;
 
