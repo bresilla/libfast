@@ -591,3 +591,31 @@ test "Persistent congestion clears recovery and ack accounting state" {
     try std.testing.expectEqual(@as(u64, 0), cc.acked_bytes_in_window);
     try std.testing.expectEqual(@as(u64, 2 * mtu), cc.congestion_window);
 }
+
+test "Congestion window floor is maintained across repeated loss epochs" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    // Drive cwnd down through repeated recovery epochs.
+    var pn: u64 = 1;
+    while (pn <= 20) : (pn += 1) {
+        cc.onPacketsLost(0, pn);
+    }
+
+    try std.testing.expect(cc.congestion_window >= 2 * mtu);
+    try std.testing.expect(cc.ssthresh >= 2 * mtu);
+}
+
+test "ACK after persistent congestion re-enters slow start growth" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    cc.onPersistentCongestion();
+    try std.testing.expectEqual(CongestionState.slow_start, cc.state);
+    const cwnd0 = cc.congestion_window;
+
+    // Slow start should add bytes_acked directly.
+    cc.onPacketAcked(1500, 1);
+    try std.testing.expectEqual(cwnd0 + 1500, cc.congestion_window);
+    try std.testing.expectEqual(CongestionState.slow_start, cc.state);
+}
