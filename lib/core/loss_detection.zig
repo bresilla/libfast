@@ -839,6 +839,53 @@ test "ACKing unsent packet number advances largest_acked and may declare thresho
     try std.testing.expectEqual(@as(usize, 0), ld.application.sent_packets.items.len);
     try std.testing.expectEqual(@as(?u64, 99), ld.application.largest_acked);
 }
+
+test "maxObservedPacketNumber combines sent and acknowledged history" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try std.testing.expect(ld.maxObservedPacketNumber(.application) == null);
+
+    try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(6, now, 1200, true));
+    try std.testing.expectEqual(@as(?u64, 6), ld.maxObservedPacketNumber(.application));
+
+    // ACK beyond sent set updates largest_acked and should become max-observed.
+    var ack = try ld.onAckReceived(.application, 9, 0, now);
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u64, 9), ld.maxObservedPacketNumber(.application));
+}
+
+test "explicit ACK list can omit largest_acked packet" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+
+    // largest_acked is 3, but explicit set only includes packet 2.
+    const acked_set = [_]types.PacketNumber{2};
+    var ack = try ld.onAckReceivedWithPacketNumbers(.application, 3, 0, now, &acked_set);
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expect(ack.acked_packet == null);
+    try std.testing.expectEqual(@as(usize, 1), ack.acked_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 2), ack.acked_packets.items[0].packet_number);
+    // Space largest_acked tracks explicitly acknowledged packet numbers.
+    try std.testing.expectEqual(@as(?u64, 2), ld.application.largest_acked);
+}
 pub const AckResult = struct {
     acked_packet: ?SentPacket,
     acked_packets: std.ArrayList(SentPacket),
