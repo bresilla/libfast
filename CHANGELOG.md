@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.0.13] - 2026-03-02
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Enforce strict drain deadline expiry semantics
+
+### <!-- 2 -->🚜 Refactor
+
+- Split connection CID and reset tests into module
+- Split connection retry/VN tests into dedicated module
+- Split connection frame-legality tests into separate file
+
+### <!-- 3 -->📚 Documentation
+
+- Expand README with practical client/server examples
+- Add concise lsquic acknowledgment
+- Thank lsquic project and contributors
+
+### <!-- 6 -->🧪 Testing
+
+- Extend path-validation state transition regressions
+- Add RTT ack-delay boundary and empty-ack regressions
+- Extend recovery gate and persistent-reset model vectors
+- Add strict loss-time threshold boundary regression
+- Add repeated-loss floor and post-reset growth vectors
+- Expand packet bookkeeping and sent-history lifecycle vectors
+- Add MAX_STREAMS and MAX_STREAM_DATA monotonic regressions
+- Add PTO noop and path validation replacement regressions
+- Add ACK-round retransmission queue ordering regression
+- Cover replayed-ack loss frontier progression
+- Add path validation queue and mismatch regressions
+- Add max-observed and explicit-ack-list regressions
+- Add amplification saturation and budget-min regressions
+- Cover PTO non-ack deadline and probe sizing
+- Add PTO probe queue and deadline refresh regressions
+- Add congestion residual-ack and reset-state regressions
+- Add sent-history isolation and unsent-ack semantics
+- Add PTO reset and backoff-cap regressions
+- Add PTO deadline and retransmission ordering regressions
+- Add drain timeout clamp boundary regressions
+- Add ACK ordering and replay idempotence regressions
+- Add recovery exit and window boundary vectors
+- Cover recovery epoch rollover and inflight saturation
+- Add congestion avoidance ack-growth vector
+- Add congestion lifecycle stability regression
+- Add mixed ACK-loss send lifecycle regression
+- Add packet bookkeeping interop vectors
+- Add packet buffer capacity ladder interop vectors
+- Add lsquic stream frame generation vectors
+- Keep latest NEW_TOKEN across multi-frame packet
+- Add lsquic packet header generation vectors
+- Add lsquic RTT progression parity vector
+- Add ack-merge duplicate packet regression
+- Add lsquic varint and ACK capacity interop vectors
+- Expand interop module with ACK and short-header truncation
+- Add malformed VN vectors to interop module
+- Add dedicated lsquic interop vector module
+- Add lsquic-style control-frame truncation matrix
+- Add lsquic-style ACK truncation corpus
+- Add lsquic-style packet truncation decode corpus
+- Extend lsquic ACK sparse and packet-number vectors
+- Extend malformed packet corpus for oversized CID lengths
+- Add lsquic ACK and packet-number compatibility vectors
+- Add lsquic compatibility vectors for varint and VN
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Gate live lsquic interop behind env toggle
+
+### Build
+
+- Add optional live lsquic interop harness target
+
 ## [0.0.12] - 2026-03-01
 
 ### <!-- 0 -->⛰️  Features
