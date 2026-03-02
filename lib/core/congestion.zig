@@ -619,3 +619,47 @@ test "ACK after persistent congestion re-enters slow start growth" {
     try std.testing.expectEqual(cwnd0 + 1500, cc.congestion_window);
     try std.testing.expectEqual(CongestionState.slow_start, cc.state);
 }
+
+test "Recovery ACK gate blocks growth until packet number passes recovery end" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    // Enter recovery with end packet set to 30.
+    cc.onPacketAcked(6000, 1);
+    cc.onPacketsLost(1000, 30);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    const cwnd_recovery = cc.congestion_window;
+
+    // ACK at/under recovery end should not grow cwnd.
+    cc.onPacketAcked(2000, 29);
+    try std.testing.expectEqual(cwnd_recovery, cc.congestion_window);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+
+    cc.onPacketAcked(2000, 30);
+    try std.testing.expectEqual(cwnd_recovery, cc.congestion_window);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+
+    // First ACK above recovery end exits recovery and can grow again.
+    cc.onPacketAcked(2000, 31);
+    try std.testing.expect(cc.state != .recovery);
+    try std.testing.expect(cc.congestion_window >= cwnd_recovery);
+}
+
+test "Persistent congestion reset is idempotent" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    cc.onPacketAcked(20000, 1);
+    cc.onPacketsLost(1000, 10);
+
+    cc.onPersistentCongestion();
+    const cwnd_after_first = cc.congestion_window;
+    const state_after_first = cc.state;
+    const ssthresh_after_first = cc.ssthresh;
+
+    cc.onPersistentCongestion();
+    try std.testing.expectEqual(cwnd_after_first, cc.congestion_window);
+    try std.testing.expectEqual(state_after_first, cc.state);
+    try std.testing.expectEqual(ssthresh_after_first, cc.ssthresh);
+    try std.testing.expectEqual(@as(u64, 2 * mtu), cc.congestion_window);
+}
