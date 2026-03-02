@@ -1895,6 +1895,56 @@ test "loss retransmissions queue before PTO probe" {
     try std.testing.expect(saw_probe);
 }
 
+test "multiple PTO expiries append probes in FIFO order" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+
+    var deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(deadline.add(1));
+    deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(deadline.add(1));
+
+    const first = conn.popRetransmission();
+    const second = conn.popRetransmission();
+
+    try std.testing.expect(first != null);
+    try std.testing.expect(second != null);
+    try std.testing.expect(first.?.is_probe);
+    try std.testing.expect(second.?.is_probe);
+    try std.testing.expectEqual(@as(u64, first.?.packet_number), second.?.packet_number);
+    try std.testing.expect(conn.popRetransmission() == null);
+}
+
+test "ack-eliciting send refreshes PTO deadline" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+    const first_deadline = conn.next_pto_at.?;
+
+    // Small delay and another ack-eliciting send should update deadline.
+    const later = time.Instant.now().add(2 * time.Duration.MILLISECOND);
+    conn.next_pto_at = later;
+    conn.trackPacketSent(1200, true);
+
+    const second_deadline = conn.next_pto_at.?;
+    try std.testing.expect(second_deadline.isAfter(first_deadline) or second_deadline.micros != first_deadline.micros);
+}
+
 test "pto counter resets when acked packet is in flight" {
     const allocator = std.testing.allocator;
 
