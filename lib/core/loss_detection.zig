@@ -663,6 +663,45 @@ test "Packet number space isolation" {
     try std.testing.expectEqual(@as(usize, 1), ld.handshake.sent_packets.items.len);
     try std.testing.expectEqual(@as(usize, 0), ld.application.sent_packets.items.len);
 }
+
+test "send control lifecycle stays stable across mixed ACK and loss rounds" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    // Initial send burst.
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(5, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(6, now, 1200, true));
+
+    const acked_round1 = [_]types.PacketNumber{ 2, 4, 6 };
+    var round1 = try ld.onAckReceivedWithPacketNumbers(.application, 6, 0, now, &acked_round1);
+    defer round1.acked_packets.deinit(allocator);
+    defer round1.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), round1.acked_packets.items.len);
+    // Packet threshold declares packet 1 lost when largest_acked is 6.
+    try std.testing.expectEqual(@as(usize, 1), round1.lost_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), round1.lost_packets.items[0].packet_number);
+
+    // Remaining outstanding packets should be 3 and 5.
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
+
+    var round2 = try ld.onAckReceived(.application, 5, 0, now);
+    defer round2.acked_packets.deinit(allocator);
+    defer round2.lost_packets.deinit(allocator);
+
+    try std.testing.expect(round2.acked_packet != null);
+    try std.testing.expectEqual(@as(?u64, 5), if (round2.acked_packet) |p| p.packet_number else null);
+    try std.testing.expectEqual(@as(usize, 1), ld.application.sent_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 3), ld.application.sent_packets.items[0].packet_number);
+}
 pub const AckResult = struct {
     acked_packet: ?SentPacket,
     acked_packets: std.ArrayList(SentPacket),
