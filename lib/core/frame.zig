@@ -1267,6 +1267,67 @@ test "ack frame decode rejects truncated ECN counts" {
     try std.testing.expectError(error.UnexpectedEof, AckFrame.decode(buf[0 .. len - 1]));
 }
 
+test "ack frame decode rejects truncation across ACK range section" {
+    var buf: [256]u8 = undefined;
+    const frame = AckFrame{
+        .largest_acked = 600,
+        .ack_delay = 3,
+        .first_ack_range = 5,
+        .ack_ranges = &[_]AckFrame.AckRange{
+            .{ .gap = 1, .ack_range_length = 2 },
+            .{ .gap = 3, .ack_range_length = 4 },
+            .{ .gap = 5, .ack_range_length = 6 },
+        },
+        .ecn_counts = null,
+    };
+
+    const len = try frame.encode(&buf);
+    var ranges: [8]AckFrame.AckRange = undefined;
+
+    var cut: usize = 1;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, AckFrame.decodeWithAckRanges(buf[0..cut], &ranges));
+    }
+
+    const decoded = try AckFrame.decodeWithAckRanges(buf[0..len], &ranges);
+    try std.testing.expectEqual(@as(usize, 3), decoded.frame.ack_ranges.len);
+}
+
+test "ack frame decode rejects all ECN tail truncation variants" {
+    var with_ecn_buf: [128]u8 = undefined;
+    const with_ecn = AckFrame{
+        .largest_acked = 9,
+        .ack_delay = 1,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = AckFrame.EcnCounts{
+            .ect0_count = 1,
+            .ect1_count = 2,
+            .ecn_ce_count = 3,
+        },
+    };
+    const with_ecn_len = try with_ecn.encode(&with_ecn_buf);
+
+    var no_ecn_buf: [128]u8 = undefined;
+    const no_ecn = AckFrame{
+        .largest_acked = 9,
+        .ack_delay = 1,
+        .first_ack_range = 0,
+        .ack_ranges = &.{},
+        .ecn_counts = null,
+    };
+    const no_ecn_len = try no_ecn.encode(&no_ecn_buf);
+
+    // Every prefix that includes ACK fields but not full ECN tail must fail.
+    var cut: usize = no_ecn_len;
+    while (cut < with_ecn_len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, AckFrame.decode(with_ecn_buf[0..cut]));
+    }
+
+    const decoded = try AckFrame.decode(with_ecn_buf[0..with_ecn_len]);
+    try std.testing.expect(decoded.frame.ecn_counts != null);
+}
+
 test "ack frame decode reports ack range output overflow" {
     var buf: [128]u8 = undefined;
     const frame = AckFrame{
@@ -1283,6 +1344,74 @@ test "ack frame decode reports ack range output overflow" {
     const len = try frame.encode(&buf);
     var ranges: [1]AckFrame.AckRange = undefined;
     try std.testing.expectError(error.BufferTooSmall, AckFrame.decodeWithAckRanges(buf[0..len], &ranges));
+}
+
+test "ack frame decode supports lsquic-scale range vectors" {
+    var ranges_in: [256]AckFrame.AckRange = undefined;
+    for (ranges_in[0..], 0..) |*range, i| {
+        range.* = .{
+            .gap = @as(u64, @intCast(i % 2)),
+            .ack_range_length = @as(u64, @intCast(i % 3)),
+        };
+    }
+
+    // Ensure the full range chain remains valid under decode invariants.
+    var current_smallest: u64 = 5_000;
+    const first_ack_range: u64 = 200;
+    current_smallest -= first_ack_range;
+    for (ranges_in) |range| {
+        const step = range.gap + 2;
+        current_smallest -= step;
+        current_smallest -= range.ack_range_length;
+    }
+
+    const frame = AckFrame{
+        .largest_acked = 5_000,
+        .ack_delay = 0,
+        .first_ack_range = first_ack_range,
+        .ack_ranges = ranges_in[0..],
+        .ecn_counts = null,
+    };
+
+    var buf: [4096]u8 = undefined;
+    const len = try frame.encode(&buf);
+
+    var decoded_ranges: [256]AckFrame.AckRange = undefined;
+    const decoded = try AckFrame.decodeWithAckRanges(buf[0..len], &decoded_ranges);
+    try std.testing.expectEqual(@as(usize, 256), decoded.frame.ack_ranges.len);
+
+    var small_out: [255]AckFrame.AckRange = undefined;
+    try std.testing.expectError(error.BufferTooSmall, AckFrame.decodeWithAckRanges(buf[0..len], &small_out));
+}
+
+test "ack frame decode supports lsquic sparse history pattern" {
+    var ranges_in: [256]AckFrame.AckRange = undefined;
+    for (&ranges_in) |*range| {
+        range.* = .{
+            .gap = 8,
+            .ack_range_length = 0,
+        };
+    }
+
+    const frame = AckFrame{
+        .largest_acked = 3_000,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_ranges = ranges_in[0..],
+        .ecn_counts = null,
+    };
+
+    var buf: [4096]u8 = undefined;
+    const len = try frame.encode(&buf);
+
+    var decoded_ranges: [256]AckFrame.AckRange = undefined;
+    const decoded = try AckFrame.decodeWithAckRanges(buf[0..len], &decoded_ranges);
+    try std.testing.expectEqual(@as(usize, 256), decoded.frame.ack_ranges.len);
+
+    for (decoded.frame.ack_ranges) |range| {
+        try std.testing.expectEqual(@as(u64, 8), range.gap);
+        try std.testing.expectEqual(@as(u64, 0), range.ack_range_length);
+    }
 }
 
 test "new connection id decode rejects invalid cid lengths" {
@@ -1322,6 +1451,43 @@ test "new connection id decode rejects truncated reset token" {
     try std.testing.expectError(error.UnexpectedEof, NewConnectionIdFrame.decode(buf[0 .. len - 3]));
 }
 
+test "new connection id decode rejects lsquic-style prefix truncation matrix" {
+    var buf: [256]u8 = undefined;
+    const cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4, 5, 6 });
+    const frame = NewConnectionIdFrame{
+        .sequence_number = 9,
+        .retire_prior_to = 3,
+        .connection_id = cid,
+        .stateless_reset_token = [_]u8{0xCC} ** 16,
+    };
+
+    const len = try frame.encode(&buf);
+
+    var cut: usize = 0;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, NewConnectionIdFrame.decode(buf[0..cut]));
+    }
+
+    const decoded = try NewConnectionIdFrame.decode(buf[0..len]);
+    try std.testing.expectEqual(@as(u64, 9), decoded.frame.sequence_number);
+    try std.testing.expectEqual(@as(u64, 3), decoded.frame.retire_prior_to);
+    try std.testing.expect(decoded.frame.connection_id.eql(&cid));
+}
+
+test "new token decode rejects lsquic-style prefix truncation matrix" {
+    var buf: [128]u8 = undefined;
+    const frame = NewTokenFrame{ .token = "token-material-123" };
+    const len = try frame.encode(&buf);
+
+    var cut: usize = 0;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, NewTokenFrame.decode(buf[0..cut]));
+    }
+
+    const decoded = try NewTokenFrame.decode(buf[0..len]);
+    try std.testing.expectEqualStrings("token-material-123", decoded.frame.token);
+}
+
 test "connection close decode rejects truncated reason length varint" {
     // 0x1d, error_code=0, reason_len starts with 2-byte varint prefix but truncated.
     try std.testing.expectError(
@@ -1336,6 +1502,44 @@ test "connection close decode rejects truncated reason bytes" {
         error.UnexpectedEof,
         ConnectionCloseFrame.decode(&[_]u8{ 0x1d, 0x00, 0x03, 'x' }),
     );
+}
+
+test "connection close decode rejects lsquic-style prefix truncation matrix" {
+    var transport_buf: [128]u8 = undefined;
+    const transport_close = ConnectionCloseFrame{
+        .error_code = 42,
+        .frame_type = 0x10,
+        .reason = "transport-close",
+    };
+    const transport_len = try transport_close.encode(&transport_buf);
+
+    var app_buf: [128]u8 = undefined;
+    const app_close = ConnectionCloseFrame{
+        .error_code = 7,
+        .frame_type = null,
+        .reason = "app-close",
+    };
+    const app_len = try app_close.encode(&app_buf);
+
+    var cut: usize = 0;
+    while (cut < transport_len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(transport_buf[0..cut]));
+    }
+
+    cut = 0;
+    while (cut < app_len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, ConnectionCloseFrame.decode(app_buf[0..cut]));
+    }
+
+    const transport_decoded = try ConnectionCloseFrame.decode(transport_buf[0..transport_len]);
+    try std.testing.expectEqual(@as(u64, 42), transport_decoded.frame.error_code);
+    try std.testing.expectEqual(@as(?u64, 0x10), transport_decoded.frame.frame_type);
+    try std.testing.expectEqualStrings("transport-close", transport_decoded.frame.reason);
+
+    const app_decoded = try ConnectionCloseFrame.decode(app_buf[0..app_len]);
+    try std.testing.expectEqual(@as(u64, 7), app_decoded.frame.error_code);
+    try std.testing.expectEqual(@as(?u64, null), app_decoded.frame.frame_type);
+    try std.testing.expectEqualStrings("app-close", app_decoded.frame.reason);
 }
 
 test "frame decode malformed corpus" {

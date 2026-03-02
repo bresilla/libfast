@@ -71,9 +71,29 @@ pub fn main() !void {
     defer conn.deinit();
 
     // Connect and use streams
-    try conn.connect("192.0.2.1:4433");
-    var stream = try conn.openStream();
-    try stream.write("Hello, QUIC!");
+    try conn.connect("192.0.2.1", 4433);
+
+    // Your app drives progress by polling.
+    while (true) {
+        try conn.poll();
+
+        while (conn.nextEvent()) |ev| switch (ev) {
+            .connected => {
+                const sid = try conn.openStream(true);
+                _ = try conn.streamWrite(sid, "Hello over QUIC", .no_finish);
+            },
+            .stream_readable => |sid| {
+                var buf: [1024]u8 = undefined;
+                const n = try conn.streamRead(sid, &buf);
+                std.debug.print("stream {} read {s}\n", .{ sid, buf[0..n] });
+            },
+            .closing => |c| {
+                std.debug.print("closing: {d} {s}\n", .{ c.error_code, c.reason });
+            },
+            .closed => return,
+            else => {},
+        };
+    }
 }
 ```
 
@@ -86,6 +106,30 @@ const config = libfast.QuicConfig.tlsClient("server.example.com");
 // Same API - just different crypto mode
 var conn = try libfast.QuicConnection.init(allocator, config);
 // ... rest is identical
+```
+
+### Usage Example (Server Loop)
+
+```zig
+const config = libfast.QuicConfig.sshServer("obfuscation-keyword");
+var conn = try libfast.QuicConnection.init(allocator, config);
+defer conn.deinit();
+
+try conn.accept("0.0.0.0", 4433);
+
+while (true) {
+    try conn.poll();
+
+    while (conn.nextEvent()) |ev| switch (ev) {
+        .stream_readable => |sid| {
+            var buf: [2048]u8 = undefined;
+            const n = try conn.streamRead(sid, &buf);
+            _ = try conn.streamWrite(sid, buf[0..n], .no_finish); // echo
+        },
+        .closed => return,
+        else => {},
+    };
+}
 ```
 
 ## Project Structure
@@ -136,12 +180,17 @@ lib/
 
 Build the library:
 ```bash
-zig build
+make build
 ```
 
 Run tests:
 ```bash
-zig build test
+make test
+```
+
+Run dual-mode regression tests:
+```bash
+make test-dual-mode
 ```
 
 Run examples:
@@ -154,7 +203,7 @@ zig build run-tls-client
 
 ## Testing
 
-200+ unit tests covering:
+500+ unit tests covering:
 - Core protocol (packets, frames, streams)
 - SSH crypto (obfuscation, key exchange)
 - TLS crypto (handshake, key schedule)
@@ -190,12 +239,11 @@ zig build test --summary all
 - Documentation
 
 ### Future Enhancements
-- Path validation and migration
-- Full integration testing
-- Performance optimization
-- Interoperability testing
-- TLS certificate validation
-- Out-of-order packet buffering
+- Congestion-control model expansion (Cubic/BW-sampler parity vectors)
+- Additional live interop lanes and environment matrix coverage
+- Performance profiling and optimization
+- TLS certificate validation hardening
+- Extended end-to-end scenario testing
 
 ## Dependencies
 

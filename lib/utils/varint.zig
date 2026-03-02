@@ -250,6 +250,41 @@ test "varint decode malformed corpus" {
     }
 }
 
+test "varint lsquic compatibility vectors" {
+    const vectors = [_]struct {
+        encoded: []const u8,
+        value: u64,
+        canonical: bool,
+    }{
+        .{ .encoded = &[_]u8{0x25}, .value = 0x25, .canonical = true },
+        .{ .encoded = &[_]u8{ 0x40, 0x25 }, .value = 0x25, .canonical = false },
+        .{ .encoded = &[_]u8{ 0x9D, 0x7F, 0x3E, 0x7D }, .value = 494878333, .canonical = true },
+        .{ .encoded = &[_]u8{ 0xC2, 0x19, 0x7C, 0x5E, 0xFF, 0x14, 0xE8, 0x8C }, .value = 151288809941952652, .canonical = true },
+    };
+
+    for (vectors) |vector| {
+        const decoded = try decode(vector.encoded);
+        try std.testing.expectEqual(vector.value, decoded.value);
+        try std.testing.expectEqual(@as(u8, @intCast(vector.encoded.len)), decoded.len);
+
+        var out: [8]u8 = undefined;
+        const encoded_len = try encode(vector.value, &out);
+        try std.testing.expectEqual(encodedLen(vector.value), encoded_len);
+
+        const decoded_roundtrip = try decode(out[0..encoded_len]);
+        try std.testing.expectEqual(vector.value, decoded_roundtrip.value);
+
+        if (vector.canonical) {
+            try std.testing.expectEqual(@as(usize, encoded_len), vector.encoded.len);
+            try std.testing.expectEqualSlices(u8, vector.encoded, out[0..encoded_len]);
+        }
+    }
+
+    try std.testing.expectError(error.UnexpectedEof, decode(&[_]u8{0x40}));
+    try std.testing.expectError(error.UnexpectedEof, decode(&[_]u8{ 0x9D, 0x7F }));
+    try std.testing.expectError(error.UnexpectedEof, decode(&[_]u8{ 0xC2, 0x19, 0x7C, 0x5E, 0xFF, 0x14, 0xE8 }));
+}
+
 test "varint decode fuzz smoke" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     const rand = prng.random();

@@ -1,4 +1,4 @@
-.PHONY: build test test-dual-mode ci install
+.PHONY: build test test-dual-mode interop-live ci install
 
 build:
 	zig build -Doptimize=ReleaseFast
@@ -9,9 +9,13 @@ test:
 test-dual-mode:
 	zig build test-dual-mode-regression --summary all
 
+interop-live:
+	./tools/lsquic_live_interop.sh
+
 ci:
 	zig build test-dual-mode-regression --summary all
 	zig build test --summary all
+	@if [ "$(LIBFAST_RUN_LIVE_INTEROP)" = "1" ]; then ./tools/lsquic_live_interop.sh; else echo "Skipping live LSQUIC interop (set LIBFAST_RUN_LIVE_INTEROP=1 to enable)"; fi
 	zig build -Doptimize=ReleaseFast
 
 install: build

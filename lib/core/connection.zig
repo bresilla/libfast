@@ -1229,6 +1229,29 @@ test "connection applies MAX_STREAMS updates" {
     try std.testing.expectEqual(@as(u64, 4), conn.streams.max_local_streams_bidi);
 }
 
+test "connection ignores decreasing MAX_STREAMS updates" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.streams.setLocalOpenLimits(2, 3);
+
+    conn.onMaxStreams(true, 10);
+    conn.onMaxStreams(false, 8);
+    try std.testing.expectEqual(@as(u64, 10), conn.streams.max_local_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 8), conn.streams.max_local_streams_uni);
+
+    // Decreasing values must be ignored.
+    conn.onMaxStreams(true, 4);
+    conn.onMaxStreams(false, 6);
+    try std.testing.expectEqual(@as(u64, 10), conn.streams.max_local_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 8), conn.streams.max_local_streams_uni);
+}
+
 test "connection applies MAX_STREAM_DATA updates" {
     const allocator = std.testing.allocator;
 
@@ -1243,6 +1266,30 @@ test "connection applies MAX_STREAM_DATA updates" {
     const before = conn.getStream(sid).?.max_stream_data_remote;
     conn.onMaxStreamData(sid, before + 5000);
     try std.testing.expectEqual(before + 5000, conn.getStream(sid).?.max_stream_data_remote);
+}
+
+test "connection ignores decreasing MAX_STREAM_DATA and unknown stream updates" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    const sid = try conn.openStream(true);
+    const before = conn.getStream(sid).?.max_stream_data_remote;
+
+    conn.onMaxStreamData(sid, before - 1);
+    try std.testing.expectEqual(before, conn.getStream(sid).?.max_stream_data_remote);
+
+    conn.onMaxStreamData(sid, before + 1024);
+    try std.testing.expectEqual(before + 1024, conn.getStream(sid).?.max_stream_data_remote);
+
+    // Unknown stream ID should be ignored and must not affect existing stream.
+    conn.onMaxStreamData(999, before + 99999);
+    try std.testing.expectEqual(before + 1024, conn.getStream(sid).?.max_stream_data_remote);
 }
 
 test "connection tracks peer blocked frame observations" {
@@ -1575,6 +1622,61 @@ test "connection enforces server amplification budget before validation" {
     try std.testing.expect(conn.availableSendBudget() > 500);
 }
 
+test "server amplification budget saturates safely on large received bytes" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.max_data_remote = std.math.maxInt(u64);
+    conn.congestion_controller.congestion_window = std.math.maxInt(u64);
+    conn.congestion_controller.bytes_in_flight = 0;
+    conn.data_received = std.math.maxInt(u64);
+    conn.data_sent = 0;
+
+    // Amplification budget path should saturate, not overflow.
+    try std.testing.expectEqual(std.math.maxInt(u64), conn.availableSendBudget());
+}
+
+test "available send budget is minimum of flow congestion amplification" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.markEstablished();
+
+    // Configure independent ceilings:
+    // flow budget: 5000 - 1000 = 4000
+    conn.max_data_remote = 5000;
+    conn.data_sent = 1000;
+
+    // congestion budget: 900
+    conn.congestion_controller.congestion_window = 1900;
+    conn.congestion_controller.bytes_in_flight = 1000;
+
+    // amplification budget (server, not validated): 3*700 - 1000 = 1100
+    conn.peer_validated = false;
+    conn.data_received = 700;
+
+    try std.testing.expectEqual(@as(u64, 900), conn.availableSendBudget());
+
+    // Raise congestion budget; amplification should become the bottleneck.
+    conn.congestion_controller.congestion_window = 5000;
+    conn.congestion_controller.bytes_in_flight = 1000;
+    try std.testing.expectEqual(@as(u64, 1100), conn.availableSendBudget());
+
+    // Validate peer; amplification cap disappears, flow should be bottleneck.
+    conn.markPeerValidated();
+    try std.testing.expectEqual(@as(u64, 4000), conn.availableSendBudget());
+}
+
 test "connection ack integrates congestion accounting" {
     const allocator = std.testing.allocator;
 
@@ -1730,6 +1832,47 @@ test "connection drain timeout derives from PTO" {
     try std.testing.expect(timeout <= 30 * time.Duration.SECOND);
 }
 
+test "connection drain timeout enforces lower clamp" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.loss_detection.rtt_stats.smoothed_rtt = 1;
+    conn.loss_detection.rtt_stats.rttvar = 0;
+    conn.remote_params = null;
+
+    try std.testing.expectEqual(
+        @as(u64, 50 * time.Duration.MILLISECOND),
+        conn.drainTimeoutDuration(),
+    );
+}
+
+test "connection drain timeout enforces upper clamp" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.loss_detection.rtt_stats.smoothed_rtt = 20 * time.Duration.SECOND;
+    conn.loss_detection.rtt_stats.rttvar = 20 * time.Duration.SECOND;
+
+    var params = types.TransportParameters{};
+    params.max_ack_delay = 60_000; // 60s equivalent in ms
+    conn.remote_params = params;
+
+    try std.testing.expectEqual(
+        @as(u64, 30 * time.Duration.SECOND),
+        conn.drainTimeoutDuration(),
+    );
+}
+
 test "connection ack with ranges keeps recovery path stable" {
     const allocator = std.testing.allocator;
 
@@ -1776,6 +1919,117 @@ test "connection schedules retransmission for lost packets" {
     try std.testing.expect(!retransmit.?.is_probe);
 }
 
+test "replaying ACK advances loss frontier without requeueing already lost packet" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(900, true); // pn 0
+    conn.trackPacketSent(1000, true); // pn 1
+    conn.trackPacketSent(1100, true); // pn 2
+    conn.trackPacketSent(1200, true); // pn 3
+    conn.trackPacketSent(1300, true); // pn 4
+
+    // First ACK induces loss-driven retransmission scheduling.
+    conn.processAckDetailed(4, 0);
+
+    var first_count: usize = 0;
+    var saw_zero = false;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        if (req.packet_number == 0) saw_zero = true;
+        first_count += 1;
+    }
+    try std.testing.expect(first_count > 0);
+    try std.testing.expect(saw_zero);
+
+    // Replaying identical ACK should not enqueue duplicates.
+    conn.processAckDetailed(4, 0);
+
+    var replay_count: usize = 0;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        // Packet #0 was already scheduled in first round.
+        try std.testing.expect(req.packet_number != 0);
+        replay_count += 1;
+    }
+    try std.testing.expect(replay_count > 0);
+}
+
+test "loss retransmission queue preserves round ordering across ACK rounds" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        conn.trackPacketSent(1200, true); // pn 0..8
+    }
+
+    // Round 1: ack pn=4 -> threshold loss should schedule pn=0.
+    conn.processAckDetailed(4, 0);
+
+    // Round 2: ack pn=8 -> threshold loss should schedule pn=1,2,3.
+    conn.processAckDetailed(8, 0);
+
+    const first = conn.popRetransmission();
+    try std.testing.expect(first != null);
+    try std.testing.expect(!first.?.is_probe);
+
+    // The first enqueued retransmission from round 1 must remain at queue head.
+    try std.testing.expectEqual(@as(u64, 0), first.?.packet_number);
+
+    var saw_additional = false;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        // Round-2 scheduling should not requeue already-lost pn=0.
+        try std.testing.expect(req.packet_number != 0);
+        saw_additional = true;
+    }
+    try std.testing.expect(saw_additional);
+}
+
+test "loss retransmission bookkeeping preserves original packet sizes" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(777, true); // pn 0
+    conn.trackPacketSent(888, true); // pn 1
+    conn.trackPacketSent(999, true); // pn 2
+    conn.trackPacketSent(1111, true); // pn 3
+    conn.trackPacketSent(1222, true); // pn 4
+
+    // ACK largest packet to force threshold loss scheduling for older packets.
+    conn.processAckDetailed(4, 0);
+
+    var saw_777 = false;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        if (req.packet_number == 0) {
+            saw_777 = true;
+            try std.testing.expectEqual(@as(usize, 777), req.size);
+        }
+    }
+
+    try std.testing.expect(saw_777);
+}
+
 test "connection schedules PTO probe" {
     const allocator = std.testing.allocator;
 
@@ -1796,6 +2050,169 @@ test "connection schedules PTO probe" {
     try std.testing.expect(probe != null);
     try std.testing.expect(probe.?.is_probe);
     try std.testing.expect(conn.pto_count > 0);
+}
+
+test "connection ignores PTO trigger before deadline" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+    const deadline = conn.next_pto_at.?;
+
+    conn.onPtoTimeout(deadline.sub(1));
+
+    try std.testing.expectEqual(@as(u32, 0), conn.pto_count);
+    try std.testing.expect(conn.popRetransmission() == null);
+    try std.testing.expectEqual(deadline.micros, conn.next_pto_at.?.micros);
+}
+
+test "onPtoTimeout is no-op when deadline is not armed" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    try std.testing.expect(conn.next_pto_at == null);
+    conn.onPtoTimeout(time.Instant.now());
+
+    try std.testing.expectEqual(@as(u32, 0), conn.pto_count);
+    try std.testing.expect(conn.next_pto_at == null);
+    try std.testing.expect(conn.popRetransmission() == null);
+}
+
+test "loss retransmissions queue before PTO probe" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        conn.trackPacketSent(1200, true);
+    }
+
+    // Ack newest packet, which creates threshold-based loss retransmissions.
+    conn.processAckDetailed(7, 0);
+
+    const deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(deadline.add(1));
+
+    var saw_probe = false;
+    var non_probe_count: usize = 0;
+
+    while (conn.popRetransmission()) |req| {
+        if (req.is_probe) {
+            saw_probe = true;
+            break;
+        }
+        non_probe_count += 1;
+    }
+
+    try std.testing.expect(non_probe_count > 0);
+    try std.testing.expect(saw_probe);
+}
+
+test "multiple PTO expiries append probes in FIFO order" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+
+    var deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(deadline.add(1));
+    deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(deadline.add(1));
+
+    const first = conn.popRetransmission();
+    const second = conn.popRetransmission();
+
+    try std.testing.expect(first != null);
+    try std.testing.expect(second != null);
+    try std.testing.expect(first.?.is_probe);
+    try std.testing.expect(second.?.is_probe);
+    try std.testing.expectEqual(@as(u64, first.?.packet_number), second.?.packet_number);
+    try std.testing.expect(conn.popRetransmission() == null);
+}
+
+test "ack-eliciting send refreshes PTO deadline" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+    const first_deadline = conn.next_pto_at.?;
+
+    // Small delay and another ack-eliciting send should update deadline.
+    const later = time.Instant.now().add(2 * time.Duration.MILLISECOND);
+    conn.next_pto_at = later;
+    conn.trackPacketSent(1200, true);
+
+    const second_deadline = conn.next_pto_at.?;
+    try std.testing.expect(second_deadline.isAfter(first_deadline) or second_deadline.micros != first_deadline.micros);
+}
+
+test "non-ack-eliciting send does not refresh PTO deadline" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+    const deadline = conn.next_pto_at.?;
+
+    conn.trackPacketSent(100, false);
+    try std.testing.expectEqual(deadline.micros, conn.next_pto_at.?.micros);
+}
+
+test "PTO probe size follows max_datagram_size" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.congestion_controller.max_datagram_size = 1350;
+    conn.trackPacketSent(1200, true);
+
+    const deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(deadline.add(1));
+
+    const probe = conn.popRetransmission();
+    try std.testing.expect(probe != null);
+    try std.testing.expect(probe.?.is_probe);
+    try std.testing.expectEqual(@as(usize, 1350), probe.?.size);
 }
 
 test "pto counter resets when acked packet is in flight" {
@@ -1819,6 +2236,26 @@ test "pto counter resets when acked packet is in flight" {
 
     try std.testing.expectEqual(@as(u32, 0), conn.pto_count);
     try std.testing.expect(conn.next_pto_at != null);
+}
+
+test "pto counter does not reset when ACK does not match inflight packet" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true); // pn 0
+    const original_deadline = conn.next_pto_at.?;
+    conn.onPtoTimeout(original_deadline.add(1));
+    try std.testing.expect(conn.pto_count > 0);
+
+    // ACK for unsent packet number should not reset PTO counter.
+    conn.processAckDetailed(99, 0);
+    try std.testing.expect(conn.pto_count > 0);
 }
 
 test "non ack-eliciting packet does not arm PTO" {
@@ -1899,6 +2336,43 @@ test "pto backoff grows and remains bounded" {
     try std.testing.expect(conn.pto_count <= 5);
 }
 
+test "pto backoff exponent caps after threshold" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    conn.trackPacketSent(1200, true);
+
+    var deadline = conn.next_pto_at.?;
+    var prev_increment: ?u64 = null;
+    var saturated_increment: ?u64 = null;
+
+    var i: u32 = 0;
+    while (i < 24) : (i += 1) {
+        conn.onPtoTimeout(deadline.add(1));
+        const next = conn.next_pto_at.?;
+        const increment = next.durationSince(deadline);
+
+        if (conn.pto_count == 20) {
+            saturated_increment = increment;
+        } else if (conn.pto_count > 20) {
+            try std.testing.expect(saturated_increment != null);
+            try std.testing.expectEqual(saturated_increment.?, increment);
+        }
+
+        prev_increment = increment;
+        deadline = next;
+    }
+
+    try std.testing.expect(prev_increment != null);
+    try std.testing.expectEqual(@as(u32, 24), conn.pto_count);
+}
+
 test "recovery remains stable under mixed loss and timeout stress" {
     const allocator = std.testing.allocator;
 
@@ -1935,6 +2409,41 @@ test "recovery remains stable under mixed loss and timeout stress" {
     }
 }
 
+test "send-control style lifecycle keeps stable invariants under mixed rounds" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        conn.trackPacketSent(800 + round * 10, true);
+        conn.trackPacketSent(900 + round * 10, true);
+        conn.trackPacketSent(1000 + round * 10, true);
+
+        // Acknowledge latest to drive ACK/loss interplay.
+        const largest = conn.next_packet_number - 1;
+        conn.processAckDetailed(largest, 0);
+
+        if (conn.next_pto_at) |deadline| {
+            conn.onPtoTimeout(deadline.add(1));
+        }
+
+        // Drain queue and verify bookkeeping invariants.
+        while (conn.popRetransmission()) |req| {
+            try std.testing.expect(req.size > 0);
+        }
+
+        try std.testing.expect(conn.congestion_controller.getCongestionWindow() >= 2 * conn.congestion_controller.max_datagram_size);
+        try std.testing.expect(conn.congestion_controller.getBytesInFlight() <= conn.congestion_controller.getCongestionWindow());
+        try std.testing.expect(conn.availableSendBudget() <= conn.max_data_remote);
+    }
+}
+
 test "path challenge queues matching path response" {
     const allocator = std.testing.allocator;
 
@@ -1950,6 +2459,36 @@ test "path challenge queues matching path response" {
     const queued = conn.popPathResponse();
     try std.testing.expect(queued != null);
     try std.testing.expectEqualSlices(u8, &token, &queued.?);
+}
+
+test "path challenge queue preserves FIFO order" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const first = [_]u8{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    const second = [_]u8{ 2, 2, 2, 2, 2, 2, 2, 2 };
+    const third = [_]u8{ 3, 3, 3, 3, 3, 3, 3, 3 };
+
+    try conn.onPathChallenge(first);
+    try conn.onPathChallenge(second);
+    try conn.onPathChallenge(third);
+
+    const pop1 = conn.popPathResponse();
+    const pop2 = conn.popPathResponse();
+    const pop3 = conn.popPathResponse();
+
+    try std.testing.expect(pop1 != null);
+    try std.testing.expect(pop2 != null);
+    try std.testing.expect(pop3 != null);
+    try std.testing.expectEqualSlices(u8, &first, &pop1.?);
+    try std.testing.expectEqualSlices(u8, &second, &pop2.?);
+    try std.testing.expectEqualSlices(u8, &third, &pop3.?);
+    try std.testing.expect(conn.popPathResponse() == null);
 }
 
 test "path response validates peer and lifts amplification cap" {
@@ -1972,4 +2511,106 @@ test "path response validates peer and lifts amplification cap" {
     try std.testing.expect(ok);
     try std.testing.expect(conn.peer_validated);
     try std.testing.expect(conn.availableSendBudget() > 3000);
+}
+
+test "path response mismatch keeps peer unvalidated" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.updateDataReceived(1000);
+    const capped_budget = conn.availableSendBudget();
+    try std.testing.expectEqual(@as(u64, 3000), capped_budget);
+
+    const expected = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const wrong = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 };
+    conn.beginPathValidation(expected);
+    try std.testing.expect(!conn.peer_validated);
+
+    const ok = conn.onPathResponse(wrong);
+    try std.testing.expect(!ok);
+    try std.testing.expect(!conn.peer_validated);
+    try std.testing.expect(conn.expected_path_response != null);
+    try std.testing.expectEqual(capped_budget, conn.availableSendBudget());
+
+    // Correct token should still validate afterward.
+    const ok2 = conn.onPathResponse(expected);
+    try std.testing.expect(ok2);
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.expected_path_response == null);
+}
+
+test "path response without pending challenge is ignored" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.markPeerValidated();
+    const token = [_]u8{ 7, 7, 7, 7, 7, 7, 7, 7 };
+
+    try std.testing.expect(!conn.onPathResponse(token));
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.expected_path_response == null);
+}
+
+test "beginPathValidation reapplies amplification cap until validated" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.updateDataReceived(1000);
+    conn.markPeerValidated();
+    const uncapped = conn.availableSendBudget();
+    try std.testing.expect(uncapped > 3000);
+
+    const token = [_]u8{ 1, 3, 5, 7, 9, 11, 13, 15 };
+    conn.beginPathValidation(token);
+    try std.testing.expect(!conn.peer_validated);
+
+    // Amplification cap should be active again while re-validating path.
+    try std.testing.expectEqual(@as(u64, 3000), conn.availableSendBudget());
+
+    try std.testing.expect(conn.onPathResponse(token));
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.availableSendBudget() >= 3000);
+}
+
+test "beginPathValidation replaces pending expected response token" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    const old_token = [_]u8{ 1, 1, 1, 1, 1, 1, 1, 1 };
+    const new_token = [_]u8{ 9, 9, 9, 9, 9, 9, 9, 9 };
+    conn.beginPathValidation(old_token);
+    conn.beginPathValidation(new_token);
+
+    try std.testing.expect(!conn.peer_validated);
+    try std.testing.expect(conn.expected_path_response != null);
+    try std.testing.expectEqualSlices(u8, &new_token, &conn.expected_path_response.?);
+
+    // Old token must no longer validate.
+    try std.testing.expect(!conn.onPathResponse(old_token));
+    try std.testing.expect(!conn.peer_validated);
+
+    // New token validates and clears expectation.
+    try std.testing.expect(conn.onPathResponse(new_token));
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.expected_path_response == null);
 }

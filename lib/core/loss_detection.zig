@@ -444,6 +444,34 @@ test "RTT stats multiple samples" {
     try std.testing.expectEqual(@as(u64, 100 * time_mod.Duration.MILLISECOND), rtt_stats.min_rtt);
 }
 
+test "RTT stats matches lsquic reference progression" {
+    var rtt_stats = RttStats.init();
+
+    // LSQUIC test_rtt.c vector #1: 1 second sample.
+    rtt_stats.updateRtt(1_000_000, 0);
+    try std.testing.expectEqual(@as(u64, 1_000_000), rtt_stats.smoothed_rtt);
+
+    // LSQUIC test_rtt.c vector #2: 0.5 second sample -> srtt = 937500.
+    rtt_stats.updateRtt(500_000, 0);
+    try std.testing.expectEqual(@as(u64, 937_500), rtt_stats.smoothed_rtt);
+}
+
+test "RTT ack-delay adjustment uses strict boundary" {
+    var rtt_stats = RttStats.init();
+
+    // First sample sets min_rtt.
+    rtt_stats.updateRtt(1_000_000, 0);
+    try std.testing.expectEqual(@as(u64, 1_000_000), rtt_stats.min_rtt);
+
+    // Exactly min_rtt + ack_delay should not subtract ack_delay.
+    rtt_stats.updateRtt(1_100_000, 100_000);
+    const srtt_at_boundary = rtt_stats.smoothed_rtt;
+
+    // One microsecond above boundary should subtract ack_delay.
+    rtt_stats.updateRtt(1_100_001, 100_000);
+    try std.testing.expect(rtt_stats.smoothed_rtt < srtt_at_boundary);
+}
+
 test "RTT stats PTO calculation" {
     var rtt_stats = RttStats.init();
     rtt_stats.updateRtt(100 * time_mod.Duration.MILLISECOND, 0);
@@ -541,6 +569,32 @@ test "ACK processing with multiple packet numbers" {
     try std.testing.expectEqual(@as(usize, 2), ack_result.acked_packets.items.len);
 }
 
+test "ACK processing ignores duplicate packet numbers in one ACK set" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+
+    // Packet 2 appears twice; it must only be acknowledged once.
+    const acked_numbers = [_]types.PacketNumber{ 2, 2, 3 };
+    var ack_result = try ld.onAckReceivedWithPacketNumbers(.application, 3, 0, now, &acked_numbers);
+    defer ack_result.acked_packets.deinit(allocator);
+    defer ack_result.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?types.PacketNumber, 3), if (ack_result.acked_packet) |p| p.packet_number else null);
+    try std.testing.expectEqual(@as(usize, 2), ack_result.acked_packets.items.len);
+
+    // Only packet 1 remains outstanding.
+    try std.testing.expectEqual(@as(usize, 1), ld.application.sent_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), ld.application.sent_packets.items[0].packet_number);
+}
+
 test "RTT ack delay does not underflow below min_rtt" {
     var rtt_stats = RttStats.init();
 
@@ -599,6 +653,34 @@ test "Loss detection by time threshold" {
     try std.testing.expect(ack_result.lost_packets.items.len >= 1);
 }
 
+test "Loss detection time threshold uses strict greater-than" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const base = time_mod.Instant.now();
+    try ld.onPacketSent(.application, SentPacket.init(1, base, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, base, 1200, true));
+
+    var first_ack = try ld.onAckReceived(.application, 2, 0, base);
+    defer first_ack.acked_packets.deinit(allocator);
+    defer first_ack.lost_packets.deinit(allocator);
+
+    const loss_delay = (ld.rtt_stats.smoothed_rtt * ld.time_threshold) / 8;
+
+    var at_threshold = try ld.onAckReceived(.application, 2, 0, base.add(loss_delay));
+    defer at_threshold.acked_packets.deinit(allocator);
+    defer at_threshold.lost_packets.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), at_threshold.lost_packets.items.len);
+
+    var after_threshold = try ld.onAckReceived(.application, 2, 0, base.add(loss_delay + 1));
+    defer after_threshold.acked_packets.deinit(allocator);
+    defer after_threshold.lost_packets.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), after_threshold.lost_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), after_threshold.lost_packets.items[0].packet_number);
+}
+
 test "Packet number space isolation" {
     const allocator = std.testing.allocator;
 
@@ -624,6 +706,270 @@ test "Packet number space isolation" {
     try std.testing.expectEqual(@as(usize, 1), ld.initial.sent_packets.items.len);
     try std.testing.expectEqual(@as(usize, 1), ld.handshake.sent_packets.items.len);
     try std.testing.expectEqual(@as(usize, 0), ld.application.sent_packets.items.len);
+}
+
+test "send control lifecycle stays stable across mixed ACK and loss rounds" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    // Initial send burst.
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(5, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(6, now, 1200, true));
+
+    const acked_round1 = [_]types.PacketNumber{ 2, 4, 6 };
+    var round1 = try ld.onAckReceivedWithPacketNumbers(.application, 6, 0, now, &acked_round1);
+    defer round1.acked_packets.deinit(allocator);
+    defer round1.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), round1.acked_packets.items.len);
+    // Packet threshold declares packet 1 lost when largest_acked is 6.
+    try std.testing.expectEqual(@as(usize, 1), round1.lost_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), round1.lost_packets.items[0].packet_number);
+
+    // Remaining outstanding packets should be 3 and 5.
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
+
+    var round2 = try ld.onAckReceived(.application, 5, 0, now);
+    defer round2.acked_packets.deinit(allocator);
+    defer round2.lost_packets.deinit(allocator);
+
+    try std.testing.expect(round2.acked_packet != null);
+    try std.testing.expectEqual(@as(?u64, 5), if (round2.acked_packet) |p| p.packet_number else null);
+    try std.testing.expectEqual(@as(usize, 1), ld.application.sent_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 3), ld.application.sent_packets.items[0].packet_number);
+}
+
+test "ACK range ordering does not change final acknowledged set" {
+    const allocator = std.testing.allocator;
+
+    var ld_a = LossDetection.init(allocator);
+    defer ld_a.deinit();
+
+    var ld_b = LossDetection.init(allocator);
+    defer ld_b.deinit();
+
+    const now = time_mod.Instant.now();
+
+    var pn: u64 = 1;
+    while (pn <= 8) : (pn += 1) {
+        const packet = SentPacket.init(pn, now, 1200, true);
+        try ld_a.onPacketSent(.application, packet);
+        try ld_b.onPacketSent(.application, packet);
+    }
+
+    const acked_ascending = [_]types.PacketNumber{ 2, 4, 6, 8 };
+    const acked_descending = [_]types.PacketNumber{ 8, 6, 4, 2 };
+
+    var res_a = try ld_a.onAckReceivedWithPacketNumbers(.application, 8, 0, now, &acked_ascending);
+    defer res_a.acked_packets.deinit(allocator);
+    defer res_a.lost_packets.deinit(allocator);
+
+    var res_b = try ld_b.onAckReceivedWithPacketNumbers(.application, 8, 0, now, &acked_descending);
+    defer res_b.acked_packets.deinit(allocator);
+    defer res_b.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), res_a.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 4), res_b.acked_packets.items.len);
+
+    // Both flows should end with the same outstanding packets set: 5 and 7.
+    try std.testing.expectEqual(@as(usize, 2), ld_a.application.sent_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld_b.application.sent_packets.items.len);
+
+    var remaining_a = [_]u64{ ld_a.application.sent_packets.items[0].packet_number, ld_a.application.sent_packets.items[1].packet_number };
+    var remaining_b = [_]u64{ ld_b.application.sent_packets.items[0].packet_number, ld_b.application.sent_packets.items[1].packet_number };
+    std.mem.sort(u64, &remaining_a, {}, std.sort.asc(u64));
+    std.mem.sort(u64, &remaining_b, {}, std.sort.asc(u64));
+
+    try std.testing.expectEqualSlices(u64, &remaining_a, &remaining_b);
+    try std.testing.expectEqualSlices(u64, &[_]u64{ 5, 7 }, &remaining_a);
+}
+
+test "ACK duplicate range list remains idempotent across repeated calls" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
+
+    const acked = [_]types.PacketNumber{ 2, 2, 2, 4, 4 };
+    var first = try ld.onAckReceivedWithPacketNumbers(.application, 4, 0, now, &acked);
+    defer first.acked_packets.deinit(allocator);
+    defer first.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), first.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.lost_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
+
+    // Replaying the same ACK set should have no further effect.
+    var replay = try ld.onAckReceivedWithPacketNumbers(.application, 4, 0, now, &acked);
+    defer replay.acked_packets.deinit(allocator);
+    defer replay.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), replay.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), replay.lost_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
+}
+
+test "Mixed space ACK/loss processing does not bleed across spaces" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    // Seed each packet number space with independent packet histories.
+    try ld.onPacketSent(.initial, SentPacket.init(0, now, 1200, true));
+    try ld.onPacketSent(.initial, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.handshake, SentPacket.init(0, now, 1200, true));
+    try ld.onPacketSent(.handshake, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(0, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+
+    // ACK only Initial packet #1. This should affect only Initial space.
+    var initial_ack = try ld.onAckReceived(.initial, 1, 0, now);
+    defer initial_ack.acked_packets.deinit(allocator);
+    defer initial_ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), initial_ack.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ld.initial.sent_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld.handshake.sent_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
+
+    // ACK handshake packet #1; handshake threshold logic may mark #0 lost.
+    var hs_ack = try ld.onAckReceived(.handshake, 1, 0, now);
+    defer hs_ack.acked_packets.deinit(allocator);
+    defer hs_ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), hs_ack.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ld.initial.sent_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ld.handshake.sent_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
+}
+
+test "ACKing unsent packet number advances largest_acked and may declare threshold loss" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+
+    const before_len = ld.application.sent_packets.items.len;
+
+    var ack = try ld.onAckReceived(.application, 99, 0, now);
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ack.acked_packets.items.len);
+    // With a far-future largest_acked, threshold loss will mark both packets lost.
+    try std.testing.expectEqual(@as(usize, before_len), ack.lost_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ld.application.sent_packets.items.len);
+    try std.testing.expectEqual(@as(?u64, 99), ld.application.largest_acked);
+}
+
+test "maxObservedPacketNumber combines sent and acknowledged history" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try std.testing.expect(ld.maxObservedPacketNumber(.application) == null);
+
+    try ld.onPacketSent(.application, SentPacket.init(4, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(6, now, 1200, true));
+    try std.testing.expectEqual(@as(?u64, 6), ld.maxObservedPacketNumber(.application));
+
+    // ACK beyond sent set updates largest_acked and should become max-observed.
+    var ack = try ld.onAckReceived(.application, 9, 0, now);
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u64, 9), ld.maxObservedPacketNumber(.application));
+}
+
+test "sent history drains deterministically under full ACK sweep" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+    var pn: u64 = 0;
+    while (pn < 6) : (pn += 1) {
+        try ld.onPacketSent(.application, SentPacket.init(pn, now, 1200, true));
+    }
+
+    var acked = [_]types.PacketNumber{ 0, 1, 2, 3, 4, 5 };
+    var ack = try ld.onAckReceivedWithPacketNumbers(.application, 5, 0, now, &acked);
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 6), ack.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ld.application.sent_packets.items.len);
+    try std.testing.expectEqual(@as(?u64, 5), ld.maxObservedPacketNumber(.application));
+}
+
+test "explicit ACK list can omit largest_acked packet" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(3, now, 1200, true));
+
+    // largest_acked is 3, but explicit set only includes packet 2.
+    const acked_set = [_]types.PacketNumber{2};
+    var ack = try ld.onAckReceivedWithPacketNumbers(.application, 3, 0, now, &acked_set);
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expect(ack.acked_packet == null);
+    try std.testing.expectEqual(@as(usize, 1), ack.acked_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 2), ack.acked_packets.items[0].packet_number);
+    // Space largest_acked tracks explicitly acknowledged packet numbers.
+    try std.testing.expectEqual(@as(?u64, 2), ld.application.largest_acked);
+}
+
+test "empty explicit ACK list is a no-op for sent history" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const now = time_mod.Instant.now();
+    try ld.onPacketSent(.application, SentPacket.init(1, now, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, now, 1200, true));
+
+    var ack = try ld.onAckReceivedWithPacketNumbers(.application, 2, 0, now, &.{});
+    defer ack.acked_packets.deinit(allocator);
+    defer ack.lost_packets.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ack.acked_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ack.lost_packets.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ld.application.sent_packets.items.len);
 }
 pub const AckResult = struct {
     acked_packet: ?SentPacket,

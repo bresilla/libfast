@@ -669,6 +669,30 @@ test "packet number decode reconstruction window edges" {
     try std.testing.expectEqual(@as(u64, 0x221), stable);
 }
 
+test "packet number decode lsquic compatibility vectors" {
+    const vectors = [_]struct {
+        truncated: []const u8,
+        largest_acked: u64,
+        expected: u64,
+    }{
+        // Derived from LSQUIC test_packno_len restore vectors (least_unacked=2).
+        .{ .truncated = &[_]u8{0x41}, .largest_acked = 1, .expected = 65 },
+        .{ .truncated = &[_]u8{0x02}, .largest_acked = 0, .expected = 2 },
+        .{ .truncated = &[_]u8{ 0x3F, 0xFF }, .largest_acked = 1, .expected = 64 * 256 - 1 },
+        .{ .truncated = &[_]u8{ 0x00, 0x3F, 0xFF, 0xFF }, .largest_acked = 1, .expected = 64 * 256 * 256 - 1 },
+        .{ .truncated = &[_]u8{ 0x00, 0x01 }, .largest_acked = (1 << 16) - 1, .expected = (1 << 16) + 1 },
+        .{ .truncated = &[_]u8{ 0x00, 0x00, 0x00, 0x01 }, .largest_acked = (1 << 33) - 1, .expected = (1 << 33) + 1 },
+
+        // Additional restore case where high bits come from the expected window.
+        .{ .truncated = &[_]u8{ 0x27, 0x11 }, .largest_acked = 9_999, .expected = 10_001 },
+    };
+
+    for (vectors) |vector| {
+        const decoded = try PacketNumberUtil.decode(vector.truncated, vector.largest_acked);
+        try std.testing.expectEqual(vector.expected, decoded);
+    }
+}
+
 test "long header decode rejects reserved bits for non-retry" {
     const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
     const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
@@ -752,6 +776,150 @@ test "version negotiation decode rejects invalid wire forms" {
     // Output buffer too small for advertised version list.
     var small_versions: [1]u32 = undefined;
     try std.testing.expectError(error.BufferTooSmall, VersionNegotiationPacket.decode(buf[0..len], &small_versions));
+}
+
+test "long header decode rejects oversized CID lengths" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var buf: [256]u8 = undefined;
+    const header = LongHeader{
+        .packet_type = .initial,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = &.{},
+        .payload_len = 1,
+        .packet_number = 7,
+    };
+    const len = try header.encode(&buf);
+
+    // Oversized DCID length (> 20).
+    var bad_dcid = [_]u8{0} ** 256;
+    @memcpy(bad_dcid[0..len], buf[0..len]);
+    bad_dcid[5] = 21;
+    try std.testing.expectError(error.ConnectionIdTooLong, LongHeader.decode(bad_dcid[0..64]));
+
+    // Oversized SCID length (> 20). Keep DCID valid.
+    var bad_scid = [_]u8{0} ** 256;
+    @memcpy(bad_scid[0..len], buf[0..len]);
+    bad_scid[5] = 4;
+    bad_scid[10] = 21;
+    try std.testing.expectError(error.ConnectionIdTooLong, LongHeader.decode(bad_scid[0..64]));
+}
+
+test "long header decode lsquic-style truncation corpus" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const scid = try ConnectionId.init(&[_]u8{ 9, 10, 11, 12 });
+
+    var buf: [256]u8 = undefined;
+    const header = LongHeader{
+        .packet_type = .initial,
+        .version = types.QUIC_VERSION_1,
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .token = "retry-token",
+        .payload_len = 4,
+        .packet_number = 0x1234,
+    };
+    const len = try header.encode(&buf);
+
+    var cut: usize = 0;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, LongHeader.decode(buf[0..cut]));
+    }
+
+    const decoded = try LongHeader.decode(buf[0..len]);
+    try std.testing.expectEqual(PacketType.initial, decoded.header.packet_type);
+    try std.testing.expectEqual(@as(u32, types.QUIC_VERSION_1), decoded.header.version);
+    try std.testing.expect(decoded.header.dest_conn_id.eql(&dcid));
+    try std.testing.expect(decoded.header.src_conn_id.eql(&scid));
+    try std.testing.expectEqualStrings("retry-token", decoded.header.token);
+    try std.testing.expectEqual(@as(u64, 4), decoded.header.payload_len);
+    try std.testing.expectEqual(@as(u64, 0x1234), decoded.header.packet_number);
+}
+
+test "short header decode rejects oversized CID length hint" {
+    var buf: [64]u8 = [_]u8{0} ** 64;
+    buf[0] = 0x40; // short header + fixed bit + pn_len=1
+    buf[22] = 0x01; // packet number byte after 21-byte DCID
+
+    // Provide a decode DCID length greater than QUIC maximum with enough bytes.
+    try std.testing.expectError(error.ConnectionIdTooLong, ShortHeader.decode(buf[0..23], 21));
+}
+
+test "short header decode lsquic-style truncation corpus" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 3, 5, 7, 9, 11, 13, 15 });
+
+    var buf: [128]u8 = undefined;
+    const header = ShortHeader{
+        .dest_conn_id = dcid,
+        .packet_number = 0x123456,
+        .key_phase = true,
+    };
+    const len = try header.encode(&buf);
+
+    var cut: usize = 0;
+    while (cut < len) : (cut += 1) {
+        try std.testing.expectError(error.UnexpectedEof, ShortHeader.decode(buf[0..cut], dcid.len));
+    }
+
+    const decoded = try ShortHeader.decode(buf[0..len], dcid.len);
+    try std.testing.expect(decoded.header.dest_conn_id.eql(&dcid));
+    try std.testing.expect(decoded.header.key_phase);
+    try std.testing.expectEqual(@as(u64, 0x123456), decoded.header.packet_number);
+}
+
+test "version negotiation decode rejects oversized CID lengths" {
+    var buf: [128]u8 = undefined;
+
+    // VN header: long + fixed, version=0.
+    buf[0] = 0xC0;
+    std.mem.writeInt(u32, buf[1..5], 0, .big);
+
+    // Oversized DCID length triggers ConnectionIdTooLong from ConnectionId.init.
+    buf[5] = 21;
+    @memset(buf[6..27], 0xAA);
+    buf[27] = 4;
+    @memcpy(buf[28..32], &[_]u8{ 1, 2, 3, 4 });
+    std.mem.writeInt(u32, buf[32..36], 0x00000001, .big);
+
+    var versions: [4]u32 = undefined;
+    try std.testing.expectError(error.ConnectionIdTooLong, VersionNegotiationPacket.decode(buf[0..36], &versions));
+
+    // Keep DCID valid and make SCID oversized.
+    buf[5] = 4;
+    @memcpy(buf[6..10], &[_]u8{ 5, 6, 7, 8 });
+    buf[10] = 21;
+    @memset(buf[11..32], 0xBB);
+    std.mem.writeInt(u32, buf[32..36], 0x00000001, .big);
+    try std.testing.expectError(error.ConnectionIdTooLong, VersionNegotiationPacket.decode(buf[0..36], &versions));
+}
+
+test "version negotiation decode accepts randomized low header bits" {
+    const dcid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const scid = try ConnectionId.init(&[_]u8{ 9, 8, 7, 6 });
+
+    var buf: [128]u8 = undefined;
+    const vn = VersionNegotiationPacket{
+        .dest_conn_id = dcid,
+        .src_conn_id = scid,
+        .supported_versions = &[_]u32{ 0x00000002, 0x00000003, types.QUIC_VERSION_1 },
+    };
+
+    const len = try vn.encode(&buf);
+    // LSQUIC-style VN tests randomize the low header bits. RFC requires only
+    // long-header and fixed-bit for VN packets.
+    buf[0] = 0xFF;
+
+    var versions: [8]u32 = undefined;
+    const decoded = try VersionNegotiationPacket.decode(buf[0..len], &versions);
+    try std.testing.expect(decoded.packet.dest_conn_id.eql(&dcid));
+    try std.testing.expect(decoded.packet.src_conn_id.eql(&scid));
+    try std.testing.expectEqual(@as(usize, 3), decoded.packet.supported_versions.len);
+    try std.testing.expectEqual(@as(u32, 0x00000002), decoded.packet.supported_versions[0]);
+    try std.testing.expectEqual(@as(u32, 0x00000003), decoded.packet.supported_versions[1]);
+    try std.testing.expectEqual(types.QUIC_VERSION_1, decoded.packet.supported_versions[2]);
 }
 
 test "packet decode fuzz smoke" {
