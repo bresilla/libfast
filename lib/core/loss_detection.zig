@@ -637,6 +637,34 @@ test "Loss detection by time threshold" {
     try std.testing.expect(ack_result.lost_packets.items.len >= 1);
 }
 
+test "Loss detection time threshold uses strict greater-than" {
+    const allocator = std.testing.allocator;
+
+    var ld = LossDetection.init(allocator);
+    defer ld.deinit();
+
+    const base = time_mod.Instant.now();
+    try ld.onPacketSent(.application, SentPacket.init(1, base, 1200, true));
+    try ld.onPacketSent(.application, SentPacket.init(2, base, 1200, true));
+
+    var first_ack = try ld.onAckReceived(.application, 2, 0, base);
+    defer first_ack.acked_packets.deinit(allocator);
+    defer first_ack.lost_packets.deinit(allocator);
+
+    const loss_delay = (ld.rtt_stats.smoothed_rtt * ld.time_threshold) / 8;
+
+    var at_threshold = try ld.onAckReceived(.application, 2, 0, base.add(loss_delay));
+    defer at_threshold.acked_packets.deinit(allocator);
+    defer at_threshold.lost_packets.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), at_threshold.lost_packets.items.len);
+
+    var after_threshold = try ld.onAckReceived(.application, 2, 0, base.add(loss_delay + 1));
+    defer after_threshold.acked_packets.deinit(allocator);
+    defer after_threshold.lost_packets.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), after_threshold.lost_packets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), after_threshold.lost_packets.items[0].packet_number);
+}
+
 test "Packet number space isolation" {
     const allocator = std.testing.allocator;
 
