@@ -1914,6 +1914,44 @@ test "replaying ACK advances loss frontier without requeueing already lost packe
     try std.testing.expect(replay_count > 0);
 }
 
+test "loss retransmission queue preserves round ordering across ACK rounds" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+    conn.markEstablished();
+
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        conn.trackPacketSent(1200, true); // pn 0..8
+    }
+
+    // Round 1: ack pn=4 -> threshold loss should schedule pn=0.
+    conn.processAckDetailed(4, 0);
+
+    // Round 2: ack pn=8 -> threshold loss should schedule pn=1,2,3.
+    conn.processAckDetailed(8, 0);
+
+    const first = conn.popRetransmission();
+    try std.testing.expect(first != null);
+    try std.testing.expect(!first.?.is_probe);
+
+    // The first enqueued retransmission from round 1 must remain at queue head.
+    try std.testing.expectEqual(@as(u64, 0), first.?.packet_number);
+
+    var saw_additional = false;
+    while (conn.popRetransmission()) |req| {
+        try std.testing.expect(!req.is_probe);
+        // Round-2 scheduling should not requeue already-lost pn=0.
+        try std.testing.expect(req.packet_number != 0);
+        saw_additional = true;
+    }
+    try std.testing.expect(saw_additional);
+}
+
 test "connection schedules PTO probe" {
     const allocator = std.testing.allocator;
 
