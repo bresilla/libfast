@@ -4,7 +4,6 @@ const std = @import("std");
 ///
 /// Implements NewReno congestion control algorithm with slow start
 /// and congestion avoidance.
-
 pub const CongestionError = error{
     InvalidCongestionWindow,
     InvalidSlowStartThreshold,
@@ -357,4 +356,64 @@ test "Minimum ssthresh enforcement" {
 
     // ssthresh should be at least 2 * MTU
     try std.testing.expect(cc.ssthresh >= 2 * mtu);
+}
+
+test "Congestion lifecycle remains stable across recovery and reset" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    // Start with inflight data and grow in slow start.
+    cc.onPacketSent(6000);
+    cc.onPacketSent(3000);
+    try std.testing.expectEqual(@as(u64, 9000), cc.bytes_in_flight);
+
+    cc.onPacketAcked(3000, 10);
+    try std.testing.expectEqual(@as(u64, 6000), cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 15000), cc.congestion_window);
+    try std.testing.expectEqual(CongestionState.slow_start, cc.state);
+
+    // Enter recovery from loss.
+    cc.onPacketsLost(2000, 12);
+    try std.testing.expectEqual(@as(u64, 4000), cc.bytes_in_flight);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    try std.testing.expectEqual(@as(?u64, 12), cc.recovery_end_packet);
+    try std.testing.expectEqual(@as(u64, 7500), cc.ssthresh);
+    try std.testing.expectEqual(@as(u64, 7500), cc.congestion_window);
+
+    // Loss with packet number inside current recovery does not re-enter recovery.
+    cc.onPacketsLost(500, 11);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    try std.testing.expectEqual(@as(?u64, 12), cc.recovery_end_packet);
+    try std.testing.expectEqual(@as(u64, 3500), cc.bytes_in_flight);
+
+    // ACK up to recovery end does not grow cwnd.
+    cc.onPacketAcked(1000, 12);
+    try std.testing.expectEqual(@as(u64, 2500), cc.bytes_in_flight);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    try std.testing.expectEqual(@as(u64, 7500), cc.congestion_window);
+
+    // ACK after recovery end exits to congestion avoidance.
+    cc.onPacketAcked(1000, 13);
+    try std.testing.expectEqual(@as(u64, 1500), cc.bytes_in_flight);
+    try std.testing.expectEqual(CongestionState.congestion_avoidance, cc.state);
+    try std.testing.expectEqual(@as(?u64, null), cc.recovery_end_packet);
+
+    // In congestion avoidance, enough ACKed bytes grow cwnd by one MTU.
+    cc.onPacketAcked(7000, 14);
+    try std.testing.expectEqual(@as(u64, 0), cc.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 8700), cc.congestion_window);
+
+    // Persistent congestion resets controller to minimal safe state.
+    cc.onPersistentCongestion();
+    try std.testing.expectEqual(@as(u64, 2 * mtu), cc.congestion_window);
+    try std.testing.expectEqual(CongestionState.slow_start, cc.state);
+    try std.testing.expectEqual(@as(?u64, null), cc.recovery_end_packet);
+
+    // After reset, send budget reflects minimal cwnd.
+    cc.onPacketSent(2000);
+    try std.testing.expect(cc.canSend());
+    try std.testing.expectEqual(@as(u64, 400), cc.availableWindow());
+    cc.onPacketSent(500);
+    try std.testing.expect(!cc.canSend());
+    try std.testing.expectEqual(@as(u64, 0), cc.availableWindow());
 }
