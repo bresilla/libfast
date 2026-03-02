@@ -545,3 +545,49 @@ test "Available window saturates correctly around boundary" {
     try std.testing.expect(!cc.canSend());
     try std.testing.expectEqual(@as(u64, 0), cc.availableWindow());
 }
+
+test "Congestion avoidance carries residual acked bytes across ACK events" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    cc.state = .congestion_avoidance;
+    cc.ssthresh = cc.congestion_window;
+    cc.acked_bytes_in_window = 0;
+
+    const cwnd0 = cc.congestion_window;
+
+    // First partial ACK does not grow cwnd yet.
+    cc.onPacketAcked(3000, 1);
+    try std.testing.expectEqual(cwnd0, cc.congestion_window);
+    try std.testing.expectEqual(@as(u64, 3000), cc.acked_bytes_in_window);
+
+    // Second partial ACK still below cwnd.
+    cc.onPacketAcked(4000, 2);
+    try std.testing.expectEqual(cwnd0, cc.congestion_window);
+    try std.testing.expectEqual(@as(u64, 7000), cc.acked_bytes_in_window);
+
+    // Crossing cwnd threshold increases by one MTU and resets accumulator.
+    cc.onPacketAcked(cwnd0 - 7000, 3);
+    try std.testing.expectEqual(cwnd0 + mtu, cc.congestion_window);
+    try std.testing.expectEqual(@as(u64, 0), cc.acked_bytes_in_window);
+}
+
+test "Persistent congestion clears recovery and ack accounting state" {
+    const mtu = 1200;
+    var cc = CongestionController.init(mtu);
+
+    cc.onPacketSent(5000);
+    cc.onPacketsLost(1000, 9);
+    try std.testing.expectEqual(CongestionState.recovery, cc.state);
+    try std.testing.expect(cc.recovery_end_packet != null);
+
+    cc.state = .congestion_avoidance;
+    cc.acked_bytes_in_window = 9999;
+
+    cc.onPersistentCongestion();
+
+    try std.testing.expectEqual(CongestionState.slow_start, cc.state);
+    try std.testing.expectEqual(@as(?u64, null), cc.recovery_end_packet);
+    try std.testing.expectEqual(@as(u64, 0), cc.acked_bytes_in_window);
+    try std.testing.expectEqual(@as(u64, 2 * mtu), cc.congestion_window);
+}
