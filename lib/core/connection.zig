@@ -1730,6 +1730,47 @@ test "connection drain timeout derives from PTO" {
     try std.testing.expect(timeout <= 30 * time.Duration.SECOND);
 }
 
+test "connection drain timeout enforces lower clamp" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.loss_detection.rtt_stats.smoothed_rtt = 1;
+    conn.loss_detection.rtt_stats.rttvar = 0;
+    conn.remote_params = null;
+
+    try std.testing.expectEqual(
+        @as(u64, 50 * time.Duration.MILLISECOND),
+        conn.drainTimeoutDuration(),
+    );
+}
+
+test "connection drain timeout enforces upper clamp" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initClient(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.loss_detection.rtt_stats.smoothed_rtt = 20 * time.Duration.SECOND;
+    conn.loss_detection.rtt_stats.rttvar = 20 * time.Duration.SECOND;
+
+    var params = types.TransportParameters{};
+    params.max_ack_delay = 60_000; // 60s equivalent in ms
+    conn.remote_params = params;
+
+    try std.testing.expectEqual(
+        @as(u64, 30 * time.Duration.SECOND),
+        conn.drainTimeoutDuration(),
+    );
+}
+
 test "connection ack with ranges keeps recovery path stable" {
     const allocator = std.testing.allocator;
 
