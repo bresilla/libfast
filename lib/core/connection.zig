@@ -2544,6 +2544,49 @@ test "path response mismatch keeps peer unvalidated" {
     try std.testing.expect(conn.expected_path_response == null);
 }
 
+test "path response without pending challenge is ignored" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.markPeerValidated();
+    const token = [_]u8{ 7, 7, 7, 7, 7, 7, 7, 7 };
+
+    try std.testing.expect(!conn.onPathResponse(token));
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.expected_path_response == null);
+}
+
+test "beginPathValidation reapplies amplification cap until validated" {
+    const allocator = std.testing.allocator;
+
+    const local_cid = try ConnectionId.init(&[_]u8{ 1, 2, 3, 4 });
+    const remote_cid = try ConnectionId.init(&[_]u8{ 5, 6, 7, 8 });
+
+    var conn = try Connection.initServer(allocator, .tls, local_cid, remote_cid);
+    defer conn.deinit();
+
+    conn.updateDataReceived(1000);
+    conn.markPeerValidated();
+    const uncapped = conn.availableSendBudget();
+    try std.testing.expect(uncapped > 3000);
+
+    const token = [_]u8{ 1, 3, 5, 7, 9, 11, 13, 15 };
+    conn.beginPathValidation(token);
+    try std.testing.expect(!conn.peer_validated);
+
+    // Amplification cap should be active again while re-validating path.
+    try std.testing.expectEqual(@as(u64, 3000), conn.availableSendBudget());
+
+    try std.testing.expect(conn.onPathResponse(token));
+    try std.testing.expect(conn.peer_validated);
+    try std.testing.expect(conn.availableSendBudget() >= 3000);
+}
+
 test "beginPathValidation replaces pending expected response token" {
     const allocator = std.testing.allocator;
 
