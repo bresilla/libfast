@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.14] - 2026-03-04
+
+### <!-- 2 -->🚜 Refactor
+
+- Migrate crypto code to libsafe dependency
+
 ## [0.0.13] - 2026-03-02
 
 ### <!-- 1 -->🐛 Bug Fixes
