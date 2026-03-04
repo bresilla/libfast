@@ -1,326 +1,41 @@
 # libfast
 
-A standalone Zig QUIC transport library supporting both SSH key exchange and TLS 1.3 modes.
+QUIC transport engine in Zig with dual security modes.
 
 ## Overview
 
-libfast provides a complete QUIC transport implementation (RFC 9000, 9002) with dual crypto modes:
+`libfast` runs the same QUIC transport API with two handshake/security paths:
 
-- **SSH Key Exchange Mode** - For SSH applications (experimental spec)
-- **TLS 1.3 Mode** - For HTTP/3 and standard QUIC applications (RFC 9001)
+- **QUIC-over-TLS** for standards-aligned QUIC workflows.
+- **QUIC-over-SSH** for SSH-style key exchange and host-key trust workflows.
 
-## Features
+Core transport behavior (streams, loss recovery, congestion, flow control) stays the same across both modes.
 
-**Core QUIC Protocol**
-- Connection management
-- Stream multiplexing (bidirectional and unidirectional)
-- Packet encoding/decoding
-- Frame handling
+## Core Capabilities
 
-**SSH/QUIC Crypto Mode**
-- Obfuscated envelope (AEAD-AES-256-GCM)
-- SSH key exchange (curve25519-sha256)
-- Secret derivation (SSH K,H → QUIC secrets)
-- No TLS overhead for SSH applications
+- Connection lifecycle and stream multiplexing
+- Packet/frame encode/decode
+- Flow control and NewReno congestion control
+- Loss detection and RTT tracking
+- TLS and SSH security mode integration under one API
 
-**Standard TLS/QUIC**
-- TLS 1.3 handshake
-- Cipher suites (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305)
-- Compatible with HTTP/3 applications
+## Build and Test
 
-**Reliability & Performance**
-- Flow control (stream and connection level)
-- Loss detection (RFC 9002)
-- RTT estimation
-- Congestion control (NewReno)
-
-## Quick Start
-
-### Installation
-
-Add libfast as a dependency in your `build.zig`:
-
-```zig
-const libfast = b.dependency("libfast", .{
-    .target = target,
-    .optimize = optimize,
-});
-
-exe.root_module.addImport("libfast", libfast.module("libfast"));
-```
-
-### Usage Example (SSH Mode)
-
-```zig
-const std = @import("std");
-const libfast = @import("libfast");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Configure SSH mode
-    const config = libfast.QuicConfig.sshClient(
-        "server.example.com",
-        "obfuscation-keyword"
-    );
-
-    // Create connection
-    var conn = try libfast.QuicConnection.init(allocator, config);
-    defer conn.deinit();
-
-    // Connect and use streams
-    try conn.connect("192.0.2.1", 4433);
-
-    // Your app drives progress by polling.
-    while (true) {
-        try conn.poll();
-
-        while (conn.nextEvent()) |ev| switch (ev) {
-            .connected => {
-                const sid = try conn.openStream(true);
-                _ = try conn.streamWrite(sid, "Hello over QUIC", .no_finish);
-            },
-            .stream_readable => |sid| {
-                var buf: [1024]u8 = undefined;
-                const n = try conn.streamRead(sid, &buf);
-                std.debug.print("stream {} read {s}\n", .{ sid, buf[0..n] });
-            },
-            .closing => |c| {
-                std.debug.print("closing: {d} {s}\n", .{ c.error_code, c.reason });
-            },
-            .closed => return,
-            else => {},
-        };
-    }
-}
-```
-
-### Usage Example (TLS Mode)
-
-```zig
-// Configure TLS mode
-const config = libfast.QuicConfig.tlsClient("server.example.com");
-
-// Same API - just different crypto mode
-var conn = try libfast.QuicConnection.init(allocator, config);
-// ... rest is identical
-```
-
-### Usage Example (Server Loop)
-
-```zig
-const config = libfast.QuicConfig.sshServer("obfuscation-keyword");
-var conn = try libfast.QuicConnection.init(allocator, config);
-defer conn.deinit();
-
-try conn.accept("0.0.0.0", 4433);
-
-while (true) {
-    try conn.poll();
-
-    while (conn.nextEvent()) |ev| switch (ev) {
-        .stream_readable => |sid| {
-            var buf: [2048]u8 = undefined;
-            const n = try conn.streamRead(sid, &buf);
-            _ = try conn.streamWrite(sid, buf[0..n], .no_finish); // echo
-        },
-        .closed => return,
-        else => {},
-    };
-}
-```
-
-## Project Structure
-
-```
-lib/
-├── libfast.zig              # Main entry point, public API
-├── core/                    # Core QUIC protocol
-│   ├── types.zig
-│   ├── connection.zig
-│   ├── stream.zig
-│   ├── packet.zig
-│   ├── frame.zig
-│   ├── transport_params.zig
-│   ├── flow_control.zig
-│   ├── loss_detection.zig
-│   └── congestion.zig
-├── crypto/                  # Cryptographic layer
-│   ├── crypto.zig          # Crypto abstraction
-│   ├── aead.zig
-│   ├── keys.zig
-│   ├── header_protection.zig
-│   ├── ssh/                # SSH key exchange mode
-│   │   ├── obfuscation.zig
-│   │   ├── init.zig
-│   │   ├── reply.zig
-│   │   ├── cancel.zig
-│   │   ├── kex_methods.zig
-│   │   └── secret_derivation.zig
-│   └── tls/                # TLS 1.3 mode
-│       ├── handshake.zig
-│       ├── key_schedule.zig
-│       └── tls_context.zig
-├── api/                    # Public API
-│   ├── config.zig
-│   ├── types.zig
-│   ├── connection.zig
-│   └── stream.zig
-├── transport/              # Transport layer
-│   └── udp.zig
-└── utils/                  # Utilities
-    ├── varint.zig
-    ├── buffer.zig
-    └── time.zig
-```
-
-## Building
-
-Build the library:
 ```bash
 make build
-```
-
-Run tests:
-```bash
 make test
-```
-
-Run dual-mode regression tests:
-```bash
 make test-dual-mode
 ```
 
-Run examples:
-```bash
-zig build run-ssh-server
-zig build run-ssh-client
-zig build run-tls-server
-zig build run-tls-client
-```
+## Docs
 
-## Testing
+- See `docs/` for package documentation and notes.
+- If `docs/` is currently sparse, it is the canonical place for upcoming docs.
 
-500+ unit tests covering:
-- Core protocol (packets, frames, streams)
-- SSH crypto (obfuscation, key exchange)
-- TLS crypto (handshake, key schedule)
-- Flow control and congestion control
-- Loss detection and RTT estimation
+## Acknowledgments
 
-```bash
-zig build test --summary all
-```
-
-## Implementation Status
-
-### Completed (Phase 1-8)
-- Core QUIC types and constants
-- Packet encoding/decoding
-- Frame handling
-- Variable-length integers
-- UDP transport
-- Connection state machine
-- Stream management
-- Transport parameters
-- SSH obfuscation and key exchange
-- TLS 1.3 handshake structures
-- Common crypto layer (AEAD, keys, header protection)
-- Flow control (stream and connection level)
-- Loss detection (RFC 9002)
-- Congestion control (NewReno)
-- Public API design and implementation
-- Connection establishment (connect/accept)
-- Stream I/O (read/write operations)
-- Integration layer (public API to internal components)
-- Example applications
-- Documentation
-
-### Future Enhancements
-- Congestion-control model expansion (Cubic/BW-sampler parity vectors)
-- Additional live interop lanes and environment matrix coverage
-- Performance profiling and optimization
-- TLS certificate validation hardening
-- Extended end-to-end scenario testing
-
-## Dependencies
-
-libfast uses only Zig's standard library:
-- `std.crypto` - All cryptographic operations
-- `std.net` - UDP sockets
-- `std.mem` - Memory management
-- `std.time` - Timers
-
-No external dependencies required!
-
-## Design Philosophy
-
-1. **Library-First Approach** - libfast is a transport library, not a full protocol implementation
-   - QUIC transport and crypto
-   - SSH protocol (implemented by applications like syslink)
-   - HTTP/3 semantics (implemented by HTTP/3 applications)
-
-2. **Dual Crypto Modes** - Support both SSH and TLS without code duplication
-   - Unified connection/stream API
-   - Mode-specific crypto layers
-   - Same reliability mechanisms
-
-3. **Clean Public API** - Easy to use, hard to misuse
-   - `QuicConnection` and `QuicStream` handles
-   - Configuration-driven setup
-   - Clear error handling
-
-## Documentation
-
-- [PLAN.md](PLAN.md) - Complete implementation roadmap
-- [examples/README.md](examples/README.md) - Example applications
-- [ssh_quic_spec.md](ssh_quic_spec.md) - SSH/QUIC specification
-
-## Release Gates
-
-- Local gate: `make ci`
-- CI gate: `.github/workflows/ci.yml`
-- Required checks before release:
-  - `zig build test --summary all`
-  - `zig build -Doptimize=ReleaseFast`
-  - Interop matrix lanes for `quiche`, `ngtcp2`, and `msquic`
-
-## Security Reporting
-
-- Report vulnerabilities privately to: `security@libfast.dev`
-- Include reproduction steps, affected version, and impact details
-- Do not open public issues for unpatched security defects
-- Target initial triage within 3 business days
-
-## References
-
-### QUIC Standards
-- [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) - QUIC Transport
-- [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) - Using TLS to Secure QUIC
-- [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002) - Loss Detection and Congestion Control
-
-### SSH Standards
-- [RFC 4251-4254](https://www.rfc-editor.org/rfc/rfc4251) - SSH Protocol
-- [RFC 8731](https://www.rfc-editor.org/rfc/rfc8731) - Curve25519-SHA256
-
-### Implementation References
-- [quiche](https://github.com/cloudflare/quiche) - Cloudflare's Rust QUIC
-- [ngtcp2](https://github.com/ngtcp2/ngtcp2) - C QUIC implementation
-
-## License
-
-[MIT](LICENSE)
+- See `ACKNOWLEDGMENTS.md`.
 
 ## Version
 
-Current version: **0.0.1**
-
-- Core QUIC protocol implemented and tested
-- SSH and TLS crypto modes functional
-- Flow control and reliability complete
-- Public API implemented and stable
-- Integration layer complete
-- 200 unit tests passing
-- Examples and documentation complete
+- Current package version: `0.0.14`
