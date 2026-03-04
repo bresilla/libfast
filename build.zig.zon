@@ -3,9 +3,9 @@
     .version = "0.0.14",
     .dependencies = .{
         .libsafe = .{
-            // .url = "git+https://github.com/libzig/libsafe?ref=0.0.6",
-            // .hash = "libsafe-0.0.6-ucZASCbdAQDW8O1fuukZNTR3m1reR2QCx15FbaEvh75_",
-            .path = "../libsafe",
+            .url = "git+https://github.com/libzig/libsafe?ref=0.0.7",
+            .hash = "libsafe-0.0.7-ucZASCGdAwA9tuwbOrMk1dipWU9BfjIorGYIvasBxfaZ",
+            // .path = "../libsafe",
         },
     },
     .paths = .{
