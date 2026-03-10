@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.16] - 2026-03-10
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Update libsafe dependency to v0.0.8
+- Merge develop to main
+
 ## [0.0.15] - 2026-03-04
 
 ### <!-- 3 -->📚 Documentation
